@@ -52,6 +52,16 @@ fn log(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if let Some(argument) = args
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .find(|argument| !argument.starts_with('-') && resolves_to_commit(&repo, argument))
+    {
+        return Err(format!(
+            "git op log does not accept revision {argument}; it would leave the operation log"
+        )
+        .into());
+    }
     let mut command = std::process::Command::new("git");
     command
         .current_dir(repo.current_dir())
@@ -64,6 +74,16 @@ fn log(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("git log failed with {status}").into());
     }
     Ok(())
+}
+
+fn resolves_to_commit(repo: &gix::Repository, specification: &str) -> bool {
+    std::process::Command::new("git")
+        .current_dir(repo.current_dir())
+        .env("GIT_DIR", repo.git_dir())
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{specification}^{{commit}}"))
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Restore one operation-log commit into the current repository.
