@@ -33,8 +33,3 @@ repos:
         entry: cargo clippy --all-targets --all-features -- -D warnings
         types: [rust]
         pass_filenames: false
-  - repo: https://github.com/crate-ci/committed
-    rev: v1.1.10
-    hooks:
-      - id: committed
-        args: [--config, .config/committed.toml, --commit-file]
