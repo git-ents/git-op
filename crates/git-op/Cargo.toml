@@ -4,8 +4,9 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
-git-store = { git = "https://github.com/git-ents/git-store", version = "0.1.0" }
+facet = { version = "=0.50.0-rc.5", features = ["reflect"] }
+facet-git-tree = { git = "https://github.com/git-ents/git-store", version = "0.1.0" }
+gix = { version = "0.85.0", default-features = false, features = ["sha1", "zlib-rs"] }
+gix-refstore = { git = "https://github.com/git-ents/git-store", version = "0.1.0" }
+thiserror = "2"
