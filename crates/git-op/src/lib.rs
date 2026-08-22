@@ -1022,6 +1022,60 @@ mod tests {
         append(&temporary.repo, "test snapshot").expect("append snapshot");
     }
 
+    /// Verify that generated messages identify changed snapshot components.
+    #[test]
+    fn generated_snapshot_message_identifies_changes() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(initial)
+                .expect("find initial snapshot")
+                .message()
+                .expect("read initial message")
+                .summary()
+                .as_bytes(),
+            b"op: capture initial repository state"
+        );
+
+        fs::write(
+            temporary.repo.common_dir().join("description"),
+            b"example\n",
+        )
+        .expect("write description");
+        Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["update-ref", "refs/heads/example", &initial.to_string()])
+            .status()
+            .expect("update example ref")
+            .success()
+            .then_some(())
+            .expect("update example ref succeeds");
+        let update = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append changed snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(update)
+                .expect("find changed snapshot")
+                .message()
+                .expect("read changed message")
+                .summary()
+                .as_bytes(),
+            b"op: update refs and description"
+        );
+    }
+
     /// Verify that operation, remote, and pseudo refs are excluded.
     #[test]
     fn ref_filter_excludes_operation_and_remote_refs() {
