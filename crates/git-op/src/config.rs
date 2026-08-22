@@ -10,7 +10,7 @@ use std::{
 use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
-const HOOK_BODY: &str = "#!/bin/sh\nexec git op reference-transaction \"$@\"\n";
+const HOOK_BODY: &str = "#!/bin/sh\n# Git can invoke this hook while `git init` is still creating the repository.\ngit rev-parse --git-dir >/dev/null 2>&1 || exit 0\nexec git op reference-transaction \"$@\"\n";
 
 /// Install the `reference-transaction` hook in this repository.
 ///
