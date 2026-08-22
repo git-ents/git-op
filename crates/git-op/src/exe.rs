@@ -42,8 +42,9 @@ fn log(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     command
         .current_dir(repo.current_dir())
         .env("GIT_DIR", repo.git_dir())
-        .arg("log");
-    command.args(args).args(["--", git_op::OP_REF]);
+        .arg("log")
+        .arg(git_op::OP_REF)
+        .args(args);
     let status = command.status()?;
     if !status.success() {
         return Err(format!("git log failed with {status}").into());
@@ -64,4 +65,19 @@ fn undo() -> Result<(), Box<dyn std::error::Error>> {
     let repo = gix::discover(".")?;
     git_op::undo(&repo)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_starts_with_operation_ref() {
+        let mut command = std::process::Command::new("git");
+        command.arg("log").arg(git_op::OP_REF).args(["--oneline"]);
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("test arguments are UTF-8"))
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["log", "refs/op", "--oneline"]);
+    }
 }
