@@ -1,0 +1,40 @@
+[files]
+
+extend-exclude = [
+  "CHANGELOG.md"
+]
+
+# Enable checking of hidden files, dot files, and respect no ignore files
+# to catch maximum errors
+ignore-hidden = false
+ignore-files = false
+ignore-dot = false
+ignore-vcs = false
+ignore-global = false
+ignore-parent = false
+
+[default]
+
+# Check binary files as text to catch errors everywhere
+binary = true
+
+# Enable all checks
+check-filename = true
+check-file = true
+
+# Enable unicode support for comprehensive identifier checking
+unicode = true
+
+# Keep hex checking disabled to avoid false positives in code
+ignore-hex = true
+
+# Disable leading digits to catch more identifier errors
+identifier-leading-digits = false
+
+# Use specific locale for stricter checking (en-us for consistency)
+locale = "en-us"
+
+# Keep these empty to not ignore anything by default
+extend-ignore-identifiers-re = []
+extend-ignore-words-re = []
+extend-ignore-re = []

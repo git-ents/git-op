@@ -1,0 +1,40 @@
+exclude: ^(.*/)?(CHANGELOG\.md)$
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+  - repo: https://github.com/rvben/rumdl-pre-commit
+    rev: v0.1.25
+    hooks:
+      - id: rumdl
+        args: [--config, .config/rumdl.toml, --fix]
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.5
+    hooks:
+      - id: typos
+        args: [--write-changes, --force-exclude, --config, .config/typos.toml]
+  - repo: local
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --all --
+        types: [rust]
+        pass_filenames: false
+      - id: clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        types: [rust]
+        pass_filenames: false
+  - repo: https://github.com/crate-ci/committed
+    rev: v1.1.10
+    hooks:
+      - id: committed
+        args: [--config, .config/committed.toml, --commit-file]

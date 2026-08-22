@@ -1,0 +1,16 @@
+[global]
+line-length = -1
+force-exclude = true
+
+exclude = [
+    ".git",
+    "dist",
+    "build",
+    "CHANGELOG.md",
+]
+
+respect-gitignore = true
+
+[MD013]
+reflow = true
+reflow-mode = "sentence-per-line"

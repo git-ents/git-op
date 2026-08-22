@@ -1,0 +1,8 @@
+{
+  "terminal": {
+    "env": {
+      "PATH": "target/debug:$PATH",
+      "MANPATH": "$PWD/target/share/man:$MANPATH"
+    }
+  }
+}

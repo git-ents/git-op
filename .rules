@@ -1,0 +1,56 @@
+# Project Rules
+
+## Behavior
+
+- Be concise.
+  No filler, no restating the task, no summaries of what you just did.
+- Do not explain code unless asked.
+  Just write it.
+- Do not narrate your diffs or describe what you changed.
+  I can read the diff.
+- Ask before making changes outside the scope of what was requested.
+- Never refactor surrounding code unless explicitly asked.
+- If you hit an error, stop and report it.
+  Do not loop trying fixes without asking.
+- Prefer minimal, targeted diffs.
+  Do not rewrite entire files when a small edit suffices.
+- If a task will touch more than 3 files, state your plan in one sentence and wait for confirmation before proceeding.
+- Do not add dependencies without asking.
+
+## Code Style
+
+- Match existing patterns in the codebase; do not introduce new conventions.
+- Keep imports organized per existing project convention.
+- Before creating a new utility or helper, check if one already exists in the codebase.
+- Do not add comments that restate what the code does.
+
+## Context
+
+- Do not read files you don't need; only read files directly relevant to the task.
+- When searching the codebase, use targeted queries; avoid broad searches.
+- If you need to understand architecture, ask me rather than reading every file.
+- When reading a large file, use line ranges or grep; do not read the entire file if you only need one function or section.
+- Truncate or pipe through `head` any command that may produce long output (`find`, `grep`, `ls -R`, build logs).
+
+## Testing
+
+- Run existing tests after changes if a test command exists.
+- Do not write new tests unless asked.
+- Suppress test output and check the exit code only; if tests fail, re-run with output visible to diagnose or do a targeted search on available logs.
+- Run typecheck/compile before committing; do not commit broken code.
+
+## Git
+
+- Never push.
+- Always commit after completing a task.
+- Use `git commit --fixup <sha>` for changes that amend a commit not yet pushed to remote.
+- Expect `prek` (not `pre-commit`) to have installed git hooks; if no hooks run on commit, try running the install command: `prek install -c .config/pre-commit.yaml`.
+- Keep commit messages terse; no long prose.
+- When committing, use Conventional Commit style; prefer brief prose in the body over bullet lists.
+- Every trackable change (anything that belongs in a changelog) must appear as either the commit header or a Conventional Commit footer token, e.g. `feat: add Foo`, `deprecates: Bar`; this applies even when the information duplicates the body.
+- When multiple changes are in one commit, the Conventional Commit header should be a summary with all concrete changes listed as Conventional Commit footers.
+- Use `Assisted-by: $Tool:$model-id` for agent attribution — for example: `Assisted-by: Claude:claude-sonnet-4-6`. Always use the model ID (e.g. `claude-sonnet-4-6`), never a display name. No parentheses.
+- Trailer bracket conventions: agents use `Tool:model-id`, humans use `Name <email>`, human review context uses `[forge#N]` or `[live]`.
+- The attribution footer (`Assisted-by`) must always be last.
+- Prioritize multiple commits when warranted.
+- The only commit scopes that should be used are those listed in `.config/committed.toml`; this project does not use scopes for code contributions that are user-facing.
