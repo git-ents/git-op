@@ -6,3 +6,6 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+git-store = { git = "https://github.com/git-ents/git-store", version = "0.1.0" }
