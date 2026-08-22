@@ -38,6 +38,20 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// Show operation-log commits by delegating formatting and filtering to Git.
 fn log(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let repo = gix::discover(".")?;
+    if repo.try_find_reference(git_op::OP_REF)?.is_none() {
+        println!("No operation snapshots recorded.");
+        return Ok(());
+    }
+    let forbidden = ["--all", "--branches", "--tags", "--remotes"];
+    if let Some(argument) = args
+        .iter()
+        .find(|argument| forbidden.iter().any(|option| *argument == option))
+    {
+        return Err(format!(
+            "git op log does not accept {argument}; it would leave the operation log"
+        )
+        .into());
+    }
     let mut command = std::process::Command::new("git");
     command
         .current_dir(repo.current_dir())

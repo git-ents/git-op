@@ -32,7 +32,7 @@ pub(crate) enum Command {
     },
     /// Show the operation-log commits using Git's log command.
     Log {
-        /// Additional arguments passed to `git log` after `refs/op`.
+        /// Additional formatting and filtering arguments passed to `git log`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
