@@ -3,13 +3,7 @@
 //! Snapshots are committed to [`OP_REF`]. The operation ref, remote refs, and
 //! pseudo references such as `HEAD` are excluded from snapshots.
 
-use std::{
-    collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::Write as _,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
 use facet::Facet;
 use facet_git_tree::{RawBlob, RawTree};
@@ -17,11 +11,14 @@ use gix::objs::{Kind, Write};
 use gix::{self, bstr::ByteSlice};
 use gix_refstore::{ApplyError, Committer, GixRefStore, ObjectId, RefEdit, RefName, RefStore};
 
+mod config;
+
+use config::commit_signing_enabled;
+pub use config::{install_global, install_local};
+
 /// The ref containing the latest repository-state snapshot.
 pub const OP_REF: &str = "refs/op";
 
-const HOOK_NAME: &str = "reference-transaction";
-const HOOK_BODY: &str = "#!/bin/sh\nexec git-op reference-transaction \"$@\"\n";
 const MAX_APPEND_ATTEMPTS: usize = 128;
 
 /// The state of repository metadata captured by an operation-log commit.
@@ -34,6 +31,15 @@ pub struct RepositoryState {
     pub config: Option<RawBlob>,
     /// The bytes of the repository's `description` file, when it exists.
     pub description: Option<RawBlob>,
+}
+
+/// Optional commit metadata for [`append_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct AppendOptions {
+    /// The author signature, or the repository-configured author when absent.
+    pub author: Option<gix::actor::Signature>,
+    /// The committer signature, or the repository-configured committer when absent.
+    pub committer: Option<gix::actor::Signature>,
 }
 
 /// Errors produced while capturing, storing, or installing repository state.
@@ -72,6 +78,7 @@ pub enum Error {
 }
 
 impl Error {
+    /// Convert an error into the crate's repository-operation error variant.
     fn git<E>(error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
@@ -79,15 +86,23 @@ impl Error {
         Self::Git(error.into())
     }
 
+    /// Create a repository-operation error from a diagnostic message.
     fn message(message: impl Into<String>) -> Self {
         Self::git(std::io::Error::other(message.into()))
     }
 }
 
+/// Return whether a ref name belongs in a captured repository snapshot.
 fn is_captured_ref(name: &[u8]) -> bool {
     name.starts_with(b"refs/") && name != OP_REF.as_bytes() && !name.starts_with(b"refs/remotes/")
 }
 
+/// Render a reference target in Git's loose-ref file format.
+///
+/// Object references are written as an object ID followed by a newline, while
+/// symbolic references use Git's `ref: ` prefix. The resulting bytes can be
+/// stored as a blob without converting Git's byte-oriented ref contents to
+/// UTF-8.
 fn ref_contents(reference: &gix::Reference<'_>) -> Vec<u8> {
     match reference.target() {
         gix::refs::TargetRef::Object(id) => {
@@ -104,6 +119,7 @@ fn ref_contents(reference: &gix::Reference<'_>) -> Vec<u8> {
     }
 }
 
+/// Validate that captured ref names form a representable tree namespace.
 fn validate_ref_paths(refs: &BTreeMap<String, Vec<u8>>) -> Result<(), Error> {
     let mut previous: Option<&str> = None;
     for name in refs.keys() {
@@ -128,6 +144,7 @@ fn validate_ref_paths(refs: &BTreeMap<String, Vec<u8>>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Write captured ref contents as a nested Git tree.
 fn write_ref_tree(
     repo: &gix::Repository,
     refs: &BTreeMap<String, Vec<u8>>,
@@ -149,6 +166,7 @@ struct RefNode {
 }
 
 impl RefNode {
+    /// Insert one ref leaf, rejecting file/directory collisions.
     fn insert(&mut self, relative: &str, oid: ObjectId, full_name: &str) -> Result<(), Error> {
         let (head, tail) = relative
             .split_once('/')
@@ -180,6 +198,7 @@ impl RefNode {
         Ok(())
     }
 
+    /// Recursively write this namespace node as a Git tree.
     fn write(&self, repo: &gix::Repository) -> Result<ObjectId, Error> {
         let mut entries = Vec::with_capacity(self.children.len() + self.leaves.len());
         for (name, child) in &self.children {
@@ -201,6 +220,35 @@ impl RefNode {
     }
 }
 
+/// Read a repository metadata file, preserving its bytes when present.
+///
+/// The file is resolved relative to the repository's common directory. Missing
+/// files return `Ok(None)`; existing files are returned byte-for-byte in
+/// `Ok(Some(_))`.
+///
+/// The capture example exercises this behavior for both metadata files: their
+/// contents remain raw bytes in the resulting Git blobs.
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!(
+///     "git-op-read-repository-file-{}-{unique}",
+///     std::process::id()
+/// ));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// std::fs::write(repo.common_dir().join("description"), b"raw bytes\\xff\\n")
+///     .expect("write description");
+/// let state = git_op::capture(&repo).expect("capture repository state");
+/// let description = repo
+///     .find_blob(state.description.expect("description was captured").oid())
+///     .expect("read description blob");
+/// assert_eq!(description.data, b"raw bytes\\xff\\n");
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
 fn read_repository_file(repo: &gix::Repository, name: &str) -> Result<Option<Vec<u8>>, Error> {
     let path = repo.common_dir().join(name);
     match fs::read(path) {
@@ -210,7 +258,14 @@ fn read_repository_file(repo: &gix::Repository, name: &str) -> Result<Option<Vec
     }
 }
 
-fn operation_parent(repo: &gix::Repository, name: &RefName) -> Result<Option<ObjectId>, Error> {
+/// Resolve and validate the current operation-log ref target, if any.
+///
+/// A missing operation ref is represented as `None`. Existing targets must be
+/// direct references to commits; symbolic targets and references to other
+/// object kinds are rejected before a new snapshot is built. The public
+/// [`append`] and [`append_with_options`] functions use this check before
+/// constructing each candidate commit.
+fn operation_target(repo: &gix::Repository, name: &RefName) -> Result<Option<ObjectId>, Error> {
     let Some(reference) = repo.try_find_reference(name.as_str()).map_err(Error::git)? else {
         return Ok(None);
     };
@@ -224,6 +279,36 @@ fn operation_parent(repo: &gix::Repository, name: &RefName) -> Result<Option<Obj
 }
 
 /// Capture all included refs and repository metadata files from `repo`.
+///
+/// # Examples
+///
+/// This example verifies that repository files are stored as raw Git blobs and
+/// can be read back without interpreting their contents.
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-capture-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// std::fs::write(repo.common_dir().join("config"), b"[core]\n\tbare = false\n")
+///     .expect("write config");
+/// std::fs::write(repo.common_dir().join("description"), b"example repository\n")
+///     .expect("write description");
+///
+/// let state = git_op::capture(&repo).expect("capture repository state");
+/// let config = repo
+///     .find_blob(state.config.expect("config was created").oid())
+///     .expect("read config blob");
+/// let description = repo
+///     .find_blob(state.description.expect("description was created").oid())
+///     .expect("read description blob");
+/// assert_eq!(config.data, b"[core]\n\tbare = false\n");
+/// assert_eq!(description.data, b"example repository\n");
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
 pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
     let mut ref_values = BTreeMap::new();
     for reference in repo
@@ -264,30 +349,153 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
     })
 }
 
-/// Serialize a repository state into the repository's object database.
+/// Serialize a repository state into a Git tree object.
+///
+/// # Examples
+///
+/// A captured state can be encoded directly into the repository's object
+/// database and yields a tree object suitable for a snapshot commit.
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-serialize-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// let state = git_op::capture(&repo).expect("capture repository state");
+/// let tree = git_op::serialize(&repo, &state).expect("serialize repository state");
+/// assert_eq!(
+///     repo.find_header(tree).expect("read serialized tree").kind(),
+///     gix::objs::Kind::Tree,
+/// );
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
 pub fn serialize(repo: &gix::Repository, state: &RepositoryState) -> Result<ObjectId, Error> {
     facet_git_tree::serialize_into(state, repo).map_err(Error::Serialize)
 }
 
-/// Append a snapshot commit and CAS-advance [`OP_REF`].
+/// Append a snapshot commit and advance [`OP_REF`] with compare-and-swap.
+///
+/// # Examples
+///
+/// Appending to a repository creates a commit whose tree contains the
+/// captured state and publishes its object ID through [`OP_REF`].
+///
+/// ```
+/// use gix::bstr::ByteSlice;
+///
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-append-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// let commit = git_op::append(&repo, "initial snapshot").expect("append snapshot");
+/// assert_eq!(
+///     repo.find_commit(commit)
+///         .expect("read snapshot commit")
+///         .message()
+///         .expect("parse snapshot message")
+///         .summary()
+///         .as_bytes(),
+///     b"initial snapshot",
+/// );
+/// assert_eq!(
+///     repo.find_reference(git_op::OP_REF)
+///         .expect("read operation ref")
+///         .target()
+///         .try_id(),
+///     Some(commit.as_ref()),
+/// );
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
 pub fn append(repo: &gix::Repository, message: &str) -> Result<ObjectId, Error> {
+    append_with_options(repo, message, AppendOptions::default())
+}
+
+/// Append a snapshot commit with explicitly selected commit metadata.
+///
+/// Missing author or committer signatures are loaded from the repository's
+/// configured identity. The operation ref is advanced with compare-and-swap.
+///
+/// # Examples
+///
+/// A caller can provide deterministic signatures when importing or replaying
+/// snapshots.
+///
+/// ```
+/// use gix::bstr::ByteSlice;
+///
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-append-options-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// let signature = gix::actor::Signature {
+///     name: "snapshot importer".into(),
+///     email: "importer@example.com".into(),
+///     time: gix::date::Time { seconds: 1_700_000_000, offset: 0 },
+/// };
+/// let commit = git_op::append_with_options(
+///     &repo,
+///     "imported snapshot",
+///     git_op::AppendOptions {
+///         author: Some(signature.clone()),
+///         committer: Some(signature),
+///     },
+/// )
+/// .expect("append imported snapshot");
+/// let commit = repo.find_commit(commit).expect("read snapshot commit");
+/// assert_eq!(
+///     commit
+///         .author()
+///         .expect("read author")
+///         .email,
+///     "importer@example.com".as_bytes().as_bstr(),
+/// );
+/// assert_eq!(
+///     commit
+///         .committer()
+///         .expect("read committer")
+///         .email,
+///     "importer@example.com".as_bytes().as_bstr(),
+/// );
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
+pub fn append_with_options(
+    repo: &gix::Repository,
+    message: &str,
+    options: AppendOptions,
+) -> Result<ObjectId, Error> {
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let author = match options.author {
+        Some(author) => author,
+        None => refs.author().map_err(Error::git)?,
+    };
+    let committer = match options.committer {
+        Some(committer) => committer,
+        None => refs.signature().map_err(Error::git)?,
+    };
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
-        let parent = operation_parent(repo, &name)?;
+        let parent = operation_target(repo, &name)?;
         let state = capture(repo)?;
         let tree = serialize(repo, &state)?;
-        let commit = gix::objs::Commit {
+        let commit_id = write_commit(
+            repo,
             tree,
-            parents: parent.into_iter().collect(),
-            author: refs.author().map_err(Error::git)?,
-            committer: refs.signature().map_err(Error::git)?,
-            encoding: None,
-            message: message.into(),
-            extra_headers: Vec::new(),
-        };
-        let commit_id = repo.write(&commit).map_err(Error::git)?;
+            parent,
+            message,
+            &author,
+            &committer,
+            commit_signing_enabled(repo)?,
+        )?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
                 name: name.clone(),
@@ -308,81 +516,114 @@ pub fn append(repo: &gix::Repository, message: &str) -> Result<ObjectId, Error> 
     Err(Error::LostRace(MAX_APPEND_ATTEMPTS))
 }
 
-/// Read a repository state from an operation-log commit.
-pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState, Error> {
-    let commit = repo.find_commit(commit).map_err(Error::git)?;
-    let tree = commit.tree_id().map_err(Error::git)?.detach();
-    facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
-}
-
-/// Install the `reference-transaction` hook in this repository.
-pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
-    install_hook(git_path(repo, "hooks")?)
-}
-
-/// Install the hook in Git's configured global template directory, creating a
-/// default directory setting when `init.templateDir` is not configured.
-pub fn install_global() -> Result<(), Error> {
-    let template = match git_config_global_template()? {
-        Some(path) => path,
-        None => {
-            let config_home = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-                .ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))?;
-            let template = config_home.join("git/templates");
-            let status = Command::new("git")
-                .args(["config", "--global", "init.templateDir"])
-                .arg(&template)
-                .status()
-                .map_err(Error::git)?;
-            if !status.success() {
-                return Err(Error::message(format!(
-                    "git config --global failed with {status}"
-                )));
-            }
-            template
-        }
-    };
-    install_hook(template.join("hooks"))
-}
-
-fn git_path(repo: &gix::Repository, name: &str) -> Result<PathBuf, Error> {
-    let output = Command::new("git")
+/// Write a snapshot commit through Git, optionally letting Git sign it.
+///
+/// `git commit-tree` is used rather than constructing the commit object
+/// directly so Git's configured signing implementation can add a `gpgsig`
+/// header. It does not invoke commit hooks.
+fn write_commit(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    parent: Option<ObjectId>,
+    message: &str,
+    author: &gix::actor::Signature,
+    committer: &gix::actor::Signature,
+    signing: bool,
+) -> Result<ObjectId, Error> {
+    let mut command = Command::new("git");
+    command
         .current_dir(repo.current_dir())
-        .args(["rev-parse", "--path-format=absolute", "--git-path", name])
+        .arg("commit-tree")
+        .arg(tree.to_hex().to_string());
+    if let Some(parent) = parent {
+        command.args(["-p", &parent.to_hex().to_string()]);
+    }
+    command.arg("-m").arg(message);
+    if signing {
+        command.arg("-S");
+    }
+    let author = format_signature(author)?;
+    let committer = format_signature(committer)?;
+    let output = command
+        .env("GIT_DIR", repo.git_dir())
+        .env("GIT_AUTHOR_NAME", author.name)
+        .env("GIT_AUTHOR_EMAIL", author.email)
+        .env("GIT_AUTHOR_DATE", author.time)
+        .env("GIT_COMMITTER_NAME", committer.name)
+        .env("GIT_COMMITTER_EMAIL", committer.email)
+        .env("GIT_COMMITTER_DATE", committer.time)
         .output()
         .map_err(Error::git)?;
     if !output.status.success() {
         return Err(Error::message(format!(
-            "git rev-parse --git-path {name} failed: {}",
+            "git commit-tree failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let path = std::str::from_utf8(&output.stdout)
-        .map_err(|error| Error::message(error.to_string()))?
-        .trim();
-    Ok(PathBuf::from(path))
+    ObjectId::from_hex(
+        std::str::from_utf8(&output.stdout)
+            .map_err(|error| Error::message(error.to_string()))?
+            .trim()
+            .as_bytes(),
+    )
+    .map_err(|error| {
+        Error::message(format!(
+            "git commit-tree returned invalid object ID: {error}"
+        ))
+    })
 }
 
-fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
-    let output = Command::new("git")
-        .args(["config", "--global", "--path", "--get", "init.templateDir"])
-        .output()
-        .map_err(Error::git)?;
-    if output.status.success() {
-        let value = std::str::from_utf8(&output.stdout)
-            .map_err(|error| Error::message(error.to_string()))?
-            .trim();
-        return Ok((!value.is_empty()).then(|| PathBuf::from(value)));
+/// Format a Git signature for the commit environment.
+///
+/// Git reads names and email addresses from environment variables when
+/// creating a commit. Newlines are rejected because they could inject extra
+/// commit-header content.
+fn format_signature(signature: &gix::actor::Signature) -> Result<FormattedSignature, Error> {
+    if signature.name.contains(&b'\n') || signature.email.contains(&b'\n') {
+        return Err(Error::message("commit signature contains a newline"));
     }
-    if output.status.code() == Some(1) {
-        return Ok(None);
-    }
-    Err(Error::message(format!(
-        "git config --global --get init.templateDir failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+    Ok(FormattedSignature {
+        name: signature.name.to_string(),
+        email: signature.email.to_string(),
+        time: signature.time.to_string(),
+    })
+}
+
+struct FormattedSignature {
+    name: String,
+    email: String,
+    time: String,
+}
+
+/// Deserialize a repository state from a snapshot commit.
+///
+/// # Examples
+///
+/// A snapshot commit can be decoded into the same state representation that
+/// was captured before it was serialized.
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-read-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// std::fs::write(repo.common_dir().join("description"), b"snapshot example\n")
+///     .expect("write description");
+/// let commit = git_op::append(&repo, "capture metadata").expect("append snapshot");
+/// let state = git_op::read(&repo, commit).expect("read snapshot");
+/// let description = repo
+///     .find_blob(state.description.expect("description was captured").oid())
+///     .expect("read description blob");
+/// assert_eq!(description.data, b"snapshot example\n");
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
+pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState, Error> {
+    let commit = repo.find_commit(commit).map_err(Error::git)?;
+    let tree = commit.tree_id().map_err(Error::git)?.detach();
+    facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
 }
 
 /// Process one `reference-transaction` hook invocation.
@@ -391,6 +632,31 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 /// excluded refs are ignored. Updating [`OP_REF`] alone does not trigger a
 /// snapshot, which prevents the operation-log update from recursively invoking
 /// itself when Git runs hooks for ref transactions.
+///
+/// # Examples
+///
+/// The hook's preparatory phase does not write an operation commit. This makes
+/// it safe for Git to invoke the hook before the ref transaction is complete.
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!(
+///     "git-op-reference-transaction-{}-{unique}",
+///     std::process::id()
+/// ));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// git_op::reference_transaction(&repo, "prepared", b"transaction input\\n")
+///     .expect("process prepared transaction");
+/// assert!(repo
+///     .try_find_reference(git_op::OP_REF)
+///     .expect("look up operation ref")
+///     .is_none());
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
 pub fn reference_transaction(
     repo: &gix::Repository,
     phase: &str,
@@ -408,6 +674,13 @@ pub fn reference_transaction(
     }
 }
 
+/// Determine whether hook input includes a captured ref update.
+///
+/// Each non-empty line must contain Git's three whitespace-separated fields:
+/// old object ID, new object ID, and reference name. Both LF and CRLF input
+/// are accepted. The parser deliberately returns a boolean rather than the
+/// affected names because the hook only needs to decide whether to append a
+/// snapshot.
 fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
     let mut captured = false;
     let mut saw_line = false;
@@ -434,47 +707,65 @@ fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
     Ok(captured)
 }
 
-fn install_hook(hooks: impl AsRef<Path>) -> Result<(), Error> {
-    let hooks = hooks.as_ref();
-    fs::create_dir_all(hooks).map_err(Error::git)?;
-    let path = hooks.join(HOOK_NAME);
-    match fs::read(&path) {
-        Ok(existing) if existing == HOOK_BODY.as_bytes() => {
-            make_executable(&path)?;
-            return Ok(());
-        }
-        Ok(_) => return Err(Error::HookExists(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Error::git(error)),
-    }
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::HookExists(path));
-        }
-        Err(error) => return Err(Error::git(error)),
-    };
-    file.write_all(HOOK_BODY.as_bytes()).map_err(Error::git)?;
-    file.sync_all().map_err(Error::git)?;
-    drop(file);
-    make_executable(&path)
-}
-
-fn make_executable(path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path).map_err(Error::git)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).map_err(Error::git)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        path::PathBuf,
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
+    static NEXT_TEMP_REPOSITORY: AtomicUsize = AtomicUsize::new(0);
+
+    /// Own a temporary repository and remove it when the test finishes.
+    struct TemporaryRepository {
+        root: PathBuf,
+        repo: gix::Repository,
+    }
+
+    impl TemporaryRepository {
+        /// Create a repository with deterministic commit identity settings.
+        fn new() -> Self {
+            let root = loop {
+                let sequence = NEXT_TEMP_REPOSITORY.fetch_add(1, Ordering::Relaxed);
+                let candidate = std::env::temp_dir()
+                    .join(format!("git-op-test-{}-{sequence}", std::process::id()));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create temporary repository directory: {error}"),
+                }
+            };
+            gix::init(&root).expect("initialize temporary repository");
+            for (key, value) in [("user.name", "git-op test"), ("user.email", "git-op@test")] {
+                let status = Command::new("git")
+                    .current_dir(&root)
+                    .args(["config", "--local", key, value])
+                    .status()
+                    .expect("configure temporary repository");
+                assert!(status.success(), "git config {key} failed with {status}");
+            }
+            let repo = gix::open(&root).expect("reopen configured temporary repository");
+            Self { root, repo }
+        }
+    }
+
+    impl Drop for TemporaryRepository {
+        /// Remove the temporary repository after the test completes.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Verify that the test repository can create a snapshot commit.
+    #[test]
+    fn temporary_repository_has_commit_identity() {
+        let temporary = TemporaryRepository::new();
+        append(&temporary.repo, "test snapshot").expect("append snapshot");
+    }
+
+    /// Verify that operation, remote, and pseudo refs are excluded.
     #[test]
     fn ref_filter_excludes_operation_and_remote_refs() {
         assert!(is_captured_ref(b"refs/heads/main"));
@@ -484,6 +775,7 @@ mod tests {
         assert!(!is_captured_ref(b"HEAD"));
     }
 
+    /// Verify that conflicting ref paths are rejected.
     #[test]
     fn ref_tree_rejects_file_directory_conflicts() {
         let refs = BTreeMap::from([
@@ -496,6 +788,7 @@ mod tests {
         ));
     }
 
+    /// Verify that hook input identifies only captured refs.
     #[test]
     fn hook_parser_classifies_only_captured_refs() {
         let oid = b"0000000000000000000000000000000000000000";
@@ -547,6 +840,7 @@ mod tests {
         );
     }
 
+    /// Verify that empty hook input is rejected.
     #[test]
     fn hook_parser_rejects_empty_transactions() {
         assert!(matches!(
