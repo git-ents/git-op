@@ -480,6 +480,14 @@ pub fn append_with_options(
     message: &str,
     options: AppendOptions,
 ) -> Result<ObjectId, Error> {
+    append_internal(repo, CommitMessage::Explicit(message), options)
+}
+
+fn append_internal(
+    repo: &gix::Repository,
+    requested_message: CommitMessage<'_>,
+    options: AppendOptions,
+) -> Result<ObjectId, Error> {
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
     let signing = commit_signing_enabled(repo)?;
@@ -495,8 +503,12 @@ pub fn append_with_options(
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let parent = operation_target(repo, &name)?;
         let state = capture(repo)?;
+        let message = match requested_message {
+            CommitMessage::Explicit(message) => message.to_owned(),
+            CommitMessage::Generated => snapshot_message(repo, parent, &state)?,
+        };
         let tree = serialize(repo, &state)?;
-        let commit_id = write_commit(repo, tree, parent, message, &author, &committer, signing)?;
+        let commit_id = write_commit(repo, tree, parent, &message, &author, &committer, signing)?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
                 name: name.clone(),
@@ -522,6 +534,34 @@ pub fn append_with_options(
 /// `git commit-tree` is used rather than constructing the commit object
 /// directly so Git's configured signing implementation can add a `gpgsig`
 /// header. It does not invoke commit hooks.
+fn snapshot_message(
+    repo: &gix::Repository,
+    parent: Option<ObjectId>,
+    state: &RepositoryState,
+) -> Result<String, Error> {
+    let Some(parent) = parent else {
+        return Ok("op: capture initial repository state".to_owned());
+    };
+    let previous = read(repo, parent)?;
+    let mut changed = Vec::new();
+    if previous.r#refs != state.r#refs {
+        changed.push("refs");
+    }
+    if previous.config != state.config {
+        changed.push("config");
+    }
+    if previous.description != state.description {
+        changed.push("description");
+    }
+    let summary = match changed.as_slice() {
+        [] => "metadata".to_owned(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    Ok(format!("op: update {summary}"))
+}
+
 fn write_commit(
     repo: &gix::Repository,
     tree: ObjectId,
@@ -594,6 +634,11 @@ struct FormattedSignature {
     name: String,
     email: String,
     time: String,
+}
+
+enum CommitMessage<'a> {
+    Explicit(&'a str),
+    Generated,
 }
 
 /// Deserialize a repository state from a snapshot commit.
@@ -872,7 +917,7 @@ pub fn reference_transaction(
         "preparing" | "prepared" | "aborted" => Ok(()),
         "committed" => {
             if transaction_changes_captured_refs(input)? {
-                append(repo, "reference-transaction")?;
+                append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
             }
             Ok(())
         }
