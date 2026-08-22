@@ -721,7 +721,7 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    ObjectId::from_hex(
+    let oid = ObjectId::from_hex(
         std::str::from_utf8(&output.stdout)
             .map_err(|error| Error::message(error.to_string()))?
             .trim()
@@ -729,7 +729,13 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
     )
     .map_err(|error| {
         Error::InvalidSnapshot(format!("Git returned an invalid operation ID: {error}"))
-    })
+    })?;
+    read(repo, oid).map_err(|error| {
+        Error::InvalidSnapshot(format!(
+            "{specification:?} is not an operation snapshot: {error}"
+        ))
+    })?;
+    Ok(oid)
 }
 
 /// Apply a captured state to the repository's refs and metadata files.
