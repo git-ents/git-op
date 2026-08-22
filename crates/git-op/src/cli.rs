@@ -36,11 +36,15 @@ pub(crate) enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Restore the repository metadata captured by an operation commit.
+    /// Restore refs, repository config, and description from an operation snapshot.
+    ///
+    /// The working tree and index are not changed.
     Restore {
         /// The operation commit to restore.
         oid: String,
     },
     /// Restore the state before the latest operation-log commit.
+    ///
+    /// The working tree and index are not changed.
     Undo,
 }

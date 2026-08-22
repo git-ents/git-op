@@ -674,7 +674,8 @@ pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState,
 
 /// Restore repository refs and metadata from an operation-log commit.
 ///
-/// Restoration itself is recorded as a new operation commit, so `undo` can
+/// The working tree and index are not changed. Restoration itself is recorded
+/// as a new operation commit, so `undo` can
 /// restore the state that preceded the restore. The operation ref is advanced
 /// only after all captured refs and files have been restored successfully.
 pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Error> {
@@ -685,7 +686,8 @@ pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Err
 
 /// Restore the state captured by the parent of the latest operation commit.
 ///
-/// Like [`restore`], undo is itself appended to the operation log. An initial
+/// The working tree and index are not changed. Like [`restore`], undo is itself
+/// appended to the operation log. An initial
 /// operation has no earlier snapshot and cannot be undone.
 pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
