@@ -10,12 +10,13 @@ use std::{
 use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
-const HOOK_BODY: &str = "#!/bin/sh\nexec git-op reference-transaction \"$@\"\n";
+const HOOK_BODY: &str = "#!/bin/sh\nexec op reference-transaction \"$@\"\n";
+const LEGACY_HOOK_BODY: &str = "#!/bin/sh\nexec git-op reference-transaction \"$@\"\n";
 
 /// Install the `reference-transaction` hook in this repository.
 ///
-/// Existing hooks created by `git-op` are updated idempotently. An unrelated
-/// hook is never overwritten.
+/// Existing hooks created by `op` or the legacy `git-op` name are updated
+/// idempotently. An unrelated hook is never overwritten.
 ///
 /// # Examples
 ///
@@ -33,7 +34,7 @@ const HOOK_BODY: &str = "#!/bin/sh\nexec git-op reference-transaction \"$@\"\n";
 /// git_op::install_local(&repo).expect("install reference-transaction hook");
 /// let hook = repo.git_dir().join("hooks/reference-transaction");
 /// let body = std::fs::read_to_string(hook).expect("read installed hook");
-/// assert!(body.contains("git-op reference-transaction"));
+/// assert!(body.contains("op reference-transaction"));
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
@@ -164,7 +165,9 @@ fn install_hook(hooks: impl AsRef<Path>) -> Result<(), Error> {
     fs::create_dir_all(hooks).map_err(Error::git)?;
     let path = hooks.join(HOOK_NAME);
     match fs::read(&path) {
-        Ok(existing) if existing == HOOK_BODY.as_bytes() => {
+        Ok(existing)
+            if existing == HOOK_BODY.as_bytes() || existing == LEGACY_HOOK_BODY.as_bytes() =>
+        {
             make_executable(&path)?;
             return Ok(());
         }

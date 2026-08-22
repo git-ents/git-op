@@ -9,6 +9,9 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
         Command::Install { local } => install(local),
+        Command::Log { args } => log(args),
+        Command::Restore { oid } => restore(&oid),
+        Command::Undo => undo(),
     }
 }
 
@@ -29,5 +32,36 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         git_op::install_global()?;
     }
+    Ok(())
+}
+
+/// Show operation-log commits by delegating formatting and filtering to Git.
+fn log(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = gix::discover(".")?;
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(repo.current_dir())
+        .env("GIT_DIR", repo.git_dir())
+        .arg("log");
+    command.args(args).args(["--", git_op::OP_REF]);
+    let status = command.status()?;
+    if !status.success() {
+        return Err(format!("git log failed with {status}").into());
+    }
+    Ok(())
+}
+
+/// Restore one operation-log commit into the current repository.
+fn restore(oid: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = gix::discover(".")?;
+    let oid = git_op::resolve_operation(&repo, oid)?;
+    git_op::restore(&repo, oid)?;
+    Ok(())
+}
+
+/// Restore the state before the latest operation-log commit.
+fn undo() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = gix::discover(".")?;
+    git_op::undo(&repo)?;
     Ok(())
 }

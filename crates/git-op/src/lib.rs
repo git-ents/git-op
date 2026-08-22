@@ -8,6 +8,8 @@ use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 use facet::Facet;
 use facet_git_tree::{RawBlob, RawTree};
 use gix::objs::{Kind, Write};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit as GixRefEdit, RefLog};
+use gix::refs::{FullName, Target};
 use gix::{self, bstr::ByteSlice};
 use gix_refstore::{ApplyError, Committer, GixRefStore, ObjectId, RefEdit, RefName, RefStore};
 
@@ -75,6 +77,12 @@ pub enum Error {
     /// Installing the hook would overwrite a hook not installed by this crate.
     #[error("refusing to overwrite existing hook {0}")]
     HookExists(PathBuf),
+    /// The operation log has no earlier snapshot to restore.
+    #[error("the operation log has no earlier snapshot to restore")]
+    NothingToUndo,
+    /// A snapshot contains a reference or metadata value that cannot be restored.
+    #[error("invalid snapshot content: {0}")]
+    InvalidSnapshot(String),
 }
 
 impl Error {
@@ -474,6 +482,7 @@ pub fn append_with_options(
 ) -> Result<ObjectId, Error> {
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let signing = commit_signing_enabled(repo)?;
     let author = match options.author {
         Some(author) => author,
         None => refs.author().map_err(Error::git)?,
@@ -487,15 +496,7 @@ pub fn append_with_options(
         let parent = operation_target(repo, &name)?;
         let state = capture(repo)?;
         let tree = serialize(repo, &state)?;
-        let commit_id = write_commit(
-            repo,
-            tree,
-            parent,
-            message,
-            &author,
-            &committer,
-            commit_signing_enabled(repo)?,
-        )?;
+        let commit_id = write_commit(repo, tree, parent, message, &author, &committer, signing)?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
                 name: name.clone(),
@@ -626,12 +627,217 @@ pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState,
     facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
 }
 
+/// Restore repository refs and metadata from an operation-log commit.
+///
+/// Restoration itself is recorded as a new operation commit, so `undo` can
+/// restore the state that preceded the restore. The operation ref is advanced
+/// only after all captured refs and files have been restored successfully.
+pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Error> {
+    let state = read(repo, commit)?;
+    apply_state(repo, &state)?;
+    append(repo, &format!("restore {commit}"))
+}
+
+/// Restore the state captured by the parent of the latest operation commit.
+///
+/// Like [`restore`], undo is itself appended to the operation log. An initial
+/// operation has no earlier snapshot and cannot be undone.
+pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
+    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let latest = operation_target(repo, &name)?.ok_or(Error::NothingToUndo)?;
+    let parent = repo
+        .find_commit(latest)
+        .map_err(Error::git)?
+        .parent_ids()
+        .next()
+        .map(|id| id.detach())
+        .ok_or(Error::NothingToUndo)?;
+    let state = read(repo, parent)?;
+    apply_state(repo, &state)?;
+    append(repo, &format!("undo {latest}"))
+}
+
+/// Resolve an operation commit specification using Git's revision parser.
+///
+/// This accepts full and abbreviated object IDs, as well as any commit
+/// expression understood by `git rev-parse`, while requiring the result to be
+/// a commit.
+pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<ObjectId, Error> {
+    let output = Command::new("git")
+        .current_dir(repo.current_dir())
+        .env("GIT_DIR", repo.git_dir())
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{specification}^{{commit}}"))
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Err(Error::InvalidSnapshot(format!(
+            "cannot resolve operation {specification:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    ObjectId::from_hex(
+        std::str::from_utf8(&output.stdout)
+            .map_err(|error| Error::message(error.to_string()))?
+            .trim()
+            .as_bytes(),
+    )
+    .map_err(|error| {
+        Error::InvalidSnapshot(format!("Git returned an invalid operation ID: {error}"))
+    })
+}
+
+/// Apply a captured state to the repository's refs and metadata files.
+fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Error> {
+    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+    let captured = updates.iter().map(|(name, _)| name.clone()).collect();
+    apply_ref_updates(repo, updates, captured)?;
+    restore_metadata_file(repo, "config", state.config.map(|blob| blob.oid()))?;
+    restore_metadata_file(
+        repo,
+        "description",
+        state.description.map(|blob| blob.oid()),
+    )?;
+    Ok(())
+}
+
+/// Flatten a nested refs tree into Git ref-file contents.
+fn collect_ref_updates(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    prefix: &str,
+    updates: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), Error> {
+    for entry in tree.decode().map_err(Error::git)?.entries {
+        let name = entry.filename.to_str().map_err(|_| {
+            Error::InvalidSnapshot(format!("non-UTF-8 reference path under {prefix}"))
+        })?;
+        let path = format!("{prefix}/{name}");
+        match entry.mode.kind() {
+            gix::objs::tree::EntryKind::Tree => {
+                collect_ref_updates(
+                    repo,
+                    &repo.find_tree(entry.oid).map_err(Error::git)?,
+                    &path,
+                    updates,
+                )?;
+            }
+            gix::objs::tree::EntryKind::Blob => {
+                let blob = repo.find_blob(entry.oid).map_err(Error::git)?;
+                updates.push((path, blob.data.to_vec()));
+            }
+            kind => {
+                return Err(Error::InvalidSnapshot(format!(
+                    "ref tree contains {kind:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace captured refs with the refs represented by a snapshot.
+fn apply_ref_updates(
+    repo: &gix::Repository,
+    updates: Vec<(String, Vec<u8>)>,
+    captured: std::collections::BTreeSet<String>,
+) -> Result<(), Error> {
+    let mut edits = Vec::new();
+    for reference in repo
+        .references()
+        .map_err(Error::git)?
+        .all()
+        .map_err(Error::git)?
+    {
+        let reference = reference.map_err(Error::git)?;
+        let name = reference.name().as_bstr().to_str().map_err(|_| {
+            Error::InvalidSnapshot("repository contains a non-UTF-8 ref name".to_owned())
+        })?;
+        if is_captured_ref(name.as_bytes()) && !captured.contains(name) {
+            let name = FullName::try_from(name).map_err(|_| Error::InvalidRef(name.to_owned()))?;
+            edits.push(GixRefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(reference.target().into_owned()),
+                    log: RefLog::AndReference,
+                },
+                name,
+                deref: false,
+            });
+        }
+    }
+    for (name, contents) in updates {
+        let name =
+            FullName::try_from(name.as_str()).map_err(|_| Error::InvalidRef(name.clone()))?;
+        let target = parse_ref_contents(&contents)?;
+        let expected = repo
+            .try_find_reference(name.as_ref())
+            .map_err(Error::git)?
+            .map_or(PreviousValue::MustNotExist, |reference| {
+                PreviousValue::MustExistAndMatch(reference.target().into_owned())
+            });
+        edits.push(GixRefEdit {
+            change: Change::Update {
+                log: LogChange::default(),
+                expected,
+                new: target,
+            },
+            name,
+            deref: false,
+        });
+    }
+    let committer = repo.committer().transpose().map_err(Error::git)?;
+    repo.edit_references_as(edits, committer)
+        .map_err(Error::git)?;
+    Ok(())
+}
+
+/// Parse a serialized direct or symbolic Git ref target.
+fn parse_ref_contents(contents: &[u8]) -> Result<Target, Error> {
+    let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if let Some(target) = contents.strip_prefix(b"ref: ") {
+        let target = std::str::from_utf8(target)
+            .map_err(|_| Error::InvalidSnapshot("symbolic ref is not UTF-8".to_owned()))?;
+        return Ok(Target::Symbolic(FullName::try_from(target).map_err(
+            |_| Error::InvalidSnapshot("invalid symbolic ref target".to_owned()),
+        )?));
+    }
+    ObjectId::from_hex(contents)
+        .map(Target::Object)
+        .map_err(|_| Error::InvalidSnapshot("invalid ref object ID".to_owned()))
+}
+
+/// Restore or remove one repository metadata file from a snapshot blob.
+fn restore_metadata_file(
+    repo: &gix::Repository,
+    name: &str,
+    blob: Option<ObjectId>,
+) -> Result<(), Error> {
+    let path = repo.common_dir().join(name);
+    match blob {
+        Some(blob) => {
+            let data = repo.find_blob(blob).map_err(Error::git)?.data.to_vec();
+            fs::write(path, data).map_err(Error::git)?;
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::git(error)),
+        },
+    }
+    Ok(())
+}
+
 /// Process one `reference-transaction` hook invocation.
 ///
 /// Only the committed phase creates a snapshot. Transactions that contain only
 /// excluded refs are ignored. Updating [`OP_REF`] alone does not trigger a
 /// snapshot, which prevents the operation-log update from recursively invoking
 /// itself when Git runs hooks for ref transactions.
+///
+/// Git invokes this hook with `preparing`, `prepared`, `committed`, or
+/// `aborted`; the non-committed phases do not write an operation commit.
 ///
 /// # Examples
 ///
@@ -663,7 +869,7 @@ pub fn reference_transaction(
     input: &[u8],
 ) -> Result<(), Error> {
     match phase {
-        "prepared" | "aborted" => Ok(()),
+        "preparing" | "prepared" | "aborted" => Ok(()),
         "committed" => {
             if transaction_changes_captured_refs(input)? {
                 append(repo, "reference-transaction")?;
@@ -837,6 +1043,23 @@ mod tests {
                 .concat()
             )
             .expect("valid transaction")
+        );
+    }
+
+    /// Verify that every non-committed hook phase is accepted without a snapshot.
+    #[test]
+    fn hook_accepts_non_committed_phases() {
+        let temporary = TemporaryRepository::new();
+        let input = b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n";
+        for phase in ["preparing", "prepared", "aborted"] {
+            reference_transaction(&temporary.repo, phase, input).expect("process hook phase");
+        }
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none()
         );
     }
 

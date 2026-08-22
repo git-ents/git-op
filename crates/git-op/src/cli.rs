@@ -30,4 +30,17 @@ pub(crate) enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Show the operation-log commits using Git's log command.
+    Log {
+        /// Additional arguments passed to `git log` after `refs/op`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Restore the repository metadata captured by an operation commit.
+    Restore {
+        /// The operation commit to restore.
+        oid: String,
+    },
+    /// Restore the state before the latest operation-log commit.
+    Undo,
 }
