@@ -480,6 +480,8 @@ dependencies = [
 name = "git-op"
 version = "0.0.0"
 dependencies = [
+ "anstream",
+ "anstyle",
  "clap",
  "facet",
  "facet-git-tree",
