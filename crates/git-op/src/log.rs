@@ -13,7 +13,7 @@ use anstyle::{AnsiColor, Style};
 
 use crate::exe::open_repository;
 
-/// Style for the `@` glyph marking the most recent snapshot.
+/// Style for the `●` glyph marking the most recent snapshot.
 const HEAD_GLYPH_STYLE: Style = AnsiColor::Green.on_default().bold();
 /// Style for the `○` glyph marking every other snapshot, and for the `│`
 /// graph connector between entries.
@@ -34,7 +34,7 @@ struct Entry {
     abbreviated_id: String,
     time: gix::date::Time,
     /// Whether this is the most recent snapshot (`refs/op` itself), drawn
-    /// with the `@` graph glyph. Set once at extraction time so it survives
+    /// with the `●` graph glyph. Set once at extraction time so it survives
     /// `--reverse` reordering the display.
     is_head: bool,
     /// The parts changed relative to the parent snapshot, or `None` for the
@@ -165,14 +165,14 @@ fn write_styled(out: &mut impl Write, style: Style, value: impl fmt::Display) ->
     write!(out, "{style}{value}{style:#}")
 }
 
-/// Render `entries` as a `jj`-style graph: an `@`/`○` glyph column connected
+/// Render `entries` as a `jj`-style graph: a `●`/`○` glyph column connected
 /// by `│`, with each snapshot's date, changed parts, and message body to its
 /// right.
 fn render_default(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
     for (index, entry) in entries.iter().enumerate() {
         let is_last = index + 1 == entries.len();
         let (glyph, glyph_style) = if entry.is_head {
-            ("@", HEAD_GLYPH_STYLE)
+            ("●", HEAD_GLYPH_STYLE)
         } else {
             ("○", DIM_STYLE)
         };
@@ -337,7 +337,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "@  3a7f2c1d9e4b  2026-08-22 14:03:11 -0400\n\
+            "●  3a7f2c1d9e4b  2026-08-22 14:03:11 -0400\n\
              │  op: update refs and config\n\
              │  Changed: refs, config\n\
              │\n\
@@ -363,7 +363,7 @@ mod tests {
             rendered.contains("\x1b["),
             "expected ANSI escape codes in forced-color output, got {rendered:?}"
         );
-        assert!(rendered.contains('@'));
+        assert!(rendered.contains('●'));
     }
 
     #[test]
