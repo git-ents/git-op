@@ -5,6 +5,8 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 clap = { version = "4.6.6", features = ["derive"] }
 facet = { version = "=0.50.0-rc.5", features = ["reflect"] }
 facet-git-tree = { git = "https://github.com/git-ents/git-store", version = "0.1.0" }

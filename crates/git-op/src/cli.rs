@@ -30,17 +30,96 @@ pub(crate) enum Command {
         #[arg(long)]
         local: bool,
     },
-    /// Show the operation-log commits using Git's log command.
+    /// Show the recorded operation-log snapshots, most recent first.
     Log {
-        /// Additional arguments passed to `git log` after `refs/op`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Limit output to the first N snapshots.
+        #[arg(short = 'n', long = "max-count")]
+        max_count: Option<usize>,
+        /// Show the oldest snapshots first.
+        #[arg(long)]
+        reverse: bool,
+        /// List every changed ref instead of the first few.
+        #[arg(short = 'v', long, conflicts_with_all = ["oneline", "json"])]
+        verbose: bool,
+        /// Do not pipe terminal output through Git's configured pager.
+        #[arg(long)]
+        no_pager: bool,
+        /// Show each snapshot as one line: abbreviated id and message summary.
+        #[arg(long, conflicts_with = "json")]
+        oneline: bool,
+        /// Show each snapshot as one JSON object per line (JSON Lines).
+        #[arg(long)]
+        json: bool,
     },
-    /// Restore the repository metadata captured by an operation commit.
+    /// Restore refs, repository config, and description from an operation snapshot.
+    ///
+    /// The working tree and index are not changed.
     Restore {
         /// The operation commit to restore.
         oid: String,
     },
     /// Restore the state before the latest operation-log commit.
+    ///
+    /// The working tree and index are not changed.
     Undo,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn log_parses_max_count_and_reverse() {
+        let cli = Cli::try_parse_from(["git-op", "log", "-n", "2", "--reverse"])
+            .expect("parse log with max-count and reverse");
+        let Command::Log {
+            max_count,
+            reverse,
+            verbose,
+            no_pager,
+            oneline,
+            json,
+        } = cli.command
+        else {
+            panic!("expected the log command");
+        };
+        assert_eq!(max_count, Some(2));
+        assert!(reverse);
+        assert!(!verbose);
+        assert!(!no_pager);
+        assert!(!oneline);
+        assert!(!json);
+    }
+
+    #[test]
+    fn log_parses_no_pager() {
+        let cli = Cli::try_parse_from(["git-op", "log", "--no-pager"]).expect("parse --no-pager");
+        let Command::Log { no_pager, .. } = cli.command else {
+            panic!("expected the log command");
+        };
+        assert!(no_pager);
+    }
+
+    #[test]
+    fn log_rejects_oneline_and_json_together() {
+        let error = Cli::try_parse_from(["git-op", "log", "--oneline", "--json"])
+            .expect_err("--oneline and --json must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn log_rejects_unknown_git_log_flags() {
+        let error = Cli::try_parse_from(["git-op", "log", "--all"])
+            .expect_err("--all is not a git-op log flag");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn log_rejects_revision_arguments() {
+        let error = Cli::try_parse_from(["git-op", "log", "HEAD~1..HEAD"])
+            .expect_err("git-op log takes no positional revision argument");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 }

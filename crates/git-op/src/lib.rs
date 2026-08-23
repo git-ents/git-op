@@ -480,6 +480,14 @@ pub fn append_with_options(
     message: &str,
     options: AppendOptions,
 ) -> Result<ObjectId, Error> {
+    append_internal(repo, CommitMessage::Explicit(message), options)
+}
+
+fn append_internal(
+    repo: &gix::Repository,
+    requested_message: CommitMessage<'_>,
+    options: AppendOptions,
+) -> Result<ObjectId, Error> {
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
     let signing = commit_signing_enabled(repo)?;
@@ -495,8 +503,20 @@ pub fn append_with_options(
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let parent = operation_target(repo, &name)?;
         let state = capture(repo)?;
+        let message = match (requested_message, parent) {
+            (CommitMessage::Explicit(message), _) => message.to_owned(),
+            (CommitMessage::Generated, None) => "op: capture initial repository state".to_owned(),
+            (CommitMessage::Generated, Some(parent)) => {
+                let changed =
+                    SnapshotEntries::from_state(&state).diff(&SnapshotEntries::read(repo, parent)?);
+                let Some(message) = snapshot_message(changed) else {
+                    return Ok(parent);
+                };
+                message
+            }
+        };
         let tree = serialize(repo, &state)?;
-        let commit_id = write_commit(repo, tree, parent, message, &author, &committer, signing)?;
+        let commit_id = write_commit(repo, tree, parent, &message, &author, &committer, signing)?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
                 name: name.clone(),
@@ -596,6 +616,12 @@ struct FormattedSignature {
     time: String,
 }
 
+#[derive(Clone, Copy)]
+enum CommitMessage<'a> {
+    Explicit(&'a str),
+    Generated,
+}
+
 /// Deserialize a repository state from a snapshot commit.
 ///
 /// # Examples
@@ -627,20 +653,378 @@ pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState,
     facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
 }
 
+/// The parts of the captured state that a snapshot changed relative to its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Changes {
+    /// Whether the captured refs tree changed.
+    pub r#refs: bool,
+    /// Whether the captured `config` file changed.
+    pub config: bool,
+    /// Whether the captured `description` file changed.
+    pub description: bool,
+}
+
+impl Changes {
+    /// The names of the changed parts, in capture order.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.r#refs {
+            names.push("refs");
+        }
+        names.extend(self.file_names());
+        names
+    }
+
+    /// The names of the changed metadata files, in capture order.
+    pub fn file_names(&self) -> Vec<&'static str> {
+        [(self.config, "config"), (self.description, "description")]
+            .into_iter()
+            .filter_map(|(changed, name)| changed.then_some(name))
+            .collect()
+    }
+}
+
+/// One captured ref changed by a snapshot, relative to its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefChange {
+    /// The full ref name, including the `refs/` prefix.
+    pub name: String,
+    /// The transition the ref made.
+    pub kind: RefChangeKind,
+}
+
+/// How a captured ref's target changed between two snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefChangeKind {
+    /// The ref exists only in the newer snapshot.
+    Created(Target),
+    /// The ref exists only in the older snapshot.
+    Deleted(Target),
+    /// The ref exists in both snapshots with different targets.
+    Updated {
+        /// The target in the older snapshot.
+        old: Target,
+        /// The target in the newer snapshot.
+        new: Target,
+    },
+}
+
+/// The object IDs of a snapshot commit's top-level `refs`, `config`, and
+/// `description` tree entries.
+///
+/// Comparing only these entries, rather than the fully deserialized
+/// [`RepositoryState`], avoids walking the entire captured refs tree just to
+/// detect whether a snapshot changed anything.
+struct SnapshotEntries {
+    r#refs: ObjectId,
+    config: Option<ObjectId>,
+    description: Option<ObjectId>,
+}
+
+impl SnapshotEntries {
+    /// Read the top-level tree entries of a snapshot commit.
+    fn read(repo: &gix::Repository, commit: ObjectId) -> Result<Self, Error> {
+        let tree_id = repo
+            .find_commit(commit)
+            .map_err(Error::git)?
+            .tree_id()
+            .map_err(Error::git)?
+            .detach();
+        let tree = repo.find_tree(tree_id).map_err(Error::git)?;
+        let mut refs = None;
+        let mut config = None;
+        let mut description = None;
+        for entry in tree.decode().map_err(Error::git)?.entries {
+            match entry.filename.to_str().ok() {
+                Some("refs") => refs = Some(entry.oid.to_owned()),
+                Some("config") => {
+                    config = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?)
+                }
+                Some("description") => {
+                    description = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?);
+                }
+                _ => {}
+            }
+        }
+        let r#refs = refs.ok_or_else(|| {
+            Error::InvalidSnapshot(format!("{commit} is missing its refs tree entry"))
+        })?;
+        Ok(Self {
+            r#refs,
+            config: config.flatten(),
+            description: description.flatten(),
+        })
+    }
+
+    /// Read the blob wrapped by a `facet_git_tree` `Option<RawBlob>` field.
+    ///
+    /// `facet_git_tree` encodes an absent value as an empty tree and a
+    /// present value as a tree with a single `some` entry, rather than
+    /// storing a blob directly under the field name.
+    fn read_optional_blob(
+        repo: &gix::Repository,
+        tree: ObjectId,
+    ) -> Result<Option<ObjectId>, Error> {
+        let tree = repo.find_tree(tree).map_err(Error::git)?;
+        for entry in tree.decode().map_err(Error::git)?.entries {
+            if entry.filename.to_str().ok() == Some("some") {
+                return Ok(Some(entry.oid.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The entries a pending state would serialize to, without reading anything.
+    fn from_state(state: &RepositoryState) -> Self {
+        Self {
+            r#refs: state.r#refs.oid(),
+            config: state.config.map(|blob| blob.oid()),
+            description: state.description.map(|blob| blob.oid()),
+        }
+    }
+
+    /// The changes `self` represents relative to `previous`.
+    fn diff(&self, previous: &Self) -> Changes {
+        Changes {
+            r#refs: self.r#refs != previous.r#refs,
+            config: self.config != previous.config,
+            description: self.description != previous.description,
+        }
+    }
+}
+
+/// The parts changed by `commit` relative to its parent, or `None` when
+/// `commit` is the initial snapshot and has no parent to compare against.
+///
+/// # Examples
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-changes-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+///
+/// let initial = git_op::append(&repo, "initial snapshot").expect("append initial snapshot");
+/// assert_eq!(git_op::changes(&repo, initial).expect("compute changes"), None);
+///
+/// std::fs::write(repo.common_dir().join("description"), b"example\n")
+///     .expect("write description");
+/// let update = git_op::append(&repo, "update snapshot").expect("append updated snapshot");
+/// let changed = git_op::changes(&repo, update)
+///     .expect("compute changes")
+///     .expect("updated snapshot has a parent");
+/// assert_eq!(changed.names(), vec!["description"]);
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
+pub fn changes(repo: &gix::Repository, commit: ObjectId) -> Result<Option<Changes>, Error> {
+    let Some(parent) = parent_snapshot(repo, commit)? else {
+        return Ok(None);
+    };
+    let current = SnapshotEntries::read(repo, commit)?;
+    let previous = SnapshotEntries::read(repo, parent)?;
+    Ok(Some(current.diff(&previous)))
+}
+
+/// The first parent of a snapshot commit, or `None` for the initial snapshot.
+fn parent_snapshot(repo: &gix::Repository, commit: ObjectId) -> Result<Option<ObjectId>, Error> {
+    Ok(repo
+        .find_commit(commit)
+        .map_err(Error::git)?
+        .parent_ids()
+        .next()
+        .map(|id| id.detach()))
+}
+
+/// The individual refs `commit` changed relative to its parent, ordered by
+/// name, or `None` when `commit` is the initial snapshot and has no parent to
+/// compare against.
+///
+/// # Examples
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-ref-changes-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// let empty_tree = repo.write_object(&gix::objs::Tree::empty()).expect("write empty tree");
+/// let target = repo
+///     .commit("refs/heads/main", "example", empty_tree, gix::commit::NO_PARENT_IDS)
+///     .expect("commit to main")
+///     .detach();
+///
+/// let initial = git_op::append(&repo, "initial snapshot").expect("append initial snapshot");
+/// assert_eq!(git_op::ref_changes(&repo, initial).expect("compute ref changes"), None);
+///
+/// repo.reference("refs/heads/topic", target, gix::refs::transaction::PreviousValue::MustNotExist, "branch")
+///     .expect("create topic");
+/// let update = git_op::append(&repo, "create topic").expect("append updated snapshot");
+/// let changed = git_op::ref_changes(&repo, update)
+///     .expect("compute ref changes")
+///     .expect("updated snapshot has a parent");
+/// assert_eq!(
+///     changed,
+///     vec![git_op::RefChange {
+///         name: "refs/heads/topic".to_owned(),
+///         kind: git_op::RefChangeKind::Created(gix::refs::Target::Object(target)),
+///     }],
+/// );
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
+pub fn ref_changes(
+    repo: &gix::Repository,
+    commit: ObjectId,
+) -> Result<Option<Vec<RefChange>>, Error> {
+    let Some(parent) = parent_snapshot(repo, commit)? else {
+        return Ok(None);
+    };
+    let current = SnapshotEntries::read(repo, commit)?;
+    let previous = SnapshotEntries::read(repo, parent)?;
+    let mut changes = Vec::new();
+    diff_ref_trees(repo, previous.r#refs, current.r#refs, "refs", &mut changes)?;
+    Ok(Some(changes))
+}
+
+/// Compare two captured ref trees, appending one [`RefChange`] per ref whose
+/// target differs.
+///
+/// Subtrees with equal object IDs are identical by construction, so the walk
+/// never descends into unchanged parts of the ref namespace.
+fn diff_ref_trees(
+    repo: &gix::Repository,
+    previous: ObjectId,
+    current: ObjectId,
+    prefix: &str,
+    changes: &mut Vec<RefChange>,
+) -> Result<(), Error> {
+    use gix::objs::tree::EntryKind;
+
+    let previous = ref_tree_entries(repo, previous)?;
+    let current = ref_tree_entries(repo, current)?;
+    let names: std::collections::BTreeSet<&String> =
+        previous.keys().chain(current.keys()).collect();
+    for name in names {
+        let path = format!("{prefix}/{name}");
+        match (previous.get(name), current.get(name)) {
+            (Some(previous), Some(current)) if previous == current => {}
+            (Some((EntryKind::Tree, previous)), Some((EntryKind::Tree, current))) => {
+                diff_ref_trees(repo, *previous, *current, &path, changes)?;
+            }
+            (Some((EntryKind::Blob, previous)), Some((EntryKind::Blob, current))) => {
+                changes.push(RefChange {
+                    name: path,
+                    kind: RefChangeKind::Updated {
+                        old: read_ref_target(repo, *previous)?,
+                        new: read_ref_target(repo, *current)?,
+                    },
+                });
+            }
+            (previous, current) => {
+                for (name, target) in ref_tree_targets(repo, previous, &path)? {
+                    changes.push(RefChange {
+                        name,
+                        kind: RefChangeKind::Deleted(target),
+                    });
+                }
+                for (name, target) in ref_tree_targets(repo, current, &path)? {
+                    changes.push(RefChange {
+                        name,
+                        kind: RefChangeKind::Created(target),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The immediate entries of a captured ref tree, keyed by path component.
+fn ref_tree_entries(
+    repo: &gix::Repository,
+    tree: ObjectId,
+) -> Result<BTreeMap<String, (gix::objs::tree::EntryKind, ObjectId)>, Error> {
+    let tree = repo.find_tree(tree).map_err(Error::git)?;
+    let mut entries = BTreeMap::new();
+    for entry in tree.decode().map_err(Error::git)?.entries {
+        let name = entry
+            .filename
+            .to_str()
+            .map_err(|_| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
+        let kind = match entry.mode.kind() {
+            kind @ (gix::objs::tree::EntryKind::Tree | gix::objs::tree::EntryKind::Blob) => kind,
+            kind => {
+                return Err(Error::InvalidSnapshot(format!(
+                    "ref tree contains {kind:?}"
+                )));
+            }
+        };
+        entries.insert(name.to_owned(), (kind, entry.oid.to_owned()));
+    }
+    Ok(entries)
+}
+
+/// Every ref reachable from one side of a ref-tree comparison, paired with its
+/// target; empty when that side has no entry at `path`.
+fn ref_tree_targets(
+    repo: &gix::Repository,
+    entry: Option<&(gix::objs::tree::EntryKind, ObjectId)>,
+    path: &str,
+) -> Result<Vec<(String, Target)>, Error> {
+    let Some((kind, oid)) = entry else {
+        return Ok(Vec::new());
+    };
+    if matches!(kind, gix::objs::tree::EntryKind::Blob) {
+        return Ok(vec![(path.to_owned(), read_ref_target(repo, *oid)?)]);
+    }
+    let tree = repo.find_tree(*oid).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &tree, path, &mut updates)?;
+    updates
+        .into_iter()
+        .map(|(name, contents)| Ok((name, parse_ref_contents(&contents)?)))
+        .collect()
+}
+
+/// Read a captured ref blob as a ref target.
+fn read_ref_target(repo: &gix::Repository, blob: ObjectId) -> Result<Target, Error> {
+    let blob = repo.find_blob(blob).map_err(Error::git)?;
+    parse_ref_contents(&blob.data)
+}
+
+/// Compose the summary line for a generated snapshot commit, or `None` when
+/// `changed` has no changed parts.
+fn snapshot_message(changed: Changes) -> Option<String> {
+    let names = changed.names();
+    let summary = match names.as_slice() {
+        [] => return None,
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    Some(format!("op: update {summary}"))
+}
+
 /// Restore repository refs and metadata from an operation-log commit.
 ///
-/// Restoration itself is recorded as a new operation commit, so `undo` can
+/// The working tree and index are not changed. Restoration itself is recorded
+/// as a new operation commit, so `undo` can
 /// restore the state that preceded the restore. The operation ref is advanced
 /// only after all captured refs and files have been restored successfully.
 pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Error> {
     let state = read(repo, commit)?;
     apply_state(repo, &state)?;
-    append(repo, &format!("restore {commit}"))
+    append(repo, &format!("op: restore {commit}"))
 }
 
 /// Restore the state captured by the parent of the latest operation commit.
 ///
-/// Like [`restore`], undo is itself appended to the operation log. An initial
+/// The working tree and index are not changed. Like [`restore`], undo is itself
+/// appended to the operation log. An initial
 /// operation has no earlier snapshot and cannot be undone.
 pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
@@ -654,7 +1038,7 @@ pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
         .ok_or(Error::NothingToUndo)?;
     let state = read(repo, parent)?;
     apply_state(repo, &state)?;
-    append(repo, &format!("undo {latest}"))
+    append(repo, &format!("op: undo {latest}"))
 }
 
 /// Resolve an operation commit specification using Git's revision parser.
@@ -676,7 +1060,7 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    ObjectId::from_hex(
+    let oid = ObjectId::from_hex(
         std::str::from_utf8(&output.stdout)
             .map_err(|error| Error::message(error.to_string()))?
             .trim()
@@ -684,7 +1068,11 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
     )
     .map_err(|error| {
         Error::InvalidSnapshot(format!("Git returned an invalid operation ID: {error}"))
-    })
+    })?;
+    read(repo, oid).map_err(|_| {
+        Error::InvalidSnapshot(format!("{specification:?} is not an operation snapshot"))
+    })?;
+    Ok(oid)
 }
 
 /// Apply a captured state to the repository's refs and metadata files.
@@ -831,10 +1219,13 @@ fn restore_metadata_file(
 
 /// Process one `reference-transaction` hook invocation.
 ///
-/// Only the committed phase creates a snapshot. Transactions that contain only
-/// excluded refs are ignored. Updating [`OP_REF`] alone does not trigger a
-/// snapshot, which prevents the operation-log update from recursively invoking
-/// itself when Git runs hooks for ref transactions.
+/// Only the committed phase attempts a snapshot, and only a transaction that
+/// actually changes the captured refs, config, or description produces a new
+/// commit; a captured transaction that leaves the state unchanged is a no-op.
+/// Transactions that contain only excluded refs are ignored. Updating
+/// [`OP_REF`] alone does not trigger a snapshot, which prevents the
+/// operation-log update from recursively invoking itself when Git runs hooks
+/// for ref transactions.
 ///
 /// Git invokes this hook with `preparing`, `prepared`, `committed`, or
 /// `aborted`; the non-committed phases do not write an operation commit.
@@ -872,7 +1263,7 @@ pub fn reference_transaction(
         "preparing" | "prepared" | "aborted" => Ok(()),
         "committed" => {
             if transaction_changes_captured_refs(input)? {
-                append(repo, "reference-transaction")?;
+                append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
             }
             Ok(())
         }
@@ -969,6 +1360,220 @@ mod tests {
     fn temporary_repository_has_commit_identity() {
         let temporary = TemporaryRepository::new();
         append(&temporary.repo, "test snapshot").expect("append snapshot");
+    }
+
+    /// Verify that generated messages identify changed snapshot components.
+    #[test]
+    fn generated_snapshot_message_identifies_changes() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(initial)
+                .expect("find initial snapshot")
+                .message()
+                .expect("read initial message")
+                .summary()
+                .as_bytes(),
+            b"op: capture initial repository state"
+        );
+
+        fs::write(
+            temporary.repo.common_dir().join("description"),
+            b"example\n",
+        )
+        .expect("write description");
+        Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["update-ref", "refs/heads/example", &initial.to_string()])
+            .status()
+            .expect("update example ref")
+            .success()
+            .then_some(())
+            .expect("update example ref succeeds");
+        let update = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append changed snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(update)
+                .expect("find changed snapshot")
+                .message()
+                .expect("read changed message")
+                .summary()
+                .as_bytes(),
+            b"op: update refs and description"
+        );
+    }
+
+    /// Verify that a single changed part produces a singular update message.
+    #[test]
+    fn generated_snapshot_message_reports_single_change() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["update-ref", "refs/heads/example", &initial.to_string()])
+            .status()
+            .expect("update example ref")
+            .success()
+            .then_some(())
+            .expect("update example ref succeeds");
+        let update = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append changed snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(update)
+                .expect("find changed snapshot")
+                .message()
+                .expect("read changed message")
+                .summary()
+                .as_bytes(),
+            b"op: update refs"
+        );
+    }
+
+    /// Verify that three changed parts are joined with an Oxford comma.
+    #[test]
+    fn generated_snapshot_message_reports_three_changes() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["update-ref", "refs/heads/example", &initial.to_string()])
+            .status()
+            .expect("update example ref")
+            .success()
+            .then_some(())
+            .expect("update example ref succeeds");
+        let config_path = temporary.repo.common_dir().join("config");
+        let mut config = fs::read(&config_path).expect("read config");
+        config.extend_from_slice(b"[extra]\n\tflag = true\n");
+        fs::write(&config_path, config).expect("write config");
+        fs::write(
+            temporary.repo.common_dir().join("description"),
+            b"example\n",
+        )
+        .expect("write description");
+        let update = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append changed snapshot");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(update)
+                .expect("find changed snapshot")
+                .message()
+                .expect("read changed message")
+                .summary()
+                .as_bytes(),
+            b"op: update refs, config, and description"
+        );
+    }
+
+    /// Verify that a generated append with nothing to record neither creates a
+    /// commit nor advances the operation ref.
+    #[test]
+    fn generated_append_is_noop_when_nothing_changed() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        let repeat = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append unchanged snapshot");
+        assert_eq!(repeat, initial);
+        assert_eq!(
+            temporary
+                .repo
+                .find_reference(OP_REF)
+                .expect("read operation ref")
+                .target()
+                .try_id(),
+            Some(initial.as_ref())
+        );
+    }
+
+    /// Verify that `changes` reports `None` for the initial snapshot and the
+    /// correct parts changed for a later one.
+    #[test]
+    fn changes_reports_parts_changed_since_parent() {
+        let temporary = TemporaryRepository::new();
+        let initial = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append initial snapshot");
+        assert_eq!(
+            changes(&temporary.repo, initial).expect("compute changes"),
+            None
+        );
+
+        Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["update-ref", "refs/heads/example", &initial.to_string()])
+            .status()
+            .expect("update example ref")
+            .success()
+            .then_some(())
+            .expect("update example ref succeeds");
+        fs::write(
+            temporary.repo.common_dir().join("description"),
+            b"example\n",
+        )
+        .expect("write description");
+        let update = append_internal(
+            &temporary.repo,
+            CommitMessage::Generated,
+            AppendOptions::default(),
+        )
+        .expect("append changed snapshot");
+        let changed = changes(&temporary.repo, update)
+            .expect("compute changes")
+            .expect("updated snapshot has a parent");
+        assert_eq!(
+            changed,
+            Changes {
+                r#refs: true,
+                config: false,
+                description: true,
+            }
+        );
     }
 
     /// Verify that operation, remote, and pseudo refs are excluded.
