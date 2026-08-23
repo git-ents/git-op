@@ -1102,13 +1102,41 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
     let mut updates = Vec::new();
     collect_ref_updates(repo, &refs, "refs", &mut updates)?;
     let captured = updates.iter().map(|(name, _)| name.clone()).collect();
+    let head = repo
+        .find_reference("HEAD")
+        .map_err(Error::git)?
+        .target()
+        .into_owned();
     apply_ref_updates(repo, updates, captured)?;
+    set_head(repo, head)?;
     restore_metadata_file(repo, "config", state.config.map(|blob| blob.oid()))?;
     restore_metadata_file(
         repo,
         "description",
         state.description.map(|blob| blob.oid()),
     )?;
+    Ok(())
+}
+
+/// Keep symbolic `HEAD` attached to the branch restored from the snapshot.
+fn set_head(repo: &gix::Repository, head: Target) -> Result<(), Error> {
+    let Target::Symbolic(branch) = head else {
+        return Ok(());
+    };
+    let head = FullName::try_from("HEAD").expect("HEAD is a valid full ref name");
+    repo.edit_reference(GixRefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                ..Default::default()
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch),
+        },
+        name: head,
+        deref: false,
+    })
+    .map_err(Error::git)?;
     Ok(())
 }
 
@@ -1416,6 +1444,85 @@ mod tests {
                 .expect("find operation commit")
                 .message_raw_sloppy(),
             b"op: capture initial repository state\n\nInvoked-by: git commit\n"
+        );
+    }
+
+    /// Run Git in a temporary repository and require successful completion.
+    fn git(temporary: &TemporaryRepository, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(&temporary.root)
+            .args(args)
+            .status()
+            .expect("run Git");
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    /// Verify that restoring a branch ref also updates its symbolic `HEAD` target.
+    #[test]
+    fn restore_updates_head_for_current_branch() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        let first = temporary
+            .repo
+            .head_id()
+            .expect("read first commit")
+            .detach();
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
+        let second = temporary
+            .repo
+            .head_id()
+            .expect("read second commit")
+            .detach();
+        assert_ne!(first, second);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        restore(&temporary.repo, initial).expect("restore initial snapshot");
+
+        assert_eq!(temporary.repo.head_id().expect("read restored HEAD"), first);
+        assert_eq!(
+            temporary
+                .repo
+                .head_name()
+                .expect("read HEAD name")
+                .map(|name| name.to_string()),
+            Some("refs/heads/main".to_owned())
+        );
+    }
+
+    /// Verify that restoring a detached repository leaves `HEAD` detached at its current commit.
+    #[test]
+    fn restore_preserves_detached_head_commit() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        let first = temporary
+            .repo
+            .head_id()
+            .expect("read first commit")
+            .detach();
+        git(&temporary, &["checkout", "--detach", &first.to_string()]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
+        let second = temporary
+            .repo
+            .head_id()
+            .expect("read second commit")
+            .detach();
+        assert_ne!(first, second);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        restore(&temporary.repo, initial).expect("restore initial snapshot");
+
+        assert_eq!(
+            temporary.repo.head_id().expect("read restored HEAD"),
+            second
+        );
+        assert!(
+            temporary
+                .repo
+                .head_name()
+                .expect("read HEAD name")
+                .is_none()
         );
     }
 
