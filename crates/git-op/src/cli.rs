@@ -41,6 +41,9 @@ pub(crate) enum Command {
         /// List every changed ref instead of the first few.
         #[arg(short = 'v', long, conflicts_with_all = ["oneline", "json"])]
         verbose: bool,
+        /// Do not pipe terminal output through Git's configured pager.
+        #[arg(long)]
+        no_pager: bool,
         /// Show each snapshot as one line: abbreviated id and message summary.
         #[arg(long, conflicts_with = "json")]
         oneline: bool,
@@ -75,6 +78,7 @@ mod tests {
             max_count,
             reverse,
             verbose,
+            no_pager,
             oneline,
             json,
         } = cli.command
@@ -84,8 +88,18 @@ mod tests {
         assert_eq!(max_count, Some(2));
         assert!(reverse);
         assert!(!verbose);
+        assert!(!no_pager);
         assert!(!oneline);
         assert!(!json);
+    }
+
+    #[test]
+    fn log_parses_no_pager() {
+        let cli = Cli::try_parse_from(["git-op", "log", "--no-pager"]).expect("parse --no-pager");
+        let Command::Log { no_pager, .. } = cli.command else {
+            panic!("expected the log command");
+        };
+        assert!(no_pager);
     }
 
     #[test]

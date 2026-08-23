@@ -6,7 +6,8 @@
 //! on) before the repository is even opened.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::process::{Child, Command, Stdio};
 
 use anstream::AutoStream;
 use anstyle::{AnsiColor, Style};
@@ -168,6 +169,7 @@ pub(crate) fn run(
     max_count: Option<usize>,
     reverse: bool,
     verbose: bool,
+    no_pager: bool,
     oneline: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,19 +195,93 @@ pub(crate) fn run(
         entries.reverse();
     }
 
+    if !no_pager && io::stdout().is_terminal() {
+        render_paged(&entries, format, verbose)?;
+    } else {
+        render_unpaged(&entries, format, verbose)?;
+    }
+    Ok(())
+}
+
+fn render_unpaged(
+    entries: &[Entry],
+    format: Format,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     match format {
-        // JSON is for machine consumption: never style it, and skip the
-        // terminal-detecting stream wrapper.
         Format::Json => {
             let mut out = io::stdout().lock();
-            ignore_broken_pipe(render(&mut out, &entries, format, verbose))?;
+            ignore_broken_pipe(render(&mut out, entries, format, verbose))?;
         }
         Format::Default | Format::Oneline => {
             let mut out = AutoStream::auto(io::stdout().lock());
-            ignore_broken_pipe(render(&mut out, &entries, format, verbose))?;
+            ignore_broken_pipe(render(&mut out, entries, format, verbose))?;
         }
     }
     Ok(())
+}
+
+fn render_paged(
+    entries: &[Entry],
+    format: Format,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut pager) = start_pager()? else {
+        return render_unpaged(entries, format, verbose);
+    };
+    let color_choice = AutoStream::choice(&io::stdout());
+    let result = match format {
+        Format::Json => {
+            let mut stdin = pager.stdin.take().ok_or_else(|| {
+                io::Error::other("configured pager did not provide standard input")
+            })?;
+            ignore_broken_pipe(render(&mut stdin, entries, format, verbose))
+        }
+        Format::Default | Format::Oneline => {
+            let stdin = pager.stdin.take().ok_or_else(|| {
+                io::Error::other("configured pager did not provide standard input")
+            })?;
+            let mut out = AutoStream::new(Box::new(stdin) as Box<dyn Write>, color_choice);
+            ignore_broken_pipe(render(&mut out, entries, format, verbose))
+        }
+    };
+    let status = pager.wait()?;
+    result?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("pager exited with {status}")).into())
+    }
+}
+
+fn start_pager() -> Result<Option<Child>, Box<dyn std::error::Error>> {
+    if std::env::var_os("GIT_PAGER").is_some_and(|pager| pager.is_empty()) {
+        return Ok(None);
+    }
+    let mut pager_command = Command::new("git");
+    pager_command.args(["var", "GIT_PAGER"]);
+    if let Some(value) = std::env::var_os("GIT_PAGER") {
+        pager_command.env("GIT_PAGER", value);
+    }
+    let pager = pager_command.output()?;
+    if !pager.status.success() {
+        return Err(io::Error::other("unable to determine Git's configured pager").into());
+    }
+    let command = String::from_utf8(pager.stdout)?.trim().to_owned();
+    if command.is_empty() {
+        return Ok(None);
+    }
+    let mut process = Command::new("sh");
+    process
+        .args(["-c", &command])
+        .env("GIT_PAGER", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if std::env::var_os("LESS").is_none() {
+        process.env("LESS", "FRX");
+    }
+    Ok(Some(process.spawn()?))
 }
 
 /// Walk `refs/op` by first parent from `tip`, extracting at most `max_count`
