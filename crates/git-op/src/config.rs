@@ -20,10 +20,12 @@ const HOOK_NAME: &str = "reference-transaction";
 /// transaction and aborting the Git command that triggered it, and `git
 /// rev-parse` keeps the hook quiet while `git init` is still creating the
 /// repository. Swallowing a failed guard, and running rather than `exec`ing
-/// git-op, leaves a host hook's own lines intact.
+/// git-op, leaves a host hook's own lines intact. The binary is run directly
+/// rather than dispatched through `git op`, which a future Git subcommand of
+/// that name would shadow.
 macro_rules! hook_line {
     () => {
-        "if command -v git-op >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then git op reference-transaction \"$@\" || exit $?; fi\n"
+        "if command -v git-op >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then git-op reference-transaction \"$@\" || exit $?; fi\n"
     };
 }
 
@@ -53,7 +55,7 @@ const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 /// git_op::install_local(&repo).expect("install reference-transaction hook");
 /// let hook = repo.git_dir().join("hooks/reference-transaction");
 /// let body = std::fs::read_to_string(hook).expect("read installed hook");
-/// assert!(body.contains("git op reference-transaction"));
+/// assert!(body.contains("git-op reference-transaction"));
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
