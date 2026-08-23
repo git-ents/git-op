@@ -127,4 +127,20 @@ mod tests {
         );
         assert_eq!(git_command("git-op reference-transaction committed"), None);
     }
+
+    #[test]
+    fn excludes_arguments_that_may_contain_secrets() {
+        const SECRET: &str = "super-secret-token";
+        let commands = [
+            format!("git -c http.extraheader=Authorization:{SECRET} commit"),
+            format!("git commit https://user:{SECRET}@example.com/repository"),
+            format!("git commit --password={SECRET}"),
+        ];
+
+        for command in commands {
+            let invoked_by = git_command(&command).expect("identify git command");
+            assert_eq!(invoked_by, "git commit");
+            assert!(!invoked_by.contains(SECRET));
+        }
+    }
 }

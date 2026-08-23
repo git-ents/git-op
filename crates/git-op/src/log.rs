@@ -149,10 +149,26 @@ impl Entry {
             .unwrap_or(&[])
     }
 
-    /// The message body with at most one trailing newline removed, matching
-    /// how Git stores commit messages.
+    /// The message body without the operation's invoking-command trailer.
     fn body(&self) -> &[u8] {
-        self.message.strip_suffix(b"\n").unwrap_or(&self.message)
+        let message = self.message.strip_suffix(b"\n").unwrap_or(&self.message);
+        self.invoked_by()
+            .and_then(|_| {
+                message
+                    .windows(2)
+                    .rposition(|window| window == b"\n\n")
+                    .map(|separator| &message[..separator])
+            })
+            .unwrap_or(message)
+    }
+
+    /// The invoking command stored in the final `Invoked-by` paragraph.
+    fn invoked_by(&self) -> Option<&[u8]> {
+        let message = self.message.strip_suffix(b"\n").unwrap_or(&self.message);
+        let separator = message.windows(2).rposition(|window| window == b"\n\n")?;
+        let trailer = &message[separator + 2..];
+        let value = trailer.strip_prefix(b"Invoked-by: ")?;
+        (!value.is_empty() && !value.contains(&b'\n')).then_some(value)
     }
 }
 
@@ -427,6 +443,17 @@ fn render_default(out: &mut impl Write, entries: &[Entry], verbose: bool) -> io:
             }
         }
 
+        if let Some(invoked_by) = entry.invoked_by() {
+            write_styled(out, DIM_STYLE, connector)?;
+            writeln!(out)?;
+            write_styled(out, DIM_STYLE, connector)?;
+            write!(out, "  ")?;
+            write_styled(out, DIM_STYLE, "Invoked by:")?;
+            write!(out, " ")?;
+            write_styled(out, CHANGED_STYLE, String::from_utf8_lossy(invoked_by))?;
+            writeln!(out)?;
+        }
+
         if !is_last {
             write_styled(out, DIM_STYLE, connector)?;
             writeln!(out)?;
@@ -690,6 +717,57 @@ mod tests {
              ○  9b1e0042ac31  2026-08-22 14:03:11 -0400\n\
              \x20\x20\x20op: capture initial repository state\n"
         );
+    }
+
+    #[test]
+    fn entry_splits_invoked_by_trailer_from_body() {
+        let entry = entry(
+            "id",
+            "id",
+            true,
+            None,
+            "op: update refs\n\nInvoked-by: git -C repo commit\n",
+        );
+
+        assert_eq!(entry.body(), b"op: update refs");
+        assert_eq!(entry.invoked_by(), Some(&b"git -C repo commit"[..]));
+    }
+
+    #[test]
+    fn entry_keeps_messages_without_invoked_by_trailer() {
+        let entry = entry("id", "id", true, None, "summary\n\nbody\n");
+
+        assert_eq!(entry.body(), b"summary\n\nbody");
+        assert_eq!(entry.invoked_by(), None);
+    }
+
+    #[test]
+    fn default_format_renders_invoked_by_after_refs() {
+        let entries = vec![entry(
+            "3a7f2c1d9e4b",
+            "3a7f2c1",
+            true,
+            Some(Changed {
+                refs: vec![ref_line(
+                    "refs/heads/main",
+                    Transition::Updated {
+                        old: target("1e2ea16"),
+                        new: target("dc80af7"),
+                    },
+                )],
+                files: vec!["config"],
+            }),
+            "op: update refs\n\nInvoked-by: git commit\n",
+        )];
+
+        let rendered = render_with_color(&entries, Format::Default, anstream::ColorChoice::Never);
+
+        assert!(rendered.starts_with("●  3a7f2c1  2026-08-22 14:03:11 -0400\n"));
+        assert!(rendered.contains("   op: update refs\n"));
+        assert!(rendered.contains("   refs/heads/main  1e2ea16 → dc80af7\n"));
+        assert!(rendered.contains("   Changed: config\n"));
+        assert!(rendered.ends_with(" \n   Invoked by: git commit\n"));
+        assert!(!rendered.contains("Invoked-by:"));
     }
 
     #[test]
