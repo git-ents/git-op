@@ -1141,21 +1141,39 @@ fn set_head(repo: &gix::Repository, head: Target) -> Result<(), Error> {
     Ok(())
 }
 
+/// Sync the index and working tree to the resolved `HEAD` commit.
+///
+/// This performs the same index and worktree update as `git reset --hard`,
+/// but through `git read-tree --reset -u HEAD` rather than `git reset`, since
+/// `reset` also rewrites the current branch ref to the same value it already
+/// holds. That redundant ref update is otherwise indistinguishable from a
+/// real ref change to the `reference-transaction` hook, which would record a
+/// spurious operation snapshot for `restore` and `undo` themselves. Reading
+/// the tree instead touches only the index and worktree, so it cannot fire
+/// ref-update hooks and needs no hook-suppressing configuration.
+///
+/// TODO: Replace this shell-out with `gix`'s native worktree checkout
+/// (the `worktree-mutation` feature, backed by `gix-worktree-state` and
+/// `gix-index`) once we've implemented the "remove files absent from the
+/// target tree" half of a hard reset ourselves; `gix_worktree_state::checkout`
+/// only writes/overwrites entries present in the target tree, it does not
+/// delete worktree files that a hard reset would remove.
 fn reset_worktree(repo: &gix::Repository) -> Result<(), Error> {
     let Some(workdir) = repo.workdir() else {
         return Ok(());
     };
+    let head = repo.head_id().map_err(Error::git)?.detach().to_string();
     let status = Command::new("git")
         .current_dir(workdir)
         .env("GIT_DIR", repo.git_dir())
-        .args(["reset", "--hard", "--quiet", "HEAD"])
+        .args(["read-tree", "--reset", "-u", &head])
         .status()
         .map_err(Error::git)?;
     if status.success() {
         Ok(())
     } else {
         Err(Error::message(format!(
-            "git reset --hard HEAD failed with {status}"
+            "git read-tree --reset -u {head} failed with {status}"
         )))
     }
 }
@@ -1573,6 +1591,59 @@ mod tests {
                 .head_name()
                 .expect("read HEAD name")
                 .is_none()
+        );
+    }
+
+    /// Verify that restoring and then undoing returns refs and checkout state.
+    #[test]
+    fn restore_then_undo_restores_original_state() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"original\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let target = append(&temporary.repo, "target snapshot").expect("append target snapshot");
+        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
+        git(&temporary, &["commit", "-am", "two"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        let original_head = temporary
+            .repo
+            .head_id()
+            .expect("read original HEAD")
+            .detach();
+        let hooks = temporary.root.join("hooks");
+        fs::create_dir(&hooks).expect("create hooks directory");
+        let hook = hooks.join("reference-transaction");
+        fs::write(&hook, b"#!/bin/sh\nexit 1\n").expect("write rejecting hook");
+        let status = Command::new("chmod")
+            .args(["+x", hook.to_str().expect("hook path is UTF-8")])
+            .status()
+            .expect("make hook executable");
+        assert!(status.success(), "chmod failed with {status}");
+        git(
+            &temporary,
+            &[
+                "config",
+                "core.hooksPath",
+                hooks.to_str().expect("hooks path is UTF-8"),
+            ],
+        );
+
+        let restored = restore(&temporary.repo, target).expect("restore target snapshot");
+        undo(&temporary.repo).expect("undo restore");
+        assert_ne!(restored, target);
+
+        assert_eq!(
+            temporary.repo.head_id().expect("read restored HEAD"),
+            original_head
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("tracked")).expect("read restored file"),
+            "changed\n"
+        );
+        assert_eq!(
+            git_output(&temporary, &["status", "--porcelain"]),
+            "?? hooks/\n"
         );
     }
 
