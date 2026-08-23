@@ -51,16 +51,12 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Restore refs, repository config, and description from an operation snapshot.
-    ///
-    /// The working tree and index are not changed.
+    /// Restore refs, repository config, description, working tree, and index from an operation snapshot.
     Restore {
         /// The operation commit to restore.
         oid: String,
     },
-    /// Restore the state before the latest operation-log commit.
-    ///
-    /// The working tree and index are not changed.
+    /// Restore the state before the latest operation-log commit, including the working tree and index.
     Undo,
 }
 

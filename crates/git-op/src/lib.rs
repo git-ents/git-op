@@ -1032,10 +1032,10 @@ fn snapshot_message(changed: Changes) -> Option<String> {
 
 /// Restore repository refs and metadata from an operation-log commit.
 ///
-/// The working tree and index are not changed. Restoration itself is recorded
-/// as a new operation commit, so `undo` can
-/// restore the state that preceded the restore. The operation ref is advanced
-/// only after all captured refs and files have been restored successfully.
+/// The working tree and index are reset to the restored `HEAD`. Restoration
+/// itself is recorded as a new operation commit, so `undo` can restore the
+/// state that preceded the restore. The operation ref is advanced only after
+/// all captured refs and files have been restored successfully.
 pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Error> {
     let state = read(repo, commit)?;
     apply_state(repo, &state)?;
@@ -1044,8 +1044,8 @@ pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Err
 
 /// Restore the state captured by the parent of the latest operation commit.
 ///
-/// The working tree and index are not changed. Like [`restore`], undo is itself
-/// appended to the operation log. An initial
+/// The working tree and index are reset to the restored `HEAD`. Like
+/// [`restore`], undo is itself appended to the operation log. An initial
 /// operation has no earlier snapshot and cannot be undone.
 pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
@@ -1109,6 +1109,7 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
         .into_owned();
     apply_ref_updates(repo, updates, captured)?;
     set_head(repo, head)?;
+    reset_worktree(repo)?;
     restore_metadata_file(repo, "config", state.config.map(|blob| blob.oid()))?;
     restore_metadata_file(
         repo,
@@ -1138,6 +1139,25 @@ fn set_head(repo: &gix::Repository, head: Target) -> Result<(), Error> {
     })
     .map_err(Error::git)?;
     Ok(())
+}
+
+fn reset_worktree(repo: &gix::Repository) -> Result<(), Error> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let status = Command::new("git")
+        .current_dir(workdir)
+        .env("GIT_DIR", repo.git_dir())
+        .args(["reset", "--hard", "--quiet", "HEAD"])
+        .status()
+        .map_err(Error::git)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::message(format!(
+            "git reset --hard HEAD failed with {status}"
+        )))
+    }
 }
 
 /// Flatten a nested refs tree into Git ref-file contents.
@@ -1457,11 +1477,27 @@ mod tests {
         assert!(status.success(), "git {args:?} failed with {status}");
     }
 
+    fn git_output(temporary: &TemporaryRepository, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(&temporary.root)
+            .args(args)
+            .output()
+            .expect("run Git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed with {}",
+            output.status
+        );
+        String::from_utf8(output.stdout).expect("Git output is UTF-8")
+    }
+
     /// Verify that restoring a branch ref also updates its symbolic `HEAD` target.
     #[test]
     fn restore_updates_head_for_current_branch() {
         let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
         let first = temporary
             .repo
             .head_id()
@@ -1476,10 +1512,22 @@ mod tests {
             .detach();
         assert_ne!(first, second);
         append(&temporary.repo, "current snapshot").expect("append current snapshot");
+        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
+        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
+        git(&temporary, &["add", "staged"]);
+        assert_eq!(
+            git_output(&temporary, &["diff", "--cached", "--name-only"]),
+            "staged\n"
+        );
 
         restore(&temporary.repo, initial).expect("restore initial snapshot");
 
         assert_eq!(temporary.repo.head_id().expect("read restored HEAD"), first);
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("tracked")).expect("read restored file"),
+            "initial\n"
+        );
+        assert_eq!(git_output(&temporary, &["status", "--porcelain"]), "");
         assert_eq!(
             temporary
                 .repo
@@ -1510,6 +1558,8 @@ mod tests {
             .detach();
         assert_ne!(first, second);
         append(&temporary.repo, "current snapshot").expect("append current snapshot");
+        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
+        git(&temporary, &["add", "staged"]);
 
         restore(&temporary.repo, initial).expect("restore initial snapshot");
 
