@@ -11,21 +11,11 @@ use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
 
-/// The one line git-op owns, expanded through a macro so [`HOOK_LINE`] and
-/// [`HOOK_BODY`] share one copy of the text and cannot drift apart.
-///
-/// Naming the entry point is what marks the line as git-op's, so every
-/// statement stays on it and removing it needs no knowledge of surrounding
-/// scaffolding. `command -v` keeps an uninstalled git-op from failing the
-/// transaction and aborting the Git command that triggered it, and `git
-/// rev-parse` keeps the hook quiet while `git init` is still creating the
-/// repository. Swallowing a failed guard, and running rather than `exec`ing
-/// git-op, leaves a host hook's own lines intact. The binary is run directly
-/// rather than dispatched through `git op`, which a future Git subcommand of
-/// that name would shadow.
+/// The generated block is shared by fresh installs and hook upgrades.
+/// TODO: Split this into readable shell lines once block rewriting can do so.
 macro_rules! hook_line {
     () => {
-        "if command -v git-op >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then git-op reference-transaction \"$@\" || exit $?; fi\n"
+        "if git rev-parse --git-dir >/dev/null 2>&1; then hook=$(git rev-parse --git-path hooks/reference-transaction 2>/dev/null) || { status=$?; echo \"git-op: unable to determine hook path with exit $status\" >&2; exit \"$status\"; }; command -v git-op >/dev/null 2>&1 || { echo \"git-op: executable not found in PATH; install git-op or fix $hook\" >&2; exit 127; }; git-op reference-transaction \"$@\" || { status=$?; echo \"git-op: reference-transaction failed with exit $status\" >&2; exit \"$status\"; }; fi\n"
     };
 }
 
@@ -35,7 +25,7 @@ const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 
 /// Install the `reference-transaction` hook in this repository.
 ///
-/// The line git-op owns is rewritten in place, whether written by an older
+/// The git-op block is rewritten in place, whether written by an older
 /// version of git-op or merged into a hook of your own. A hook that does not
 /// invoke git-op is never overwritten.
 ///
@@ -177,28 +167,29 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
     )))
 }
 
-/// Return whether `line` runs git-op's hook entry point rather than describing it.
+/// Return whether `line` is a non-comment line owned by git-op.
 fn invokes_git_op(line: &str) -> bool {
     let line = line.trim();
     !line.starts_with('#')
-        && (line.contains("git op reference-transaction")
-            || line.contains("git-op reference-transaction"))
+        && (line.contains("git-op") || line.contains("git op reference-transaction"))
 }
 
-/// Rewrite git-op's line in `existing`, or `None` if it invokes no git-op hook.
+/// Rewrite git-op's block in `existing`, or `None` if no owned line exists.
 ///
-/// [`HOOK_LINE`] replaces the first line invoking git-op and any further ones
-/// are dropped; every other line, including its terminator, is preserved byte
-/// for byte.
+/// [`HOOK_LINE`] replaces the first owned line and all further owned lines are
+/// dropped; every other line, including its terminator, is preserved byte for
+/// byte.
 fn rewrite_managed_line(existing: &str) -> Option<String> {
     let mut rewritten = String::with_capacity(existing.len() + HOOK_LINE.len());
     let mut spliced = false;
     for line in existing.split_inclusive('\n') {
-        if !invokes_git_op(line.trim_end_matches(['\n', '\r'])) {
+        if invokes_git_op(line.trim_end_matches(['\n', '\r'])) {
+            if !spliced {
+                rewritten.push_str(HOOK_LINE);
+                spliced = true;
+            }
+        } else {
             rewritten.push_str(line);
-        } else if !spliced {
-            rewritten.push_str(HOOK_LINE);
-            spliced = true;
         }
     }
     spliced.then_some(rewritten)
@@ -348,6 +339,26 @@ mod tests {
     #[test]
     fn hook_body_is_recognized_unchanged() {
         assert_eq!(rewrite_managed_line(HOOK_BODY).as_deref(), Some(HOOK_BODY));
+    }
+
+    #[test]
+    fn rewrite_removes_every_git_op_line() {
+        let existing = concat!(
+            "#!/bin/sh\n",
+            "echo before\n",
+            "git-op old-hook-line\n",
+            "# git-op in a comment\n",
+            "git op reference-transaction \"$@\"\n",
+            "echo after\n",
+        );
+        let expected = format!(
+            "#!/bin/sh\n{}{}{}{}",
+            "echo before\n", HOOK_LINE, "# git-op in a comment\n", "echo after\n",
+        );
+        assert_eq!(
+            rewrite_managed_line(existing).as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     /// Verify that a fresh install writes an executable hook with the current body.
