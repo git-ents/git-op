@@ -12,9 +12,10 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Log {
             max_count,
             reverse,
+            verbose,
             oneline,
             json,
-        } => crate::log::run(max_count, reverse, oneline, json),
+        } => crate::log::run(max_count, reverse, verbose, oneline, json),
         Command::Restore { oid } => restore(&oid),
         Command::Undo => undo(),
     }

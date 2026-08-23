@@ -38,6 +38,9 @@ pub(crate) enum Command {
         /// Show the oldest snapshots first.
         #[arg(long)]
         reverse: bool,
+        /// List every changed ref instead of the first few.
+        #[arg(short = 'v', long, conflicts_with_all = ["oneline", "json"])]
+        verbose: bool,
         /// Show each snapshot as one line: abbreviated id and message summary.
         #[arg(long, conflicts_with = "json")]
         oneline: bool,
@@ -71,6 +74,7 @@ mod tests {
         let Command::Log {
             max_count,
             reverse,
+            verbose,
             oneline,
             json,
         } = cli.command
@@ -79,6 +83,7 @@ mod tests {
         };
         assert_eq!(max_count, Some(2));
         assert!(reverse);
+        assert!(!verbose);
         assert!(!oneline);
         assert!(!json);
     }

@@ -10,6 +10,8 @@ use std::io::{self, Write};
 
 use anstream::AutoStream;
 use anstyle::{AnsiColor, Style};
+use gix::prelude::ObjectIdExt;
+use gix::refs::Target;
 
 use crate::exe::open_repository;
 
@@ -21,8 +23,12 @@ const DIM_STYLE: Style = Style::new().dimmed();
 /// Style for the abbreviated commit id, in both the default and oneline
 /// formats.
 const ID_STYLE: Style = AnsiColor::Yellow.on_default().bold();
-/// Style for the names of changed parts.
+/// Style for the names of changed parts and refs.
 const CHANGED_STYLE: Style = AnsiColor::Cyan.on_default();
+
+/// The number of changed refs listed per snapshot before the rest are
+/// summarized; `--verbose` lists them all.
+const MAX_REF_LINES: usize = 10;
 
 /// One rendered operation-log entry, extracted from a snapshot commit.
 ///
@@ -37,10 +43,100 @@ struct Entry {
     /// with the `●` graph glyph. Set once at extraction time so it survives
     /// `--reverse` reordering the display.
     is_head: bool,
-    /// The parts changed relative to the parent snapshot, or `None` for the
-    /// initial snapshot, which has no parent to compare against.
-    changed: Option<Vec<&'static str>>,
+    /// The changes relative to the parent snapshot, or `None` for the initial
+    /// snapshot, which has no parent to compare against.
+    changed: Option<Changed>,
     message: Vec<u8>,
+}
+
+/// What one snapshot changed, with ref targets already resolved for output.
+struct Changed {
+    /// Each changed ref, ordered by name.
+    refs: Vec<RefLine>,
+    /// The changed metadata files, in capture order.
+    files: Vec<&'static str>,
+}
+
+impl Changed {
+    /// The names of the changed parts, in capture order.
+    fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if !self.refs.is_empty() {
+            names.push("refs");
+        }
+        names.extend(self.files.iter().copied());
+        names
+    }
+}
+
+/// One changed ref, ready to render.
+struct RefLine {
+    name: String,
+    transition: Transition,
+}
+
+/// A changed ref's targets, as rendered strings.
+enum Transition {
+    Created(RefTarget),
+    Deleted(RefTarget),
+    Updated { old: RefTarget, new: RefTarget },
+}
+
+impl Transition {
+    /// The abbreviated target before the change, or a placeholder for a ref
+    /// that did not exist yet.
+    fn before(&self) -> &str {
+        match self {
+            Transition::Created(_) => "(new)",
+            Transition::Deleted(old) | Transition::Updated { old, .. } => &old.short,
+        }
+    }
+
+    /// The abbreviated target after the change, or a placeholder for a ref
+    /// that no longer exists.
+    fn after(&self) -> &str {
+        match self {
+            Transition::Deleted(_) => "(deleted)",
+            Transition::Created(new) | Transition::Updated { new, .. } => &new.short,
+        }
+    }
+
+    /// The targets as JSON values: the full ref-file contents on each side,
+    /// and `null` for the side where the ref does not exist.
+    fn json(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Transition::Created(new) => (None, Some(&new.full)),
+            Transition::Deleted(old) => (Some(&old.full), None),
+            Transition::Updated { old, new } => (Some(&old.full), Some(&new.full)),
+        }
+    }
+}
+
+/// A ref target rendered both for machines and for display.
+struct RefTarget {
+    /// Git's loose-ref file contents without the trailing newline: an object
+    /// ID, or `ref: ` followed by a symbolic target.
+    full: String,
+    /// The unambiguously abbreviated object ID, or the symbolic target name.
+    short: String,
+}
+
+impl RefTarget {
+    fn new(repo: &gix::Repository, target: &Target) -> Self {
+        match target {
+            Target::Object(id) => Self {
+                full: id.to_string(),
+                short: id.attach(repo).shorten_or_id().to_string(),
+            },
+            Target::Symbolic(name) => {
+                let name = name.as_bstr().to_string();
+                Self {
+                    full: format!("ref: {name}"),
+                    short: name,
+                }
+            }
+        }
+    }
 }
 
 impl Entry {
@@ -71,6 +167,7 @@ enum Format {
 pub(crate) fn run(
     max_count: Option<usize>,
     reverse: bool,
+    verbose: bool,
     oneline: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,11 +198,11 @@ pub(crate) fn run(
         // terminal-detecting stream wrapper.
         Format::Json => {
             let mut out = io::stdout().lock();
-            ignore_broken_pipe(render(&mut out, &entries, format))?;
+            ignore_broken_pipe(render(&mut out, &entries, format, verbose))?;
         }
         Format::Default | Format::Oneline => {
             let mut out = AutoStream::auto(io::stdout().lock());
-            ignore_broken_pipe(render(&mut out, &entries, format))?;
+            ignore_broken_pipe(render(&mut out, &entries, format, verbose))?;
         }
     }
     Ok(())
@@ -126,7 +223,17 @@ fn extract_entries(
         }
         let commit = repo.find_commit(id)?;
         let time = commit.committer()?.time()?;
-        let changed = git_op::changes(repo, id)?.map(|changes| changes.names());
+        let changed = match git_op::changes(repo, id)? {
+            Some(changes) => Some(Changed {
+                refs: if changes.r#refs {
+                    ref_lines(repo, id)?
+                } else {
+                    Vec::new()
+                },
+                files: changes.file_names(),
+            }),
+            None => None,
+        };
         current = commit.parent_ids().next().map(|parent| parent.detach());
         entries.push(Entry {
             id: id.to_string(),
@@ -140,6 +247,32 @@ fn extract_entries(
     Ok(entries)
 }
 
+/// Resolve the refs one snapshot changed into renderable lines.
+fn ref_lines(
+    repo: &gix::Repository,
+    commit: gix::ObjectId,
+) -> Result<Vec<RefLine>, Box<dyn std::error::Error>> {
+    Ok(git_op::ref_changes(repo, commit)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|change| RefLine {
+            name: change.name,
+            transition: match change.kind {
+                git_op::RefChangeKind::Created(new) => {
+                    Transition::Created(RefTarget::new(repo, &new))
+                }
+                git_op::RefChangeKind::Deleted(old) => {
+                    Transition::Deleted(RefTarget::new(repo, &old))
+                }
+                git_op::RefChangeKind::Updated { old, new } => Transition::Updated {
+                    old: RefTarget::new(repo, &old),
+                    new: RefTarget::new(repo, &new),
+                },
+            },
+        })
+        .collect())
+}
+
 /// Treat a broken pipe (for example `git op log | head`) as a normal exit.
 fn ignore_broken_pipe(result: io::Result<()>) -> io::Result<()> {
     match result {
@@ -148,9 +281,14 @@ fn ignore_broken_pipe(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-fn render(out: &mut impl Write, entries: &[Entry], format: Format) -> io::Result<()> {
+fn render(
+    out: &mut impl Write,
+    entries: &[Entry],
+    format: Format,
+    verbose: bool,
+) -> io::Result<()> {
     match format {
-        Format::Default => render_default(out, entries),
+        Format::Default => render_default(out, entries, verbose),
         Format::Oneline => render_oneline(out, entries),
         Format::Json => render_json(out, entries),
     }
@@ -166,9 +304,9 @@ fn write_styled(out: &mut impl Write, style: Style, value: impl fmt::Display) ->
 }
 
 /// Render `entries` as a `jj`-style graph: a `●`/`○` glyph column connected
-/// by `│`, with each snapshot's date, changed parts, and message body to its
-/// right.
-fn render_default(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
+/// by `│`, with each snapshot's date, changed refs, changed metadata files,
+/// and message body to its right.
+fn render_default(out: &mut impl Write, entries: &[Entry], verbose: bool) -> io::Result<()> {
     for (index, entry) in entries.iter().enumerate() {
         let is_last = index + 1 == entries.len();
         let (glyph, glyph_style) = if entry.is_head {
@@ -197,17 +335,20 @@ fn render_default(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
         }
 
         if let Some(changed) = &entry.changed {
-            write_styled(out, DIM_STYLE, connector)?;
-            write!(out, "  ")?;
-            write_styled(out, DIM_STYLE, "Changed:")?;
-            write!(out, " ")?;
-            for (index, name) in changed.iter().enumerate() {
-                if index > 0 {
-                    write!(out, ", ")?;
+            render_ref_lines(out, &changed.refs, connector, verbose)?;
+            if !changed.files.is_empty() {
+                write_styled(out, DIM_STYLE, connector)?;
+                write!(out, "  ")?;
+                write_styled(out, DIM_STYLE, "Changed:")?;
+                write!(out, " ")?;
+                for (index, name) in changed.files.iter().enumerate() {
+                    if index > 0 {
+                        write!(out, ", ")?;
+                    }
+                    write_styled(out, CHANGED_STYLE, *name)?;
                 }
-                write_styled(out, CHANGED_STYLE, *name)?;
+                writeln!(out)?;
             }
-            writeln!(out)?;
         }
 
         if !is_last {
@@ -216,6 +357,65 @@ fn render_default(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render one aligned `name  old → new` line per changed ref, truncating the
+/// list unless `verbose` is set.
+fn render_ref_lines(
+    out: &mut impl Write,
+    refs: &[RefLine],
+    connector: char,
+    verbose: bool,
+) -> io::Result<()> {
+    let shown = if verbose {
+        refs
+    } else {
+        &refs[..refs.len().min(MAX_REF_LINES)]
+    };
+    let width = |value: &str| value.chars().count();
+    let name_width = shown
+        .iter()
+        .map(|line| width(&line.name))
+        .max()
+        .unwrap_or(0);
+    let old_width = shown
+        .iter()
+        .map(|line| width(line.transition.before()))
+        .max()
+        .unwrap_or(0);
+
+    for line in shown {
+        write_styled(out, DIM_STYLE, connector)?;
+        write!(out, "  ")?;
+        write_styled(out, CHANGED_STYLE, format!("{:name_width$}", line.name))?;
+        write!(out, "  ")?;
+        write_target(out, line.transition.before(), old_width)?;
+        write!(out, " ")?;
+        write_styled(out, DIM_STYLE, "→")?;
+        write!(out, " ")?;
+        write_target(out, line.transition.after(), 0)?;
+        writeln!(out)?;
+    }
+
+    let remaining = refs.len() - shown.len();
+    if remaining > 0 {
+        write_styled(out, DIM_STYLE, connector)?;
+        write!(out, "  ")?;
+        write_styled(out, DIM_STYLE, format!("… and {remaining} more"))?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// Write one ref target padded to `width`, dimming the `(new)` and `(deleted)`
+/// placeholders that stand in for a missing side.
+fn write_target(out: &mut impl Write, target: &str, width: usize) -> io::Result<()> {
+    let style = if target.starts_with('(') {
+        DIM_STYLE
+    } else {
+        ID_STYLE
+    };
+    write_styled(out, style, format!("{target:width$}"))
 }
 
 fn render_oneline(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
@@ -237,9 +437,9 @@ fn render_json(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
                 .format_or_unix(gix::date::time::format::ISO8601_STRICT),
         )?;
         match &entry.changed {
-            Some(names) => {
+            Some(changed) => {
                 write!(out, "[")?;
-                for (index, name) in names.iter().enumerate() {
+                for (index, name) in changed.names().iter().enumerate() {
                     if index > 0 {
                         write!(out, ",")?;
                     }
@@ -249,11 +449,49 @@ fn render_json(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
             }
             None => write!(out, "null")?,
         }
+        write!(out, ",\"refs\":")?;
+        match &entry.changed {
+            Some(changed) => render_json_refs(out, &changed.refs)?,
+            None => write!(out, "null")?,
+        }
         write!(out, ",\"summary\":\"")?;
         write_json_escaped(out, entry.summary())?;
         writeln!(out, "\"}}")?;
     }
     Ok(())
+}
+
+/// Write the changed refs as a JSON array of `name`, `old`, and `new`, where
+/// each target is Git's loose-ref file format and a missing side is `null`.
+fn render_json_refs(out: &mut impl Write, refs: &[RefLine]) -> io::Result<()> {
+    write!(out, "[")?;
+    for (index, line) in refs.iter().enumerate() {
+        if index > 0 {
+            write!(out, ",")?;
+        }
+        let (old, new) = line.transition.json();
+        write!(out, "{{\"name\":\"")?;
+        write_json_escaped(out, line.name.as_bytes())?;
+        write!(out, "\",\"old\":")?;
+        write_json_target(out, old)?;
+        write!(out, ",\"new\":")?;
+        write_json_target(out, new)?;
+        write!(out, "}}")?;
+    }
+    write!(out, "]")
+}
+
+/// Write one side of a ref transition as a JSON string, or `null` when the ref
+/// does not exist on that side.
+fn write_json_target(out: &mut impl Write, target: Option<&str>) -> io::Result<()> {
+    match target {
+        Some(target) => {
+            write!(out, "\"")?;
+            write_json_escaped(out, target.as_bytes())?;
+            write!(out, "\"")
+        }
+        None => write!(out, "null"),
+    }
 }
 
 /// Write `bytes` as the escaped contents of a JSON string, excluding the
@@ -281,11 +519,27 @@ fn write_json_escaped(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A ref target whose short form is `id` and whose full form is `id`
+    /// zero-padded to an object ID.
+    fn target(id: &str) -> RefTarget {
+        RefTarget {
+            full: format!("{id}{}", "0".repeat(40 - id.len())),
+            short: id.to_owned(),
+        }
+    }
+
+    fn ref_line(name: &str, transition: Transition) -> RefLine {
+        RefLine {
+            name: name.to_owned(),
+            transition,
+        }
+    }
+
     fn entry(
         id: &str,
         abbreviated_id: &str,
         is_head: bool,
-        changed: Option<Vec<&'static str>>,
+        changed: Option<Changed>,
         message: &str,
     ) -> Entry {
         Entry {
@@ -310,18 +564,31 @@ mod tests {
         choice: anstream::ColorChoice,
     ) -> String {
         let mut out = AutoStream::new(Vec::new(), choice);
-        render(&mut out, entries, format).expect("render");
+        render(&mut out, entries, format, false).expect("render");
         String::from_utf8(out.into_inner()).expect("output is UTF-8")
     }
 
     #[test]
-    fn default_format_omits_changed_for_initial_snapshot() {
+    fn default_format_lists_changed_refs_and_omits_changes_for_the_initial_snapshot() {
         let entries = vec![
             entry(
                 "3a7f2c1d9e4b000000000000000000000000000000",
                 "3a7f2c1d9e4b",
                 true,
-                Some(vec!["refs", "config"]),
+                Some(Changed {
+                    refs: vec![
+                        ref_line(
+                            "refs/heads/main",
+                            Transition::Updated {
+                                old: target("1e2ea16"),
+                                new: target("dc80af7"),
+                            },
+                        ),
+                        ref_line("refs/heads/topic", Transition::Created(target("8087efa"))),
+                        ref_line("refs/tags/v0.1.0", Transition::Deleted(target("047ae16"))),
+                    ],
+                    files: vec!["config"],
+                }),
                 "op: update refs and config\n",
             ),
             entry(
@@ -339,11 +606,52 @@ mod tests {
             rendered,
             "●  3a7f2c1d9e4b  2026-08-22 14:03:11 -0400\n\
              │  op: update refs and config\n\
-             │  Changed: refs, config\n\
+             │  refs/heads/main   1e2ea16 → dc80af7\n\
+             │  refs/heads/topic  (new)   → 8087efa\n\
+             │  refs/tags/v0.1.0  047ae16 → (deleted)\n\
+             │  Changed: config\n\
              │\n\
              ○  9b1e0042ac31  2026-08-22 14:03:11 -0400\n\
              \x20\x20\x20op: capture initial repository state\n"
         );
+    }
+
+    #[test]
+    fn default_format_truncates_long_ref_lists_unless_verbose() {
+        let refs = (0..MAX_REF_LINES + 2)
+            .map(|index| {
+                ref_line(
+                    &format!("refs/heads/branch-{index}"),
+                    Transition::Created(target("8087efa")),
+                )
+            })
+            .collect();
+        let entries = vec![entry(
+            "3a7f2c1d9e4b",
+            "3a7f2c1",
+            true,
+            Some(Changed {
+                refs,
+                files: Vec::new(),
+            }),
+            "op: update refs\n",
+        )];
+
+        let truncated = render_with_color(&entries, Format::Default, anstream::ColorChoice::Never);
+        assert_eq!(
+            truncated.matches("refs/heads/branch-").count(),
+            MAX_REF_LINES
+        );
+        assert!(truncated.contains("… and 2 more"));
+
+        let mut out = AutoStream::new(Vec::new(), anstream::ColorChoice::Never);
+        render(&mut out, &entries, Format::Default, true).expect("render verbose");
+        let verbose = String::from_utf8(out.into_inner()).expect("output is UTF-8");
+        assert_eq!(
+            verbose.matches("refs/heads/branch-").count(),
+            MAX_REF_LINES + 2
+        );
+        assert!(!verbose.contains("more"));
     }
 
     #[test]
@@ -372,7 +680,16 @@ mod tests {
             "3a7f2c1d9e4b",
             "3a7f2c1",
             true,
-            Some(vec!["refs", "config"]),
+            Some(Changed {
+                refs: vec![ref_line(
+                    "refs/heads/main",
+                    Transition::Updated {
+                        old: target("1e2ea16"),
+                        new: target("dc80af7"),
+                    },
+                )],
+                files: vec!["config"],
+            }),
             "op: update refs and config\n\nlonger body ignored",
         )];
 
@@ -387,7 +704,25 @@ mod tests {
                 "3a7f2c1d9e4b",
                 "3a7f2c1",
                 true,
-                Some(vec!["refs", "config"]),
+                Some(Changed {
+                    refs: vec![
+                        ref_line(
+                            "refs/heads/main",
+                            Transition::Updated {
+                                old: target("1e2ea16"),
+                                new: target("dc80af7"),
+                            },
+                        ),
+                        ref_line(
+                            "refs/heads/alias",
+                            Transition::Created(RefTarget {
+                                full: "ref: refs/heads/main".to_owned(),
+                                short: "refs/heads/main".to_owned(),
+                            }),
+                        ),
+                    ],
+                    files: vec!["config"],
+                }),
                 "op: update refs and config\n",
             ),
             entry(
@@ -400,17 +735,22 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        render(&mut out, &entries, Format::Json).expect("render json format");
+        render(&mut out, &entries, Format::Json, false).expect("render json format");
         let rendered = String::from_utf8(out).expect("output is UTF-8");
         let mut lines = rendered.lines();
 
         assert_eq!(
             lines.next().expect("first line"),
-            "{\"id\":\"3a7f2c1d9e4b\",\"time\":\"2026-08-22T14:03:11-04:00\",\"changed\":[\"refs\",\"config\"],\"summary\":\"op: update refs and config\"}"
+            "{\"id\":\"3a7f2c1d9e4b\",\"time\":\"2026-08-22T14:03:11-04:00\",\"changed\":[\"refs\",\"config\"],\
+             \"refs\":[\
+             {\"name\":\"refs/heads/main\",\"old\":\"1e2ea16000000000000000000000000000000000\",\"new\":\"dc80af7000000000000000000000000000000000\"},\
+             {\"name\":\"refs/heads/alias\",\"old\":null,\"new\":\"ref: refs/heads/main\"}\
+             ],\"summary\":\"op: update refs and config\"}"
         );
         assert_eq!(
             lines.next().expect("second line"),
-            "{\"id\":\"9b1e0042ac31\",\"time\":\"2026-08-22T14:03:11-04:00\",\"changed\":null,\"summary\":\"op: capture initial repository state\"}"
+            "{\"id\":\"9b1e0042ac31\",\"time\":\"2026-08-22T14:03:11-04:00\",\"changed\":null,\
+             \"refs\":null,\"summary\":\"op: capture initial repository state\"}"
         );
         assert_eq!(lines.next(), None);
     }

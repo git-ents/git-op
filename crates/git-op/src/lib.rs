@@ -667,15 +667,46 @@ pub struct Changes {
 impl Changes {
     /// The names of the changed parts, in capture order.
     pub fn names(&self) -> Vec<&'static str> {
-        [
-            (self.r#refs, "refs"),
-            (self.config, "config"),
-            (self.description, "description"),
-        ]
-        .into_iter()
-        .filter_map(|(changed, name)| changed.then_some(name))
-        .collect()
+        let mut names = Vec::new();
+        if self.r#refs {
+            names.push("refs");
+        }
+        names.extend(self.file_names());
+        names
     }
+
+    /// The names of the changed metadata files, in capture order.
+    pub fn file_names(&self) -> Vec<&'static str> {
+        [(self.config, "config"), (self.description, "description")]
+            .into_iter()
+            .filter_map(|(changed, name)| changed.then_some(name))
+            .collect()
+    }
+}
+
+/// One captured ref changed by a snapshot, relative to its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefChange {
+    /// The full ref name, including the `refs/` prefix.
+    pub name: String,
+    /// The transition the ref made.
+    pub kind: RefChangeKind,
+}
+
+/// How a captured ref's target changed between two snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefChangeKind {
+    /// The ref exists only in the newer snapshot.
+    Created(Target),
+    /// The ref exists only in the older snapshot.
+    Deleted(Target),
+    /// The ref exists in both snapshots with different targets.
+    Updated {
+        /// The target in the older snapshot.
+        old: Target,
+        /// The target in the newer snapshot.
+        new: Target,
+    },
 }
 
 /// The object IDs of a snapshot commit's top-level `refs`, `config`, and
@@ -789,18 +820,180 @@ impl SnapshotEntries {
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn changes(repo: &gix::Repository, commit: ObjectId) -> Result<Option<Changes>, Error> {
-    let parent = repo
-        .find_commit(commit)
-        .map_err(Error::git)?
-        .parent_ids()
-        .next()
-        .map(|id| id.detach());
-    let Some(parent) = parent else {
+    let Some(parent) = parent_snapshot(repo, commit)? else {
         return Ok(None);
     };
     let current = SnapshotEntries::read(repo, commit)?;
     let previous = SnapshotEntries::read(repo, parent)?;
     Ok(Some(current.diff(&previous)))
+}
+
+/// The first parent of a snapshot commit, or `None` for the initial snapshot.
+fn parent_snapshot(repo: &gix::Repository, commit: ObjectId) -> Result<Option<ObjectId>, Error> {
+    Ok(repo
+        .find_commit(commit)
+        .map_err(Error::git)?
+        .parent_ids()
+        .next()
+        .map(|id| id.detach()))
+}
+
+/// The individual refs `commit` changed relative to its parent, ordered by
+/// name, or `None` when `commit` is the initial snapshot and has no parent to
+/// compare against.
+///
+/// # Examples
+///
+/// ```
+/// let unique = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .expect("system clock is after the Unix epoch")
+///     .as_nanos();
+/// let root = std::env::temp_dir().join(format!("git-op-ref-changes-{}-{unique}", std::process::id()));
+/// std::fs::create_dir(&root).expect("create temporary repository directory");
+/// let repo = gix::init(&root).expect("initialize repository");
+/// let empty_tree = repo.write_object(&gix::objs::Tree::empty()).expect("write empty tree");
+/// let target = repo
+///     .commit("refs/heads/main", "example", empty_tree, gix::commit::NO_PARENT_IDS)
+///     .expect("commit to main")
+///     .detach();
+///
+/// let initial = git_op::append(&repo, "initial snapshot").expect("append initial snapshot");
+/// assert_eq!(git_op::ref_changes(&repo, initial).expect("compute ref changes"), None);
+///
+/// repo.reference("refs/heads/topic", target, gix::refs::transaction::PreviousValue::MustNotExist, "branch")
+///     .expect("create topic");
+/// let update = git_op::append(&repo, "create topic").expect("append updated snapshot");
+/// let changed = git_op::ref_changes(&repo, update)
+///     .expect("compute ref changes")
+///     .expect("updated snapshot has a parent");
+/// assert_eq!(
+///     changed,
+///     vec![git_op::RefChange {
+///         name: "refs/heads/topic".to_owned(),
+///         kind: git_op::RefChangeKind::Created(gix::refs::Target::Object(target)),
+///     }],
+/// );
+/// std::fs::remove_dir_all(root).expect("remove temporary repository");
+/// ```
+pub fn ref_changes(
+    repo: &gix::Repository,
+    commit: ObjectId,
+) -> Result<Option<Vec<RefChange>>, Error> {
+    let Some(parent) = parent_snapshot(repo, commit)? else {
+        return Ok(None);
+    };
+    let current = SnapshotEntries::read(repo, commit)?;
+    let previous = SnapshotEntries::read(repo, parent)?;
+    let mut changes = Vec::new();
+    diff_ref_trees(repo, previous.r#refs, current.r#refs, "refs", &mut changes)?;
+    Ok(Some(changes))
+}
+
+/// Compare two captured ref trees, appending one [`RefChange`] per ref whose
+/// target differs.
+///
+/// Subtrees with equal object IDs are identical by construction, so the walk
+/// never descends into unchanged parts of the ref namespace.
+fn diff_ref_trees(
+    repo: &gix::Repository,
+    previous: ObjectId,
+    current: ObjectId,
+    prefix: &str,
+    changes: &mut Vec<RefChange>,
+) -> Result<(), Error> {
+    use gix::objs::tree::EntryKind;
+
+    let previous = ref_tree_entries(repo, previous)?;
+    let current = ref_tree_entries(repo, current)?;
+    let names: std::collections::BTreeSet<&String> =
+        previous.keys().chain(current.keys()).collect();
+    for name in names {
+        let path = format!("{prefix}/{name}");
+        match (previous.get(name), current.get(name)) {
+            (Some(previous), Some(current)) if previous == current => {}
+            (Some((EntryKind::Tree, previous)), Some((EntryKind::Tree, current))) => {
+                diff_ref_trees(repo, *previous, *current, &path, changes)?;
+            }
+            (Some((EntryKind::Blob, previous)), Some((EntryKind::Blob, current))) => {
+                changes.push(RefChange {
+                    name: path,
+                    kind: RefChangeKind::Updated {
+                        old: read_ref_target(repo, *previous)?,
+                        new: read_ref_target(repo, *current)?,
+                    },
+                });
+            }
+            (previous, current) => {
+                for (name, target) in ref_tree_targets(repo, previous, &path)? {
+                    changes.push(RefChange {
+                        name,
+                        kind: RefChangeKind::Deleted(target),
+                    });
+                }
+                for (name, target) in ref_tree_targets(repo, current, &path)? {
+                    changes.push(RefChange {
+                        name,
+                        kind: RefChangeKind::Created(target),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The immediate entries of a captured ref tree, keyed by path component.
+fn ref_tree_entries(
+    repo: &gix::Repository,
+    tree: ObjectId,
+) -> Result<BTreeMap<String, (gix::objs::tree::EntryKind, ObjectId)>, Error> {
+    let tree = repo.find_tree(tree).map_err(Error::git)?;
+    let mut entries = BTreeMap::new();
+    for entry in tree.decode().map_err(Error::git)?.entries {
+        let name = entry
+            .filename
+            .to_str()
+            .map_err(|_| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
+        let kind = match entry.mode.kind() {
+            kind @ (gix::objs::tree::EntryKind::Tree | gix::objs::tree::EntryKind::Blob) => kind,
+            kind => {
+                return Err(Error::InvalidSnapshot(format!(
+                    "ref tree contains {kind:?}"
+                )));
+            }
+        };
+        entries.insert(name.to_owned(), (kind, entry.oid.to_owned()));
+    }
+    Ok(entries)
+}
+
+/// Every ref reachable from one side of a ref-tree comparison, paired with its
+/// target; empty when that side has no entry at `path`.
+fn ref_tree_targets(
+    repo: &gix::Repository,
+    entry: Option<&(gix::objs::tree::EntryKind, ObjectId)>,
+    path: &str,
+) -> Result<Vec<(String, Target)>, Error> {
+    let Some((kind, oid)) = entry else {
+        return Ok(Vec::new());
+    };
+    if matches!(kind, gix::objs::tree::EntryKind::Blob) {
+        return Ok(vec![(path.to_owned(), read_ref_target(repo, *oid)?)]);
+    }
+    let tree = repo.find_tree(*oid).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &tree, path, &mut updates)?;
+    updates
+        .into_iter()
+        .map(|(name, contents)| Ok((name, parse_ref_contents(&contents)?)))
+        .collect()
+}
+
+/// Read a captured ref blob as a ref target.
+fn read_ref_target(repo: &gix::Repository, blob: ObjectId) -> Result<Target, Error> {
+    let blob = repo.find_blob(blob).map_err(Error::git)?;
+    parse_ref_contents(&blob.data)
 }
 
 /// Compose the summary line for a generated snapshot commit, or `None` when
