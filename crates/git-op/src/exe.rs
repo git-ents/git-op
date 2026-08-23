@@ -18,7 +18,7 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => crate::log::run(max_count, reverse, verbose, no_pager, oneline, json),
         Command::Restore { oid } => restore(&oid),
-        Command::Undo => undo(),
+        Command::Undo { oid } => undo(oid.as_deref()),
     }
 }
 
@@ -69,9 +69,12 @@ fn restore(oid: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Restore the state before the latest operation-log commit.
-fn undo() -> Result<(), Box<dyn std::error::Error>> {
+/// Restore the state before an operation-log commit.
+fn undo(specification: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
-    git_op::undo(&repo)?;
+    let oid = specification
+        .map(|specification| git_op::resolve_operation(&repo, specification))
+        .transpose()?;
+    git_op::undo_at(&repo, oid)?;
     Ok(())
 }

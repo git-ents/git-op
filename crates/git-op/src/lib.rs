@@ -1048,10 +1048,23 @@ pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Err
 /// [`restore`], undo is itself appended to the operation log. An initial
 /// operation has no earlier snapshot and cannot be undone.
 pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
-    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
-    let latest = operation_target(repo, &name)?.ok_or(Error::NothingToUndo)?;
+    undo_at(repo, None)
+}
+
+/// Restore the state captured by the parent of an operation commit.
+///
+/// When `commit` is absent, the latest operation is used. The operation
+/// itself is appended to the operation log after restoration.
+pub fn undo_at(repo: &gix::Repository, commit: Option<ObjectId>) -> Result<ObjectId, Error> {
+    let target = match commit {
+        Some(commit) => commit,
+        None => {
+            let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+            operation_target(repo, &name)?.ok_or(Error::NothingToUndo)?
+        }
+    };
     let parent = repo
-        .find_commit(latest)
+        .find_commit(target)
         .map_err(Error::git)?
         .parent_ids()
         .next()
@@ -1059,7 +1072,7 @@ pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
         .ok_or(Error::NothingToUndo)?;
     let state = read(repo, parent)?;
     apply_state(repo, &state)?;
-    append(repo, &format!("op: undo {latest}"))
+    append(repo, &format!("op: undo {target}"))
 }
 
 /// Resolve an operation commit specification using Git's revision parser.

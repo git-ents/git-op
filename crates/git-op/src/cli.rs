@@ -56,8 +56,11 @@ pub(crate) enum Command {
         /// The operation commit to restore.
         oid: String,
     },
-    /// Restore the state before the latest operation-log commit, including the working tree and index.
-    Undo,
+    /// Restore the state before an operation-log commit, including the working tree and index.
+    Undo {
+        /// The operation commit to undo; defaults to the latest operation.
+        oid: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -65,6 +68,22 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn undo_parses_an_optional_operation_hash() {
+        let cli =
+            Cli::try_parse_from(["git-op", "undo", "abc123"]).expect("parse undo operation hash");
+        let Command::Undo { oid } = cli.command else {
+            panic!("expected the undo command");
+        };
+        assert_eq!(oid.as_deref(), Some("abc123"));
+
+        let cli = Cli::try_parse_from(["git-op", "undo"]).expect("parse undo without hash");
+        let Command::Undo { oid } = cli.command else {
+            panic!("expected the undo command");
+        };
+        assert_eq!(oid, None);
+    }
 
     #[test]
     fn log_parses_max_count_and_reverse() {
