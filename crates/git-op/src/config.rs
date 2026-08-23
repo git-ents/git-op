@@ -11,52 +11,27 @@ use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
 
-/// Comment naming git-op's block, expanded through a macro so
-/// [`MANAGED_COMMENTS`] and [`HOOK_BODY`] share one copy of the text and cannot
-/// drift apart.
-macro_rules! hook_marker {
-    () => {
-        "# git-op reference-transaction hook"
-    };
-}
-
-/// Comment explaining the repository guard, shared for the same reason as
-/// [`hook_marker`].
-macro_rules! hook_guard_comment {
-    () => {
-        "# Git can invoke this hook while `git init` is still creating the repository."
-    };
-}
-
-/// The lines git-op owns, whether or not it owns the file containing them.
+/// The one line git-op owns, expanded through a macro so [`HOOK_LINE`] and
+/// [`HOOK_BODY`] share one copy of the text and cannot drift apart.
 ///
-/// Every statement lives on the one line naming the entry point, so removing
-/// the block never has to recognize scaffolding around it. The invocation is
-/// guarded rather than `exec`ed, and swallows a failed guard, so the block
-/// stays inert when spliced into a hook that has lines of its own after it.
-macro_rules! hook_block {
+/// Naming the entry point is what marks the line as git-op's, so every
+/// statement stays on it and removing it needs no knowledge of surrounding
+/// scaffolding. The `git rev-parse` guard keeps the hook quiet while `git init`
+/// is still creating the repository, and swallowing its failure alongside
+/// running rather than `exec`ing git-op leaves a host hook's own lines intact.
+macro_rules! hook_line {
     () => {
-        concat!(
-            hook_marker!(),
-            "\n",
-            hook_guard_comment!(),
-            "\n",
-            "if git rev-parse --git-dir >/dev/null 2>&1; then git op reference-transaction \"$@\" || exit $?; fi\n",
-        )
+        "if git rev-parse --git-dir >/dev/null 2>&1; then git op reference-transaction \"$@\" || exit $?; fi\n"
     };
 }
 
-const HOOK_BLOCK: &str = hook_block!();
+const HOOK_LINE: &str = hook_line!();
 
-const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_block!());
-
-/// Comment lines git-op writes, removed alongside its invocation so repeated
-/// installs cannot accumulate stale copies.
-const MANAGED_COMMENTS: &[&str] = &[hook_marker!(), hook_guard_comment!()];
+const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 
 /// Install the `reference-transaction` hook in this repository.
 ///
-/// The lines git-op owns are rewritten in place, whether written by an older
+/// The line git-op owns is rewritten in place, whether written by an older
 /// version of git-op or merged into a hook of your own. A hook that does not
 /// invoke git-op is never overwritten.
 ///
@@ -206,36 +181,34 @@ fn invokes_git_op(line: &str) -> bool {
             || line.contains("git-op reference-transaction"))
 }
 
-/// Rewrite git-op's lines in `existing`, or `None` if it invokes no git-op hook.
+/// Rewrite git-op's line in `existing`, or `None` if it invokes no git-op hook.
 ///
-/// [`HOOK_BLOCK`] is spliced in where the first owned line stood; every other
-/// line, including its terminator, is preserved byte for byte.
-fn rewrite_managed_block(existing: &str) -> Option<String> {
-    let mut rewritten = String::with_capacity(existing.len() + HOOK_BLOCK.len());
+/// [`HOOK_LINE`] replaces the first line invoking git-op and any further ones
+/// are dropped; every other line, including its terminator, is preserved byte
+/// for byte.
+fn rewrite_managed_line(existing: &str) -> Option<String> {
+    let mut rewritten = String::with_capacity(existing.len() + HOOK_LINE.len());
     let mut spliced = false;
     for line in existing.split_inclusive('\n') {
-        let content = line.trim_end_matches(['\n', '\r']);
-        if invokes_git_op(content) {
-            if !spliced {
-                rewritten.push_str(HOOK_BLOCK);
-                spliced = true;
-            }
-        } else if !MANAGED_COMMENTS.contains(&content.trim()) {
+        if !invokes_git_op(line.trim_end_matches(['\n', '\r'])) {
             rewritten.push_str(line);
+        } else if !spliced {
+            rewritten.push_str(HOOK_LINE);
+            spliced = true;
         }
     }
     spliced.then_some(rewritten)
 }
 
-/// Bring an existing hook up to date with the current [`HOOK_BLOCK`].
+/// Bring an existing hook up to date with the current [`HOOK_LINE`].
 ///
-/// A hook already carrying that block is left untouched; one that invokes no
+/// A hook already carrying that line is left untouched; one that invokes no
 /// git-op hook, or that is not valid UTF-8 to scan, is refused.
 fn upgrade_hook(hooks: &Path, path: &Path, existing: &[u8]) -> Result<(), Error> {
     let existing =
         std::str::from_utf8(existing).map_err(|_| Error::HookExists(path.to_path_buf()))?;
     let rewritten =
-        rewrite_managed_block(existing).ok_or_else(|| Error::HookExists(path.to_path_buf()))?;
+        rewrite_managed_line(existing).ok_or_else(|| Error::HookExists(path.to_path_buf()))?;
     if rewritten == existing {
         return Ok(());
     }
@@ -318,7 +291,7 @@ mod tests {
 
     static NEXT_TEMP_HOOKS_DIR: AtomicUsize = AtomicUsize::new(0);
 
-    /// Historical hook body shipped before [`HOOK_BLOCK`] existed.
+    /// Historical hook body shipped before [`HOOK_LINE`] existed.
     const HISTORICAL_HOOK_BODY: &str = "#!/bin/sh\nexec git op reference-transaction \"$@\"\n";
 
     /// Own a temporary hooks directory and remove it when the test finishes.
@@ -370,7 +343,7 @@ mod tests {
     /// unchanged, by the next upgrade.
     #[test]
     fn hook_body_is_recognized_unchanged() {
-        assert_eq!(rewrite_managed_block(HOOK_BODY).as_deref(), Some(HOOK_BODY));
+        assert_eq!(rewrite_managed_line(HOOK_BODY).as_deref(), Some(HOOK_BODY));
     }
 
     /// Verify that a fresh install writes an executable hook with the current body.
