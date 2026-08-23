@@ -1,5 +1,6 @@
 mod cli;
 mod exe;
+mod log;
 
 use clap::Parser;
 
