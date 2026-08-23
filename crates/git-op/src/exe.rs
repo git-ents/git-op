@@ -17,8 +17,35 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             oneline,
             json,
         } => crate::log::run(max_count, reverse, verbose, no_pager, oneline, json),
-        Command::Restore { oid } => restore(&oid),
-        Command::Undo { oid } => undo(oid.as_deref()),
+        Command::Restore { oid } => write_command(|| restore(&oid)),
+        Command::Undo { oid } => write_command(|| undo(oid.as_deref())),
+    }
+}
+
+fn write_command(
+    command: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = open_repository()?;
+    ensure_clean(&repo)?;
+    command()
+}
+
+fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let output = std::process::Command::new("git")
+        .current_dir(workdir)
+        .env("GIT_DIR", repo.git_dir())
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git status failed with {}", output.status).into());
+    }
+    if output.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err("working tree is dirty; commit or restore before changing repository state".into())
     }
 }
 
@@ -46,6 +73,9 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
     let Ok(repo) = open_repository() else {
         return Ok(());
     };
+    if phase == "committed" {
+        ensure_clean(&repo)?;
+    }
     git_op::reference_transaction(&repo, phase, &input)?;
     Ok(())
 }
@@ -54,8 +84,12 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
 fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
     if local {
         let repo = open_repository()?;
+        ensure_clean(&repo)?;
         git_op::install_local(&repo)?;
     } else {
+        if let Ok(repo) = open_repository() {
+            ensure_clean(&repo)?;
+        }
         git_op::install_global()?;
     }
     Ok(())
@@ -77,4 +111,43 @@ fn undo(specification: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     git_op::undo_at(&repo, oid)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::ensure_clean;
+
+    fn repository() -> (gix::Repository, std::path::PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("git-op-exe-{}-{unique}", std::process::id()));
+        let repo = gix::init(&path).expect("initialize repository");
+        (repo, path)
+    }
+
+    #[test]
+    fn clean_worktree_is_allowed() {
+        let (repo, path) = repository();
+        ensure_clean(&repo).expect("clean worktree should be allowed");
+        fs::remove_dir_all(path).expect("remove temporary repository");
+    }
+
+    #[test]
+    fn dirty_worktree_is_rejected() {
+        let (repo, path) = repository();
+        fs::write(path.join("untracked"), b"change").expect("write untracked file");
+        let error = ensure_clean(&repo).expect_err("dirty worktree should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "working tree is dirty; commit or restore before changing repository state"
+        );
+        fs::remove_dir_all(path).expect("remove temporary repository");
+    }
 }
