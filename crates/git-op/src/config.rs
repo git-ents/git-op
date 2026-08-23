@@ -16,12 +16,14 @@ const HOOK_NAME: &str = "reference-transaction";
 ///
 /// Naming the entry point is what marks the line as git-op's, so every
 /// statement stays on it and removing it needs no knowledge of surrounding
-/// scaffolding. The `git rev-parse` guard keeps the hook quiet while `git init`
-/// is still creating the repository, and swallowing its failure alongside
-/// running rather than `exec`ing git-op leaves a host hook's own lines intact.
+/// scaffolding. `command -v` keeps an uninstalled git-op from failing the
+/// transaction and aborting the Git command that triggered it, and `git
+/// rev-parse` keeps the hook quiet while `git init` is still creating the
+/// repository. Swallowing a failed guard, and running rather than `exec`ing
+/// git-op, leaves a host hook's own lines intact.
 macro_rules! hook_line {
     () => {
-        "if git rev-parse --git-dir >/dev/null 2>&1; then git op reference-transaction \"$@\" || exit $?; fi\n"
+        "if command -v git-op >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then git op reference-transaction \"$@\" || exit $?; fi\n"
     };
 }
 
