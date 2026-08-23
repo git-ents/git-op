@@ -10,12 +10,36 @@ use std::{
 use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
-const HOOK_BODY: &str = "#!/bin/sh\n# Git can invoke this hook while `git init` is still creating the repository.\ngit rev-parse --git-dir >/dev/null 2>&1 || exit 0\nexec git op reference-transaction \"$@\"\n";
+
+/// Literal marker line embedded in [`HOOK_BODY`], expanded through a macro so
+/// [`HOOK_MARKER`] and [`HOOK_BODY`] share one copy of the text and cannot
+/// drift apart.
+macro_rules! hook_marker {
+    () => {
+        "# git-op reference-transaction hook\n"
+    };
+}
+
+/// Line identifying a hook file as git-op's own, so future changes to
+/// [`HOOK_BODY`] remain recognizable and upgradable in place.
+const HOOK_MARKER: &str = hook_marker!();
+
+const HOOK_BODY: &str = concat!(
+    "#!/bin/sh\n",
+    hook_marker!(),
+    "# Git can invoke this hook while `git init` is still creating the repository.\n",
+    "git rev-parse --git-dir >/dev/null 2>&1 || exit 0\n",
+    "exec git op reference-transaction \"$@\"\n",
+);
+
+/// Hook bodies shipped before [`HOOK_MARKER`] existed, recognized so
+/// installations from those versions can still be upgraded in place.
+const LEGACY_HOOK_BODIES: &[&str] = &["#!/bin/sh\nexec git op reference-transaction \"$@\"\n"];
 
 /// Install the `reference-transaction` hook in this repository.
 ///
-/// An existing hook with the expected body is updated idempotently. An
-/// unrelated hook is never overwritten.
+/// git-op's own hook — including one written by an older version of git-op —
+/// is upgraded in place. An unrelated hook is never overwritten.
 ///
 /// # Examples
 ///
@@ -155,19 +179,27 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
     )))
 }
 
+/// Return whether `body` is a hook git-op installed, at any version.
+fn is_git_op_hook(body: &[u8]) -> bool {
+    std::str::from_utf8(body).is_ok_and(|body| body.contains(HOOK_MARKER))
+        || LEGACY_HOOK_BODIES
+            .iter()
+            .any(|legacy| body == legacy.as_bytes())
+}
+
 /// Install the hook without replacing an unrelated existing hook.
 ///
-/// The create-new open protects the final installation step from replacing a
-/// hook created concurrently by another process.
+/// The create-new open protects the fresh-install path from replacing a hook
+/// created concurrently by another process. Upgrading a recognized git-op
+/// hook instead writes the new body to a sibling temporary file and renames
+/// it into place, so a process dying mid-write can never leave a truncated
+/// hook for Git to execute.
 fn install_hook(hooks: impl AsRef<Path>) -> Result<(), Error> {
     let hooks = hooks.as_ref();
     fs::create_dir_all(hooks).map_err(Error::git)?;
     let path = hooks.join(HOOK_NAME);
     match fs::read(&path) {
-        Ok(existing) if existing == HOOK_BODY.as_bytes() => {
-            make_executable(&path)?;
-            return Ok(());
-        }
+        Ok(existing) if is_git_op_hook(&existing) => return replace_hook(hooks, &path),
         Ok(_) => return Err(Error::HookExists(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(Error::git(error)),
@@ -185,6 +217,31 @@ fn install_hook(hooks: impl AsRef<Path>) -> Result<(), Error> {
     make_executable(&path)
 }
 
+/// Atomically replace `path` with the current [`HOOK_BODY`].
+///
+/// The body is written to a uniquely-named temporary file in `hooks` first,
+/// then renamed over `path`, so the live hook is never truncated in place.
+fn replace_hook(hooks: &Path, path: &Path) -> Result<(), Error> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::message(error.to_string()))?
+        .as_nanos();
+    let tmp_path = hooks.join(format!(".{HOOK_NAME}.tmp-{}-{unique}", std::process::id()));
+    write_tmp_hook(&tmp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp_path);
+    })
+}
+
+/// Write [`HOOK_BODY`] to `tmp_path` and rename it over `path`.
+fn write_tmp_hook(tmp_path: &Path, path: &Path) -> Result<(), Error> {
+    let mut file = fs::File::create_new(tmp_path).map_err(Error::git)?;
+    file.write_all(HOOK_BODY.as_bytes()).map_err(Error::git)?;
+    file.sync_all().map_err(Error::git)?;
+    drop(file);
+    make_executable(tmp_path)?;
+    fs::rename(tmp_path, path).map_err(Error::git)
+}
+
 /// Ensure the hook has executable permissions on supported platforms.
 ///
 /// On non-Unix platforms the file is already executable according to the
@@ -198,4 +255,110 @@ fn make_executable(path: &Path) -> Result<(), Error> {
         fs::set_permissions(path, permissions).map_err(Error::git)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_HOOKS_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Historical hook body shipped before [`HOOK_MARKER`] existed.
+    const HISTORICAL_HOOK_BODY: &str = LEGACY_HOOK_BODIES[0];
+
+    /// Own a temporary hooks directory and remove it when the test finishes.
+    struct TemporaryHooksDir {
+        path: PathBuf,
+    }
+
+    impl TemporaryHooksDir {
+        fn new() -> Self {
+            let path = loop {
+                let sequence = NEXT_TEMP_HOOKS_DIR.fetch_add(1, Ordering::Relaxed);
+                let candidate = std::env::temp_dir().join(format!(
+                    "git-op-hooks-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create temporary hooks directory: {error}"),
+                }
+            };
+            Self { path }
+        }
+
+        fn hook_path(&self) -> PathBuf {
+            self.path.join(HOOK_NAME)
+        }
+    }
+
+    impl Drop for TemporaryHooksDir {
+        /// Remove the temporary hooks directory after the test completes.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_executable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .expect("read hook metadata")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    }
+
+    /// Verify that `HOOK_BODY` still carries `HOOK_MARKER`, so a hook this
+    /// version writes is recognized as git-op's own on the next upgrade.
+    #[test]
+    fn hook_body_contains_marker() {
+        assert!(HOOK_BODY.contains(HOOK_MARKER));
+    }
+
+    /// Verify that a fresh install writes an executable hook with the current body.
+    #[test]
+    fn fresh_install_writes_executable_hook() {
+        let hooks = TemporaryHooksDir::new();
+        install_hook(&hooks.path).expect("install hook");
+        let body = fs::read(hooks.hook_path()).expect("read installed hook");
+        assert_eq!(body, HOOK_BODY.as_bytes());
+        #[cfg(unix)]
+        assert!(is_executable(&hooks.hook_path()));
+    }
+
+    /// Verify that installing over the current body is idempotent.
+    #[test]
+    fn install_over_current_body_is_idempotent() {
+        let hooks = TemporaryHooksDir::new();
+        install_hook(&hooks.path).expect("install hook");
+        install_hook(&hooks.path).expect("reinstall hook");
+        let body = fs::read(hooks.hook_path()).expect("read installed hook");
+        assert_eq!(body, HOOK_BODY.as_bytes());
+    }
+
+    /// Verify that a hook written by an older git-op version is upgraded in place.
+    #[test]
+    fn install_over_historical_body_upgrades_in_place() {
+        let hooks = TemporaryHooksDir::new();
+        fs::write(hooks.hook_path(), HISTORICAL_HOOK_BODY).expect("write historical hook");
+        install_hook(&hooks.path).expect("install hook");
+        let body = fs::read(hooks.hook_path()).expect("read installed hook");
+        assert_eq!(body, HOOK_BODY.as_bytes());
+    }
+
+    /// Verify that a genuinely foreign hook is refused and left untouched.
+    #[test]
+    fn install_over_foreign_hook_is_refused() {
+        let hooks = TemporaryHooksDir::new();
+        let foreign = "#!/bin/sh\necho something-else\n";
+        fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
+        let error = install_hook(&hooks.path).expect_err("foreign hook must be refused");
+        assert!(matches!(error, Error::HookExists(_)));
+        let body = fs::read(hooks.hook_path()).expect("read hook after refused install");
+        assert_eq!(body, foreign.as_bytes());
+    }
 }
