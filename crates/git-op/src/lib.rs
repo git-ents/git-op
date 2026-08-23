@@ -14,9 +14,11 @@ use gix::{self, bstr::ByteSlice};
 use gix_refstore::{ApplyError, Committer, GixRefStore, ObjectId, RefEdit, RefName, RefStore};
 
 mod config;
+mod invocation;
 
 use config::commit_signing_enabled;
 pub use config::{install_global, install_local};
+use invocation::InvokedBy;
 
 /// The ref containing the latest repository-state snapshot.
 pub const OP_REF: &str = "refs/op";
@@ -491,6 +493,9 @@ fn append_internal(
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
     let signing = commit_signing_enabled(repo)?;
+    let invoked_by = matches!(requested_message, CommitMessage::Generated)
+        .then(invocation::detect)
+        .flatten();
     let author = match options.author {
         Some(author) => author,
         None => refs.author().map_err(Error::git)?,
@@ -516,7 +521,16 @@ fn append_internal(
             }
         };
         let tree = serialize(repo, &state)?;
-        let commit_id = write_commit(repo, tree, parent, &message, &author, &committer, signing)?;
+        let commit_id = write_commit(
+            repo,
+            tree,
+            parent,
+            &message,
+            invoked_by.as_ref(),
+            &author,
+            &committer,
+            signing,
+        )?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
                 name: name.clone(),
@@ -542,11 +556,13 @@ fn append_internal(
 /// `git commit-tree` is used rather than constructing the commit object
 /// directly so Git's configured signing implementation can add a `gpgsig`
 /// header. It does not invoke commit hooks.
+#[allow(clippy::too_many_arguments)]
 fn write_commit(
     repo: &gix::Repository,
     tree: ObjectId,
     parent: Option<ObjectId>,
     message: &str,
+    invoked_by: Option<&InvokedBy>,
     author: &gix::actor::Signature,
     committer: &gix::actor::Signature,
     signing: bool,
@@ -560,6 +576,11 @@ fn write_commit(
         command.args(["-p", &parent.to_hex().to_string()]);
     }
     command.arg("-m").arg(message);
+    if let Some(invoked_by) = invoked_by {
+        command
+            .arg("-m")
+            .arg(format!("Invoked-by: {}", invoked_by.as_str()));
+    }
     if signing {
         command.arg("-S");
     }
@@ -1360,6 +1381,42 @@ mod tests {
     fn temporary_repository_has_commit_identity() {
         let temporary = TemporaryRepository::new();
         append(&temporary.repo, "test snapshot").expect("append snapshot");
+    }
+
+    #[test]
+    fn generated_commit_records_invoking_command() {
+        let temporary = TemporaryRepository::new();
+        let tree = temporary
+            .repo
+            .write_buf(Kind::Tree, b"")
+            .expect("write empty tree");
+        let signature = gix::actor::Signature {
+            name: "git-op test".into(),
+            email: "git-op@test".into(),
+            time: gix::date::Time {
+                seconds: 1_700_000_000,
+                offset: 0,
+            },
+        };
+        let commit = write_commit(
+            &temporary.repo,
+            tree,
+            None,
+            "op: capture initial repository state",
+            Some(&InvokedBy("git commit".to_owned())),
+            &signature,
+            &signature,
+            false,
+        )
+        .expect("write operation commit");
+        assert_eq!(
+            temporary
+                .repo
+                .find_commit(commit)
+                .expect("find operation commit")
+                .message_raw_sloppy(),
+            b"op: capture initial repository state\n\nInvoked-by: git commit\n"
+        );
     }
 
     /// Verify that generated messages identify changed snapshot components.
