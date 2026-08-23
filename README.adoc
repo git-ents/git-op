@@ -1,5 +1,14 @@
-= git-op
+= 🪵 `git-op`
+:abstract: Operation logs in pure git.
 
-== TODO
+== Motivation
 
-TODO
+// TODO
+
+== Installation
+
+// TODO
+
+== Usage
+
+// TODO
