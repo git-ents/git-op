@@ -1320,7 +1320,7 @@ fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
         captured |= is_captured_ref(fields[2]);
     }
     if !saw_line {
-        return Err(Error::InvalidHookInput("transaction is empty".to_owned()));
+        return Ok(false);
     }
     Ok(captured)
 }
@@ -1725,12 +1725,25 @@ mod tests {
         );
     }
 
-    /// Verify that empty hook input is rejected.
+    /// Verify that an empty committed transaction leaves the operation log unchanged.
     #[test]
-    fn hook_parser_rejects_empty_transactions() {
-        assert!(matches!(
-            transaction_changes_captured_refs(b"\n"),
-            Err(Error::InvalidHookInput(_))
-        ));
+    fn hook_accepts_empty_committed_transaction() {
+        let temporary = TemporaryRepository::new();
+        reference_transaction(&temporary.repo, "committed", b"")
+            .expect("process empty transaction");
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none()
+        );
+    }
+
+    /// Verify that empty hook input is treated as a no-op.
+    #[test]
+    fn hook_parser_accepts_empty_transactions() {
+        assert!(!transaction_changes_captured_refs(b"\n").expect("empty transaction"));
+        assert!(!transaction_changes_captured_refs(b"\r\n").expect("empty transaction"));
     }
 }
