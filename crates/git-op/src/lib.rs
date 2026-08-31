@@ -1893,6 +1893,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn undo_and_redo_follow_the_logical_transition_table() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "base"]);
+        let a = append(&temporary.repo, "A").expect("append A");
+        let initial_description = fs::read(temporary.repo.common_dir().join("description"))
+            .expect("read initial description");
+        fs::write(temporary.repo.common_dir().join("description"), b"B\n").expect("write B");
+        let b = append(&temporary.repo, "B").expect("append B");
+        fs::write(temporary.repo.common_dir().join("description"), b"C\n").expect("write C");
+        let c = append(&temporary.repo, "C").expect("append C");
+
+        let undo_c = undo_action(&temporary.repo).expect("undo C");
+        assert_eq!(undo_c.target, c);
+        assert_eq!(
+            fs::read(temporary.repo.common_dir().join("description")).expect("read B"),
+            b"B\n"
+        );
+        let undo_b = undo_action(&temporary.repo).expect("undo B");
+        assert_eq!(undo_b.target, b);
+        assert_eq!(
+            fs::read(temporary.repo.common_dir().join("description")).expect("read A"),
+            initial_description
+        );
+
+        let redo_b = redo_action(&temporary.repo).expect("redo B");
+        assert_eq!(redo_b.target, b);
+        let redo_c = redo_action(&temporary.repo).expect("redo C");
+        assert_eq!(redo_c.target, c);
+        assert_eq!(
+            fs::read(temporary.repo.common_dir().join("description")).expect("read C"),
+            b"C\n"
+        );
+        assert!(matches!(
+            redo_action(&temporary.repo),
+            Err(Error::NothingToRedo)
+        ));
+
+        let operation = temporary
+            .repo
+            .find_commit(undo_c.operation)
+            .expect("read undo operation");
+        let message = operation.message_raw_sloppy();
+        assert!(
+            message
+                .windows(b"Git-op: undo:".len())
+                .any(|window| window == b"Git-op: undo:")
+        );
+        assert!(
+            message
+                .windows(b"undone-operation:".len())
+                .any(|window| window == b"undone-operation:")
+        );
+        assert!(
+            message
+                .windows(b"restored-operation:".len())
+                .any(|window| window == b"restored-operation:")
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn new_work_after_undo_ends_the_redo_chain() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "base"]);
+        append(&temporary.repo, "A").expect("append A");
+        fs::write(temporary.repo.common_dir().join("description"), b"B\n").expect("write B");
+        append(&temporary.repo, "B").expect("append B");
+        fs::write(temporary.repo.common_dir().join("description"), b"C\n").expect("write C");
+        let c = append(&temporary.repo, "C").expect("append C");
+        undo_action(&temporary.repo).expect("undo C");
+        fs::write(temporary.repo.common_dir().join("description"), b"D\n").expect("write D");
+        append(&temporary.repo, "D").expect("append D");
+
+        assert!(matches!(
+            redo_action(&temporary.repo),
+            Err(Error::NothingToRedo)
+        ));
+        undo_action(&temporary.repo).expect("undo D");
+        assert_eq!(
+            fs::read(temporary.repo.common_dir().join("description")).expect("read B"),
+            b"B\n"
+        );
+        restore(&temporary.repo, c).expect("restore C");
+        assert_eq!(
+            fs::read(temporary.repo.common_dir().join("description")).expect("read C"),
+            b"C\n"
+        );
+    }
+
+    #[test]
+    fn restore_of_current_state_does_not_append() {
+        let temporary = TemporaryRepository::new();
+        let current = append(&temporary.repo, "current").expect("append current");
+        let result = restore_action(&temporary.repo, current).expect("restore current");
+        assert!(!result.changed);
+        assert_eq!(result.operation, current);
+    }
+
     /// Verify that generated messages identify changed snapshot components.
     #[test]
     fn generated_snapshot_message_identifies_changes() {
