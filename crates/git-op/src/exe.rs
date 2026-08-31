@@ -1,6 +1,6 @@
 //! Implementations of `git-op` command-line operations.
 
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read, Write};
 
 use crate::cli::Command;
 
@@ -93,12 +93,12 @@ fn restore_command(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
-    let Some(specification) = specification else {
-        return Err(
-            "restore requires an operation; interactive selection is not implemented".into(),
-        );
+    let specification = match specification {
+        Some(specification) => specification.to_owned(),
+        None if io::stdin().is_terminal() => select_restore_operation(&repo)?,
+        None => return Err("restore requires an operation in non-interactive mode".into()),
     };
-    let oid = git_op::resolve_operation(&repo, specification)?;
+    let oid = git_op::resolve_operation(&repo, &specification)?;
     if dry_run {
         println!("Would restore to operation {}", short(&oid));
         return Ok(());
@@ -107,6 +107,30 @@ fn restore_command(
     let result = git_op::restore_action(&repo, oid)?;
     println!("Restored to operation {}", short(&result.restored));
     Ok(())
+}
+
+fn select_restore_operation(repo: &gix::Repository) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(reference) = repo.try_find_reference(git_op::OP_REF)? else {
+        return Err("no operation snapshots recorded".into());
+    };
+    let tip = reference
+        .target()
+        .try_id()
+        .ok_or(git_op::Error::InvalidOperationRef)?
+        .to_owned();
+    let commit = repo.find_commit(tip)?;
+    println!("Restore repository to the state after this operation:");
+    println!("{}  {}", tip, commit.message()?.summary());
+    print!("Operation ID (empty selects latest): ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    Ok(if input.is_empty() {
+        tip.to_string()
+    } else {
+        input.to_owned()
+    })
 }
 
 fn undo_command(
