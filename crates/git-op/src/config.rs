@@ -14,7 +14,7 @@ const HOOK_NAME: &str = "reference-transaction";
 /// Hook block written by fresh installs and hook upgrades.
 macro_rules! hook_line {
     () => {
-        "if command -v git-op >/dev/null 2>&1; then git-op reference-transaction \"$@\"; fi\n"
+        "command -v git-op >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found. If you no longer wish for operations to be logged, delete the following file.\" \"$0\"; exit 2; }; git-op reference-transaction \"$@\"\n"
     };
 }
 
@@ -170,7 +170,9 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 fn invokes_git_op(line: &str) -> bool {
     let line = line.trim();
     !line.starts_with('#')
-        && (line.contains("git-op") || line.contains("git op reference-transaction"))
+        && (line.contains("git-op")
+            || line.contains("git op reference-transaction")
+            || line.contains("git op \"$hook\""))
 }
 
 /// Rewrite git-op's block in `existing`, or `None` if no owned line exists.
