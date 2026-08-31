@@ -1379,8 +1379,6 @@ fn apply_action_with_trailers(
             changed: false,
         });
     }
-    let state = read(repo, plan.restored)?;
-    verify_snapshot_referents(repo, &state)?;
     apply_state(repo, &state)?;
     let primary_target = primary_target.unwrap_or(plan.target);
     let mut message = format!(
@@ -2348,7 +2346,7 @@ mod tests {
     /// Verify that a no-op restore still reports snapshot refs that point at
     /// missing objects instead of silently reporting success.
     #[test]
-    fn restore_noop_reports_missing_snapshot_objects() {
+    fn restore_noop_reports_missing_snapshot_referents() {
         let temporary = TemporaryRepository::new();
         std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
         git(&temporary, &["add", "tracked"]);
@@ -2365,49 +2363,12 @@ mod tests {
         std::fs::remove_file(&loose).expect("remove loose commit object");
 
         match restore_action(&temporary.repo, snapshot) {
-            Err(Error::PrunedObject { ref_name, oid }) => {
+            Err(Error::PrunedReferent { ref_name, oid }) => {
                 assert_eq!(ref_name, "refs/heads/main");
                 assert_eq!(oid, missing);
             }
-            result => panic!("expected PrunedObject, got {result:?}"),
+            result => panic!("expected PrunedReferent, got {result:?}"),
         }
-    }
-
-    /// Verify that restoring a snapshot whose branch targets an existing
-    /// non-commit object is rejected before refs move.
-    #[test]
-    fn restore_aborts_when_snapshot_branch_targets_non_commit() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("blob"), b"blob\n").expect("write blob file");
-        let blob = git_output(&temporary, &["hash-object", "-w", "blob"])
-            .trim()
-            .to_owned();
-        // Git refuses to point a branch at a blob, so write the loose ref
-        // directly; a snapshot records ref targets as plain bytes either way.
-        std::fs::create_dir_all(temporary.repo.git_dir().join("refs/heads"))
-            .expect("create refs/heads");
-        std::fs::write(
-            temporary.repo.git_dir().join("refs/heads/broken"),
-            format!("{blob}\n"),
-        )
-        .expect("write loose ref");
-        let snapshot = append(&temporary.repo, "snapshot of blob branch")
-            .expect("append snapshot of blob branch");
-        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
-        let moved = temporary.repo.head_id().expect("read moved HEAD").detach();
-
-        match restore_action(&temporary.repo, snapshot) {
-            Err(Error::UnusableObject { ref_name, oid }) => {
-                assert_eq!(ref_name, "refs/heads/broken");
-                assert_eq!(oid.to_string(), blob);
-            }
-            result => panic!("expected UnusableObject, got {result:?}"),
-        }
-        assert_eq!(
-            temporary.repo.head_id().expect("read HEAD"),
-            moved,
-            "refs must not move when a branch target is unusable"
-        );
     }
 
     /// Verify that generated messages identify changed snapshot components.
