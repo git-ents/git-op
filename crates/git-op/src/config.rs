@@ -15,7 +15,7 @@ const HOOK_NAME: &str = "reference-transaction";
 /// TODO: Split this into readable shell lines once block rewriting can do so.
 macro_rules! hook_line {
     () => {
-        "if git rev-parse --git-dir >/dev/null 2>&1; then hook=$(git rev-parse --git-path hooks/reference-transaction 2>/dev/null) || { status=$?; echo \"git-op: unable to determine hook path with exit $status\" >&2; exit \"$status\"; }; command -v git-op >/dev/null 2>&1 || { echo \"git-op: executable not found in PATH; install git-op or fix $hook\" >&2; exit 127; }; git-op reference-transaction \"$@\" || { status=$?; echo \"git-op: reference-transaction failed with exit $status\" >&2; exit \"$status\"; }; fi\n"
+        "if git rev-parse --git-dir >/dev/null 2>&1; then command -v git-op >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found. If you no longer wish for operations to be logged, delete the following file.\" \"$0\"; exit 2; }; hook=reference-transaction; git op \"$hook\" \"$@\"; fi\n"
     };
 }
 
@@ -45,7 +45,7 @@ const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 /// git_op::install_local(&repo).expect("install reference-transaction hook");
 /// let hook = repo.git_dir().join("hooks/reference-transaction");
 /// let body = std::fs::read_to_string(hook).expect("read installed hook");
-/// assert!(body.contains("git-op reference-transaction"));
+/// assert!(body.contains("git op \"$hook\""));
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
@@ -171,7 +171,9 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 fn invokes_git_op(line: &str) -> bool {
     let line = line.trim();
     !line.starts_with('#')
-        && (line.contains("git-op") || line.contains("git op reference-transaction"))
+        && (line.contains("git-op")
+            || line.contains("git op reference-transaction")
+            || line.contains("git op \"$hook\""))
 }
 
 /// Rewrite git-op's block in `existing`, or `None` if no owned line exists.
