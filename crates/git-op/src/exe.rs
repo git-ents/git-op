@@ -11,6 +11,7 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
         Command::Install { local } => install(local),
+        Command::Snap => snap_command(),
         Command::Log {
             max_count,
             reverse,
@@ -86,6 +87,25 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Record any repository state not yet on the operation log, reporting whether
+/// this invocation appended a snapshot.
+fn snap_command() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = open_repository()?;
+    let snapped = git_op::snap(&repo)?;
+    println!("{}", snap_summary(&snapped));
+    Ok(())
+}
+
+/// Describe a snap outcome, attributing a snapshot to this invocation only
+/// when this call actually appended it.
+fn snap_summary(snapped: &git_op::SnapResult) -> String {
+    if snapped.appended {
+        format!("Recorded snapshot {}", short(&snapped.operation))
+    } else {
+        format!("Operation log is current ({})", short(&snapped.operation))
+    }
+}
+
 fn restore_command(
     specification: Option<&str>,
     dry_run: bool,
@@ -118,7 +138,7 @@ fn select_restore_operation(repo: &gix::Repository) -> Result<String, Box<dyn st
         .to_owned();
     let commit = repo.find_commit(tip)?;
     println!("Restore repository to the state after this operation:");
-    println!("{}  {}", tip, commit.message()?.summary());
+    println!("{}  {}", short(&tip), commit.message()?.summary());
     print!("Operation ID (empty selects latest): ");
     io::stdout().flush()?;
     let mut input = String::new();
@@ -198,7 +218,7 @@ fn target_summary(target: &gix::refs::Target) -> String {
 }
 
 fn short(oid: &gix::ObjectId) -> String {
-    oid.to_string().chars().take(12).collect()
+    oid.to_string().chars().take(7).collect()
 }
 
 #[cfg(test)]
@@ -208,7 +228,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{action_summary, ensure_clean};
+    use super::{action_summary, ensure_clean, snap_summary};
 
     fn repository() -> (gix::Repository, std::path::PathBuf) {
         let unique = SystemTime::now()
@@ -241,7 +261,7 @@ mod tests {
         };
         assert_eq!(
             action_summary("Restored to operation", &result),
-            "Restored to operation 222222222222\nrefs/heads/main -> 222222222222"
+            "Restored to operation 2222222\nrefs/heads/main -> 2222222"
         );
     }
 
@@ -258,7 +278,43 @@ mod tests {
         };
         assert_eq!(
             action_summary("Restored to operation", &result),
-            "Restored to operation 111111111111; no updates"
+            "Restored to operation 1111111; no updates"
+        );
+    }
+
+    /// Verify that a snap only claims a snapshot for this invocation when
+    /// this call appended it.
+    #[test]
+    fn snap_summary_reports_whether_this_invocation_appended() {
+        let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+            .expect("parse object ID");
+        let appended = git_op::SnapResult {
+            operation: oid,
+            appended: true,
+        };
+        assert_eq!(snap_summary(&appended), "Recorded snapshot 1111111");
+        let current = git_op::SnapResult {
+            operation: oid,
+            appended: false,
+        };
+        assert_eq!(snap_summary(&current), "Operation log is current (1111111)");
+    }
+
+    /// Verify that a detached HEAD reports an informational no-op.
+    #[test]
+    fn snap_outcome_reports_detached_head() {
+        assert_eq!(
+            snap_outcome_summary(&git_op::SnapOutcome::Detached),
+            "HEAD is detached; no snapshot recorded"
+        );
+        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult {
+            operation: gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+                .expect("parse object ID"),
+            appended: false,
+        });
+        assert_eq!(
+            snap_outcome_summary(&recorded),
+            "Operation log is current (1111111)"
         );
     }
 
