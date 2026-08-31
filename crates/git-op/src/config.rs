@@ -15,7 +15,7 @@ const HOOK_NAME: &str = "reference-transaction";
 /// TODO: Split this into readable shell lines once block rewriting can do so.
 macro_rules! hook_line {
     () => {
-        "if git rev-parse --git-dir >/dev/null 2>&1; then command -v git-op >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found. If you no longer wish for operations to be logged, delete the following file.\" \"$0\"; exit 2; }; hook=reference-transaction; git op \"$hook\" \"$@\"; fi\n"
+        "command -v git-op >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found. If you no longer wish for operations to be logged, delete the following file.\" \"$0\"; exit 2; }; hook=reference-transaction; git op \"$hook\" \"$@\"\n"
     };
 }
 
