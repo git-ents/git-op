@@ -529,7 +529,7 @@ fn append_internal(
             (CommitMessage::Generated, Some(parent)) => {
                 let changed =
                     SnapshotEntries::from_state(&state).diff(&SnapshotEntries::read(repo, parent)?);
-                let Some(message) = snapshot_message(changed) else {
+                let Some(message) = snapshot_message(&changed) else {
                     return Ok(parent);
                 };
                 message
@@ -690,32 +690,38 @@ pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState,
 }
 
 /// The parts of the captured state that a snapshot changed relative to its parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Changes {
-    /// Whether the captured refs tree changed.
-    pub r#refs: bool,
-    /// Whether the captured `config` file changed.
-    pub config: bool,
-    /// Whether the captured `description` file changed.
-    pub description: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changes {
+    /// The captured refs changed.
+    Refs(Vec<RefChange>),
+    /// The captured `config` file changed.
+    Config,
+    /// The captured `description` file changed.
+    Description,
 }
 
 impl Changes {
     /// The names of the changed parts, in capture order.
-    pub fn names(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        if self.r#refs {
-            names.push("refs");
-        }
-        names.extend(self.file_names());
-        names
+    pub fn names(changes: &[Self]) -> Vec<&'static str> {
+        changes
+            .iter()
+            .map(|change| match change {
+                Self::Refs(_) => "refs",
+                Self::Config => "config",
+                Self::Description => "description",
+            })
+            .collect()
     }
 
     /// The names of the changed metadata files, in capture order.
-    pub fn file_names(&self) -> Vec<&'static str> {
-        [(self.config, "config"), (self.description, "description")]
-            .into_iter()
-            .filter_map(|(changed, name)| changed.then_some(name))
+    pub fn file_names(changes: &[Self]) -> Vec<&'static str> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Self::Config => Some("config"),
+                Self::Description => Some("description"),
+                Self::Refs(_) => None,
+            })
             .collect()
     }
 }
@@ -821,12 +827,18 @@ impl SnapshotEntries {
     }
 
     /// The changes `self` represents relative to `previous`.
-    fn diff(&self, previous: &Self) -> Changes {
-        Changes {
-            r#refs: self.r#refs != previous.r#refs,
-            config: self.config != previous.config,
-            description: self.description != previous.description,
+    fn diff(&self, previous: &Self) -> Vec<Changes> {
+        let mut changes = Vec::new();
+        if self.r#refs != previous.r#refs {
+            changes.push(Changes::Refs(Vec::new()));
         }
+        if self.config != previous.config {
+            changes.push(Changes::Config);
+        }
+        if self.description != previous.description {
+            changes.push(Changes::Description);
+        }
+        changes
     }
 }
 
@@ -853,16 +865,23 @@ impl SnapshotEntries {
 /// let changed = git_op::changes(&repo, update)
 ///     .expect("compute changes")
 ///     .expect("updated snapshot has a parent");
-/// assert_eq!(changed.names(), vec!["description"]);
+/// assert_eq!(git_op::Changes::names(&changed), vec!["description"]);
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
-pub fn changes(repo: &gix::Repository, commit: ObjectId) -> Result<Option<Changes>, Error> {
+pub fn changes(repo: &gix::Repository, commit: ObjectId) -> Result<Option<Vec<Changes>>, Error> {
     let Some(parent) = parent_snapshot(repo, commit)? else {
         return Ok(None);
     };
     let current = SnapshotEntries::read(repo, commit)?;
     let previous = SnapshotEntries::read(repo, parent)?;
-    Ok(Some(current.diff(&previous)))
+    let mut changes = current.diff(&previous);
+    if let Some(Changes::Refs(refs)) = changes
+        .iter_mut()
+        .find(|change| matches!(change, Changes::Refs(_)))
+    {
+        *refs = ref_changes_between(repo, previous.r#refs, current.r#refs)?;
+    }
+    Ok(Some(changes))
 }
 
 /// The first parent of a snapshot commit, or `None` for the initial snapshot.
@@ -1051,8 +1070,8 @@ fn read_ref_target(repo: &gix::Repository, blob: ObjectId) -> Result<Target, Err
 
 /// Compose the summary line for a generated snapshot commit, or `None` when
 /// `changed` has no changed parts.
-fn snapshot_message(changed: Changes) -> Option<String> {
-    let names = changed.names();
+fn snapshot_message(changed: &[Changes]) -> Option<String> {
+    let names = Changes::names(changed);
     let summary = match names.as_slice() {
         [] => return None,
         [one] => (*one).to_owned(),
@@ -1072,9 +1091,7 @@ pub struct ActionResult {
     /// The snapshot that was applied.
     pub restored: ObjectId,
     /// The captured state components changed while applying the snapshot.
-    pub changes: Changes,
-    /// The refs changed while applying the snapshot, ordered by name.
-    pub ref_changes: Vec<RefChange>,
+    pub changes: Vec<Changes>,
     /// Whether the action changed the repository and appended a log entry.
     pub changed: bool,
 }
@@ -1207,19 +1224,26 @@ fn apply_action_with_trailers(
         return Err(Error::InvalidOperationRef);
     };
     let current_entries = SnapshotEntries::from_state(&current);
-    let changes = Changes {
-        r#refs: current_entries.r#refs != target_entries.r#refs,
-        config: current_entries.config != target_entries.config,
-        description: current_entries.description != target_entries.description,
-    };
-    let ref_changes = ref_changes_between(repo, current_entries.r#refs, target_entries.r#refs)?;
+    let mut changes = Vec::new();
+    if current_entries.r#refs != target_entries.r#refs {
+        changes.push(Changes::Refs(ref_changes_between(
+            repo,
+            current_entries.r#refs,
+            target_entries.r#refs,
+        )?));
+    }
+    if current_entries.config != target_entries.config {
+        changes.push(Changes::Config);
+    }
+    if current_entries.description != target_entries.description {
+        changes.push(Changes::Description);
+    }
     if current_entries == target_entries {
         return Ok(ActionResult {
             operation,
             target: plan.target,
             restored: plan.restored,
             changes,
-            ref_changes,
             changed: false,
         });
     }
@@ -1238,7 +1262,6 @@ fn apply_action_with_trailers(
         target: plan.target,
         restored: plan.restored,
         changes,
-        ref_changes,
         changed: true,
     })
 }
@@ -1793,14 +1816,14 @@ mod tests {
 
         let result = restore_action(&temporary.repo, initial).expect("restore initial snapshot");
         assert_eq!(
-            result.ref_changes,
-            vec![RefChange {
+            result.changes,
+            vec![Changes::Refs(vec![RefChange {
                 name: "refs/heads/main".to_owned(),
                 kind: RefChangeKind::Updated {
                     old: Target::Object(second),
                     new: Target::Object(first),
                 },
-            }]
+            }])]
         );
 
         assert_eq!(temporary.repo.head_id().expect("read restored HEAD"), first);
@@ -2213,13 +2236,8 @@ mod tests {
         let changed = changes(&temporary.repo, update)
             .expect("compute changes")
             .expect("updated snapshot has a parent");
-        assert_eq!(
-            changed,
-            Changes {
-                r#refs: true,
-                config: false,
-                description: true,
-            }
+        assert!(
+            matches!(changed.as_slice(), [Changes::Refs(refs), Changes::Description] if refs.len() == 1)
         );
     }
 

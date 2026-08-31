@@ -318,12 +318,14 @@ fn extract_entries(
         let time = commit.committer()?.time()?;
         let changed = match git_op::changes(repo, id)? {
             Some(changes) => Some(Changed {
-                refs: if changes.r#refs {
-                    ref_lines(repo, id)?
-                } else {
-                    Vec::new()
+                refs: match changes.iter().find_map(|change| match change {
+                    git_op::Changes::Refs(_) => Some(ref_lines(repo, id)),
+                    _ => None,
+                }) {
+                    Some(refs) => refs?,
+                    None => Vec::new(),
                 },
-                files: changes.file_names(),
+                files: git_op::Changes::file_names(&changes),
             }),
             None => None,
         };

@@ -169,7 +169,16 @@ fn action_summary(prefix: &str, result: &git_op::ActionResult) -> String {
         summary.push_str("; no updates");
         return summary;
     }
-    for change in &result.ref_changes {
+    for change in result
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            git_op::Changes::Refs(refs) => Some(refs),
+            _ => None,
+        })
+        .into_iter()
+        .flatten()
+    {
         let target = match &change.kind {
             git_op::RefChangeKind::Created(target)
             | git_op::RefChangeKind::Updated { new: target, .. } => target_summary(target),
@@ -177,7 +186,7 @@ fn action_summary(prefix: &str, result: &git_op::ActionResult) -> String {
         };
         summary.push_str(&format!("\n{} -> {target}", change.name));
     }
-    for name in result.changes.file_names() {
+    for name in git_op::Changes::file_names(&result.changes) {
         summary.push_str(&format!("\n{name} updated"));
     }
     summary
@@ -223,18 +232,13 @@ mod tests {
             operation: old,
             target: old,
             restored: new,
-            changes: git_op::Changes {
-                refs: true,
-                config: false,
-                description: false,
-            },
-            ref_changes: vec![git_op::RefChange {
+            changes: vec![git_op::Changes::Refs(vec![git_op::RefChange {
                 name: "refs/heads/main".to_owned(),
                 kind: git_op::RefChangeKind::Updated {
                     old: gix::refs::Target::Object(old),
                     new: gix::refs::Target::Object(new),
                 },
-            }],
+            }])],
             changed: true,
         };
         assert_eq!(
@@ -251,12 +255,7 @@ mod tests {
             operation: oid,
             target: oid,
             restored: oid,
-            changes: git_op::Changes {
-                refs: false,
-                config: false,
-                description: false,
-            },
-            ref_changes: Vec::new(),
+            changes: Vec::new(),
             changed: false,
         };
         assert_eq!(
