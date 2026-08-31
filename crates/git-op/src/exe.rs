@@ -18,7 +18,7 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => crate::log::run(max_count, reverse, verbose, no_pager, oneline, json),
         Command::Restore { oid, dry_run } => restore_command(oid.as_deref(), dry_run),
-        Command::Undo { oid, dry_run } => undo_command(oid.as_deref(), dry_run),
+        Command::Undo { dry_run } => undo_command(dry_run),
         Command::Redo { dry_run } => redo_command(dry_run),
     }
 }
@@ -133,13 +133,7 @@ fn select_restore_operation(repo: &gix::Repository) -> Result<String, Box<dyn st
     })
 }
 
-fn undo_command(
-    specification: Option<&str>,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if specification.is_some() {
-        return Err("undo does not take an operation\nhint: use `git op restore <operation>`\nhint: reproduce the former behavior with `git op restore <operation>^`".into());
-    }
+fn undo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
     let plan = git_op::plan_undo(&repo)?;
     if dry_run {

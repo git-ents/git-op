@@ -60,11 +60,7 @@ pub(crate) enum Command {
         dry_run: bool,
     },
     /// Restore the state before the latest logical operation.
-    #[command(disable_help_flag = false)]
     Undo {
-        /// Deprecated operation argument; use `restore <operation>` instead.
-        #[arg(hide = true)]
-        oid: Option<String>,
         /// Show the action without changing the repository or operation log.
         #[arg(short = 'n', long)]
         dry_run: bool,
@@ -86,19 +82,11 @@ mod tests {
     #[test]
     fn undo_is_zero_argument_and_accepts_dry_run() {
         let cli = Cli::try_parse_from(["git-op", "undo", "-n"]).expect("parse undo dry-run");
-        let Command::Undo { oid, dry_run } = cli.command else {
+        let Command::Undo { dry_run } = cli.command else {
             panic!("expected the undo command");
         };
-        assert!(oid.is_none());
         assert!(dry_run);
-
-        let cli = Cli::try_parse_from(["git-op", "undo", "abc123"])
-            .expect("parse deprecated undo operation");
-        let Command::Undo { oid, dry_run } = cli.command else {
-            panic!("expected the undo command");
-        };
-        assert_eq!(oid.as_deref(), Some("abc123"));
-        assert!(!dry_run);
+        assert!(Cli::try_parse_from(["git-op", "undo", "abc123"]).is_err());
     }
 
     #[test]

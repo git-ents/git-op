@@ -1059,7 +1059,7 @@ pub struct ActionResult {
     pub operation: ObjectId,
     /// The operation whose captured state was selected.
     pub target: ObjectId,
-    /// The operation whose state was applied.
+    /// The snapshot that was applied.
     pub restored: ObjectId,
     /// Whether the action changed the repository and appended a log entry.
     pub changed: bool,
@@ -1068,9 +1068,9 @@ pub struct ActionResult {
 /// A state transition that can be displayed without applying it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionPlan {
-    /// The action name used by operation trailers.
+    /// The action name used by the operation trailer.
     pub action: &'static str,
-    /// The logical operation selected by the action.
+    /// The operation identified by the transition.
     pub target: ObjectId,
     /// The snapshot that would become the repository state.
     pub restored: ObjectId,
@@ -1081,54 +1081,50 @@ pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Err
     Ok(restore_action(repo, commit)?.operation)
 }
 
-/// Restore a selected snapshot and record a typed restore operation.
+/// Restore a selected snapshot and append a restore operation.
 pub fn restore_action(repo: &gix::Repository, commit: ObjectId) -> Result<ActionResult, Error> {
-    let plan = ActionPlan {
-        action: "restore",
-        target: commit,
-        restored: commit,
-    };
-    apply_action(repo, plan)
+    apply_action(
+        repo,
+        ActionPlan {
+            action: "restore",
+            target: commit,
+            restored: commit,
+        },
+    )
 }
 
-/// Restore the previous logical state and record an undo operation.
+/// Restore the previous logical state and append an undo operation.
 pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
     Ok(undo_action(repo)?.operation)
 }
 
-/// Select the next sequential undo transition without changing the repository.
+/// Select the next undo transition without changing the repository.
 pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
     let metadata = operation_metadata(repo, tip)?;
     let (target, restored) = match metadata.action {
-        None => (
+        None | Some(OperationAction::Restore) => (
             tip,
             parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
         ),
         Some(OperationAction::Undo) => {
-            let restored = metadata.restored.ok_or_else(|| {
-                Error::InvalidSnapshot(format!(
-                    "undo operation {tip} is missing restored-operation"
-                ))
-            })?;
+            let restored = metadata
+                .restored
+                .ok_or_else(|| missing_trailer(tip, "restored-operation"))?;
             (
                 restored,
                 parent_snapshot(repo, restored)?.ok_or(Error::NothingToUndo)?,
             )
         }
         Some(OperationAction::Redo) => {
-            let target = metadata.target.ok_or_else(|| {
-                Error::InvalidSnapshot(format!("redo operation {tip} is missing its target"))
-            })?;
+            let target = metadata
+                .target
+                .ok_or_else(|| missing_trailer(tip, "Git-op"))?;
             (
                 target,
                 parent_snapshot(repo, target)?.ok_or(Error::NothingToUndo)?,
             )
         }
-        Some(OperationAction::Restore) => (
-            tip,
-            parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
-        ),
     };
     Ok(ActionPlan {
         action: "undo",
@@ -1137,32 +1133,25 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     })
 }
 
-/// Apply the next sequential undo transition and append its operation trailer.
+/// Apply the next undo transition and append its operation trailer.
 pub fn undo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
-    let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
-    let metadata = operation_metadata(repo, tip)?;
     let plan = plan_undo(repo)?;
-    let trailer_target = if matches!(metadata.action, Some(OperationAction::Restore)) {
-        tip
-    } else {
-        plan.target
-    };
-    apply_action_with_trailer(repo, plan, trailer_target, Some(plan.restored))
+    apply_action_with_trailers(repo, plan, Some(plan.target), Some(plan.restored))
 }
 
-/// Select the next sequential redo transition without changing the repository.
+/// Select the next redo transition without changing the repository.
 pub fn plan_redo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
-    let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
+    let tip = current_operation(repo)?.ok_or(Error::NothingToRedo)?;
     let metadata = operation_metadata(repo, tip)?;
     let target = match metadata.action {
         Some(OperationAction::Undo) => metadata.target,
         Some(OperationAction::Redo) => {
-            let previous = metadata.target.ok_or_else(|| {
-                Error::InvalidSnapshot(format!("redo operation {tip} is missing its target"))
-            })?;
-            next_undo_target(repo, tip, previous)?
+            let target = metadata
+                .target
+                .ok_or_else(|| missing_trailer(tip, "Git-op"))?;
+            next_redo_target(repo, tip, target)?
         }
-        _ => None,
+        None | Some(OperationAction::Restore) => None,
     }
     .ok_or(Error::NothingToRedo)?;
     Ok(ActionPlan {
@@ -1172,47 +1161,45 @@ pub fn plan_redo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     })
 }
 
-/// Apply the next sequential redo transition and append its operation trailer.
+/// Apply the next redo transition and append its operation trailer.
 pub fn redo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
     apply_action(repo, plan_redo(repo)?)
 }
 
 fn apply_action(repo: &gix::Repository, plan: ActionPlan) -> Result<ActionResult, Error> {
-    apply_action_with_trailer(repo, plan, plan.target, None)
+    apply_action_with_trailers(repo, plan, None, None)
 }
 
-fn apply_action_with_trailer(
+fn apply_action_with_trailers(
     repo: &gix::Repository,
     plan: ActionPlan,
-    trailer_target: ObjectId,
-    restored_operation: Option<ObjectId>,
+    undone: Option<ObjectId>,
+    restored: Option<ObjectId>,
 ) -> Result<ActionResult, Error> {
-    let state = read(repo, plan.restored)?;
-    let current = capture(repo)?;
-    let current_entries = SnapshotEntries::from_state(&current);
     let target_entries = SnapshotEntries::read(repo, plan.restored)?;
-    let Some(tip) = current_operation(repo)? else {
+    let current = capture(repo)?;
+    let Some(operation) = current_operation(repo)? else {
         return Err(Error::InvalidOperationRef);
     };
-    if current_entries == target_entries {
+    if SnapshotEntries::from_state(&current) == target_entries {
         return Ok(ActionResult {
-            operation: tip,
+            operation,
             target: plan.target,
             restored: plan.restored,
             changed: false,
         });
     }
-    apply_state(repo, &state)?;
-    let message = match restored_operation {
-        Some(restored) => format!(
-            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}\nundone-operation: {trailer_target}\nrestored-operation: {restored}",
-            plan.action, plan.action
-        ),
-        None => format!(
-            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}",
-            plan.action, plan.action
-        ),
-    };
+    apply_state(repo, &read(repo, plan.restored)?)?;
+    let mut message = format!(
+        "op: {} {}\n\nGit-op: {}:{}",
+        plan.action, plan.target, plan.action, plan.target
+    );
+    if let Some(undone) = undone {
+        message.push_str(&format!("\nundone-operation: {undone}"));
+    }
+    if let Some(restored) = restored {
+        message.push_str(&format!("\nrestored-operation: {restored}"));
+    }
     let operation = append(repo, &message)?;
     Ok(ActionResult {
         operation,
@@ -1220,6 +1207,10 @@ fn apply_action_with_trailer(
         restored: plan.restored,
         changed: true,
     })
+}
+
+fn missing_trailer(commit: ObjectId, trailer: &str) -> Error {
+    Error::InvalidSnapshot(format!("operation {commit} is missing {trailer}"))
 }
 
 fn current_operation(repo: &gix::Repository) -> Result<Option<ObjectId>, Error> {
@@ -1243,26 +1234,23 @@ fn operation_metadata(
         restored: None,
     };
     for line in message.split(|byte| *byte == b'\n') {
-        let Some(value) = line.strip_prefix(b"Git-op: ") else {
-            if let Some(value) = line.strip_prefix(b"undone-operation: ") {
-                metadata.undone = parse_operation_id(value)?;
-            } else if let Some(value) = line.strip_prefix(b"restored-operation: ") {
-                metadata.restored = parse_operation_id(value)?;
-            }
-            continue;
-        };
-        let Some(separator) = value.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        let (action, value) = value.split_at(separator);
-        let value = &value[1..];
-        metadata.action = match action {
-            b"undo" => Some(OperationAction::Undo),
-            b"redo" => Some(OperationAction::Redo),
-            b"restore" => Some(OperationAction::Restore),
-            _ => None,
-        };
-        metadata.target = parse_operation_id(value)?;
+        if let Some(value) = line.strip_prefix(b"undone-operation: ") {
+            metadata.undone = parse_operation_id(value)?;
+        } else if let Some(value) = line.strip_prefix(b"restored-operation: ") {
+            metadata.restored = parse_operation_id(value)?;
+        } else if let Some(value) = line.strip_prefix(b"Git-op: ") {
+            let Some(separator) = value.iter().position(|byte| *byte == b':') else {
+                continue;
+            };
+            let (action, value) = value.split_at(separator);
+            metadata.action = match action {
+                b"undo" => Some(OperationAction::Undo),
+                b"redo" => Some(OperationAction::Redo),
+                b"restore" => Some(OperationAction::Restore),
+                _ => None,
+            };
+            metadata.target = parse_operation_id(&value[1..])?;
+        }
     }
     Ok(metadata)
 }
@@ -1277,39 +1265,23 @@ fn parse_operation_id(value: &[u8]) -> Result<Option<ObjectId>, Error> {
         .map_err(|error| Error::InvalidSnapshot(format!("invalid operation trailer: {error}")))
 }
 
-fn next_undo_target(
+fn next_redo_target(
     repo: &gix::Repository,
-    tip: ObjectId,
-    previous: ObjectId,
+    redo: ObjectId,
+    undone: ObjectId,
 ) -> Result<Option<ObjectId>, Error> {
-    let redo = repo.find_commit(tip).map_err(Error::git)?;
-    let Some(undo_id) = redo.parent_ids().next().map(|id| id.detach()) else {
+    let parent = parent_snapshot(repo, redo)?;
+    let Some(parent) = parent else {
         return Ok(None);
     };
-    let undo = operation_metadata(repo, undo_id)?;
-    if undo.action != Some(OperationAction::Undo) || undo.undone != Some(previous) {
+    let metadata = operation_metadata(repo, parent)?;
+    if metadata.action != Some(OperationAction::Undo) || metadata.undone != Some(undone) {
         return Ok(None);
     }
-    let Some(previous_undo_id) = repo
-        .find_commit(undo_id)
-        .map_err(Error::git)?
-        .parent_ids()
-        .next()
-        .map(|id| id.detach())
-    else {
+    let Some(next) = parent_snapshot(repo, parent)? else {
         return Ok(None);
     };
-    let target = operation_metadata(repo, previous_undo_id)?.target;
-    Ok(target.filter(|target| *target != previous))
-}
-
-/// Restore the state captured by an operation-log commit, retaining the old
-/// behavior for callers that need the direct object ID API.
-pub fn undo_at(repo: &gix::Repository, commit: Option<ObjectId>) -> Result<ObjectId, Error> {
-    if commit.is_some() {
-        return Err(Error::UndoTakesNoOperation);
-    }
-    undo(repo)
+    Ok(operation_metadata(repo, next)?.target)
 }
 
 /// Resolve an operation commit specification using Git's revision parser.
