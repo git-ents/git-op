@@ -54,12 +54,26 @@ pub(crate) enum Command {
     /// Restore refs, repository config, description, working tree, and index from an operation snapshot.
     Restore {
         /// The operation commit to restore.
-        oid: String,
-    },
-    /// Restore the state before an operation-log commit, including the working tree and index.
-    Undo {
-        /// The operation commit to undo; defaults to the latest operation.
         oid: Option<String>,
+        /// Show the action without changing the repository or operation log.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+    /// Restore the state before the latest logical operation.
+    #[command(disable_help_flag = false)]
+    Undo {
+        /// Deprecated operation argument; use `restore <operation>` instead.
+        #[arg(hide = true)]
+        oid: Option<String>,
+        /// Show the action without changing the repository or operation log.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+    /// Reapply the next logical operation after an undo.
+    Redo {
+        /// Show the action without changing the repository or operation log.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
 }
 
@@ -70,19 +84,41 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
-    fn undo_parses_an_optional_operation_hash() {
-        let cli =
-            Cli::try_parse_from(["git-op", "undo", "abc123"]).expect("parse undo operation hash");
-        let Command::Undo { oid } = cli.command else {
+    fn undo_is_zero_argument_and_accepts_dry_run() {
+        let cli = Cli::try_parse_from(["git-op", "undo", "-n"]).expect("parse undo dry-run");
+        let Command::Undo { oid, dry_run } = cli.command else {
+            panic!("expected the undo command");
+        };
+        assert!(oid.is_none());
+        assert!(dry_run);
+
+        let cli = Cli::try_parse_from(["git-op", "undo", "abc123"])
+            .expect("parse deprecated undo operation");
+        let Command::Undo { oid, dry_run } = cli.command else {
             panic!("expected the undo command");
         };
         assert_eq!(oid.as_deref(), Some("abc123"));
+        assert!(!dry_run);
+    }
 
-        let cli = Cli::try_parse_from(["git-op", "undo"]).expect("parse undo without hash");
-        let Command::Undo { oid } = cli.command else {
-            panic!("expected the undo command");
+    #[test]
+    fn redo_accepts_dry_run() {
+        let cli = Cli::try_parse_from(["git-op", "redo", "--dry-run"]).expect("parse redo");
+        let Command::Redo { dry_run } = cli.command else {
+            panic!("expected the redo command");
         };
-        assert_eq!(oid, None);
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn restore_accepts_an_optional_operation_and_dry_run() {
+        let cli = Cli::try_parse_from(["git-op", "restore", "abc123", "-n"])
+            .expect("parse restore dry-run");
+        let Command::Restore { oid, dry_run } = cli.command else {
+            panic!("expected the restore command");
+        };
+        assert_eq!(oid.as_deref(), Some("abc123"));
+        assert!(dry_run);
     }
 
     #[test]

@@ -17,17 +17,10 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             oneline,
             json,
         } => crate::log::run(max_count, reverse, verbose, no_pager, oneline, json),
-        Command::Restore { oid } => write_command(|| restore(&oid)),
-        Command::Undo { oid } => write_command(|| undo(oid.as_deref())),
+        Command::Restore { oid, dry_run } => restore_command(oid.as_deref(), dry_run),
+        Command::Undo { oid, dry_run } => undo_command(oid.as_deref(), dry_run),
+        Command::Redo { dry_run } => redo_command(dry_run),
     }
-}
-
-fn write_command(
-    command: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = open_repository()?;
-    ensure_clean(&repo)?;
-    command()
 }
 
 fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>> {
@@ -95,22 +88,61 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Restore one operation-log commit into the current repository.
-fn restore(oid: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn restore_command(
+    specification: Option<&str>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
-    let oid = git_op::resolve_operation(&repo, oid)?;
-    git_op::restore(&repo, oid)?;
+    let Some(specification) = specification else {
+        return Err(
+            "restore requires an operation; interactive selection is not implemented".into(),
+        );
+    };
+    let oid = git_op::resolve_operation(&repo, specification)?;
+    if dry_run {
+        println!("Would restore to operation {}", short(&oid));
+        return Ok(());
+    }
+    ensure_clean(&repo)?;
+    let result = git_op::restore_action(&repo, oid)?;
+    println!("Restored to operation {}", short(&result.restored));
     Ok(())
 }
 
-/// Restore the state before an operation-log commit.
-fn undo(specification: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn undo_command(
+    specification: Option<&str>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if specification.is_some() {
+        return Err("undo does not take an operation\nhint: use `git op restore <operation>`\nhint: reproduce the former behavior with `git op restore <operation>^`".into());
+    }
     let repo = open_repository()?;
-    let oid = specification
-        .map(|specification| git_op::resolve_operation(&repo, specification))
-        .transpose()?;
-    git_op::undo_at(&repo, oid)?;
+    let plan = git_op::plan_undo(&repo)?;
+    if dry_run {
+        println!("Would undo operation {}", short(&plan.target));
+        return Ok(());
+    }
+    ensure_clean(&repo)?;
+    let result = git_op::undo_action(&repo)?;
+    println!("Undid operation {}", short(&result.target));
     Ok(())
+}
+
+fn redo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = open_repository()?;
+    let plan = git_op::plan_redo(&repo)?;
+    if dry_run {
+        println!("Would redo operation {}", short(&plan.target));
+        return Ok(());
+    }
+    ensure_clean(&repo)?;
+    let result = git_op::redo_action(&repo)?;
+    println!("Redid operation {}", short(&result.target));
+    Ok(())
+}
+
+fn short(oid: &gix::ObjectId) -> String {
+    oid.to_string().chars().take(12).collect()
 }
 
 #[cfg(test)]

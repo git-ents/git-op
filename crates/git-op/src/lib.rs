@@ -46,6 +46,20 @@ pub struct AppendOptions {
     pub committer: Option<gix::actor::Signature>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationAction {
+    Undo,
+    Redo,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationMetadata {
+    action: Option<OperationAction>,
+    target: Option<ObjectId>,
+    restored: Option<ObjectId>,
+}
+
 /// Errors produced while capturing, storing, or installing repository state.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -80,8 +94,14 @@ pub enum Error {
     #[error("refusing to overwrite existing hook {0}")]
     HookExists(PathBuf),
     /// The operation log has no earlier snapshot to restore.
-    #[error("the operation log has no earlier snapshot to restore")]
+    #[error("nothing to undo")]
     NothingToUndo,
+    /// No operation was undone and can be redone.
+    #[error("nothing to redo")]
+    NothingToRedo,
+    /// The high-level undo command does not select an operation.
+    #[error("undo does not take an operation")]
+    UndoTakesNoOperation,
     /// A snapshot contains a reference or metadata value that cannot be restored.
     #[error("invalid snapshot content: {0}")]
     InvalidSnapshot(String),
@@ -736,6 +756,7 @@ pub enum RefChangeKind {
 /// Comparing only these entries, rather than the fully deserialized
 /// [`RepositoryState`], avoids walking the entire captured refs tree just to
 /// detect whether a snapshot changed anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntries {
     r#refs: ObjectId,
     config: Option<ObjectId>,
@@ -1030,49 +1051,260 @@ fn snapshot_message(changed: Changes) -> Option<String> {
     Some(format!("op: update {summary}"))
 }
 
+/// The result of a state-changing operation, including its logical target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionResult {
+    /// The operation-log commit created by the action, or the existing tip for a no-op.
+    pub operation: ObjectId,
+    /// The operation whose captured state was selected.
+    pub target: ObjectId,
+    /// The operation whose state was applied.
+    pub restored: ObjectId,
+    /// Whether the action changed the repository and appended a log entry.
+    pub changed: bool,
+}
+
+/// A state transition that can be displayed without applying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionPlan {
+    /// The action name used by operation trailers.
+    pub action: &'static str,
+    /// The logical operation selected by the action.
+    pub target: ObjectId,
+    /// The snapshot that would become the repository state.
+    pub restored: ObjectId,
+}
+
 /// Restore repository refs and metadata from an operation-log commit.
-///
-/// The working tree and index are reset to the restored `HEAD`. Restoration
-/// itself is recorded as a new operation commit, so `undo` can restore the
-/// state that preceded the restore. The operation ref is advanced only after
-/// all captured refs and files have been restored successfully.
 pub fn restore(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, Error> {
-    let state = read(repo, commit)?;
-    apply_state(repo, &state)?;
-    append(repo, &format!("op: restore {commit}"))
+    Ok(restore_action(repo, commit)?.operation)
 }
 
-/// Restore the state captured by the parent of the latest operation commit.
-///
-/// The working tree and index are reset to the restored `HEAD`. Like
-/// [`restore`], undo is itself appended to the operation log. An initial
-/// operation has no earlier snapshot and cannot be undone.
-pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
-    undo_at(repo, None)
-}
-
-/// Restore the state captured by the parent of an operation commit.
-///
-/// When `commit` is absent, the latest operation is used. The operation
-/// itself is appended to the operation log after restoration.
-pub fn undo_at(repo: &gix::Repository, commit: Option<ObjectId>) -> Result<ObjectId, Error> {
-    let target = match commit {
-        Some(commit) => commit,
-        None => {
-            let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
-            operation_target(repo, &name)?.ok_or(Error::NothingToUndo)?
-        }
+/// Restore a selected snapshot and record a typed restore operation.
+pub fn restore_action(repo: &gix::Repository, commit: ObjectId) -> Result<ActionResult, Error> {
+    let plan = ActionPlan {
+        action: "restore",
+        target: commit,
+        restored: commit,
     };
-    let parent = repo
-        .find_commit(target)
+    apply_action(repo, plan)
+}
+
+/// Restore the previous logical state and record an undo operation.
+pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
+    Ok(undo_action(repo)?.operation)
+}
+
+/// Select the next sequential undo transition without changing the repository.
+pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
+    let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
+    let metadata = operation_metadata(repo, tip)?;
+    let (target, restored) = match metadata.action {
+        None => (
+            tip,
+            parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
+        ),
+        Some(OperationAction::Undo) => {
+            let restored = metadata.restored.ok_or_else(|| {
+                Error::InvalidSnapshot(format!(
+                    "undo operation {tip} is missing Restored-operation"
+                ))
+            })?;
+            (
+                restored,
+                parent_snapshot(repo, restored)?.ok_or(Error::NothingToUndo)?,
+            )
+        }
+        Some(OperationAction::Redo) => {
+            let target = metadata.target.ok_or_else(|| {
+                Error::InvalidSnapshot(format!("redo operation {tip} is missing its target"))
+            })?;
+            (
+                target,
+                parent_snapshot(repo, target)?.ok_or(Error::NothingToUndo)?,
+            )
+        }
+        Some(OperationAction::Restore) => (
+            tip,
+            parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
+        ),
+    };
+    Ok(ActionPlan {
+        action: "undo",
+        target,
+        restored,
+    })
+}
+
+/// Apply the next sequential undo transition and append its operation trailer.
+pub fn undo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
+    let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
+    let metadata = operation_metadata(repo, tip)?;
+    let plan = plan_undo(repo)?;
+    let trailer_target = if matches!(metadata.action, Some(OperationAction::Restore)) {
+        tip
+    } else {
+        plan.target
+    };
+    apply_action_with_trailer(repo, plan, trailer_target, Some(plan.restored))
+}
+
+/// Select the next sequential redo transition without changing the repository.
+pub fn plan_redo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
+    let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
+    let metadata = operation_metadata(repo, tip)?;
+    let target = match metadata.action {
+        Some(OperationAction::Undo) => metadata.target,
+        Some(OperationAction::Redo) => {
+            let previous = metadata.target.ok_or_else(|| {
+                Error::InvalidSnapshot(format!("redo operation {tip} is missing its target"))
+            })?;
+            next_undo_target(repo, tip, previous)?
+        }
+        _ => None,
+    }
+    .ok_or(Error::NothingToRedo)?;
+    Ok(ActionPlan {
+        action: "redo",
+        target,
+        restored: target,
+    })
+}
+
+/// Apply the next sequential redo transition and append its operation trailer.
+pub fn redo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
+    apply_action(repo, plan_redo(repo)?)
+}
+
+fn apply_action(repo: &gix::Repository, plan: ActionPlan) -> Result<ActionResult, Error> {
+    apply_action_with_trailer(repo, plan, plan.target, None)
+}
+
+fn apply_action_with_trailer(
+    repo: &gix::Repository,
+    plan: ActionPlan,
+    trailer_target: ObjectId,
+    restored_operation: Option<ObjectId>,
+) -> Result<ActionResult, Error> {
+    let state = read(repo, plan.restored)?;
+    let current = capture(repo)?;
+    let current_entries = SnapshotEntries::from_state(&current);
+    let target_entries = SnapshotEntries::read(repo, plan.restored)?;
+    let Some(tip) = current_operation(repo)? else {
+        return Err(Error::InvalidOperationRef);
+    };
+    if current_entries == target_entries {
+        return Ok(ActionResult {
+            operation: tip,
+            target: plan.target,
+            restored: plan.restored,
+            changed: false,
+        });
+    }
+    apply_state(repo, &state)?;
+    let message = match restored_operation {
+        Some(restored) => format!(
+            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}\nUndone-operation: {trailer_target}\nRestored-operation: {restored}",
+            plan.action, plan.action
+        ),
+        None => format!(
+            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}",
+            plan.action, plan.action
+        ),
+    };
+    let operation = append(repo, &message)?;
+    Ok(ActionResult {
+        operation,
+        target: plan.target,
+        restored: plan.restored,
+        changed: true,
+    })
+}
+
+fn current_operation(repo: &gix::Repository) -> Result<Option<ObjectId>, Error> {
+    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    operation_target(repo, &name)
+}
+
+fn operation_metadata(
+    repo: &gix::Repository,
+    commit: ObjectId,
+) -> Result<OperationMetadata, Error> {
+    let message = repo
+        .find_commit(commit)
+        .map_err(Error::git)?
+        .message_raw_sloppy()
+        .to_vec();
+    let mut metadata = OperationMetadata {
+        action: None,
+        target: None,
+        restored: None,
+    };
+    for line in message.split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"Git-op: ") else {
+            if let Some(value) = line.strip_prefix(b"Restored-operation: ") {
+                metadata.restored = parse_operation_id(value)?;
+            }
+            continue;
+        };
+        let Some(separator) = value.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let (action, value) = value.split_at(separator);
+        let value = &value[1..];
+        metadata.action = match action {
+            b"undo" => Some(OperationAction::Undo),
+            b"redo" => Some(OperationAction::Redo),
+            b"restore" => Some(OperationAction::Restore),
+            _ => None,
+        };
+        metadata.target = parse_operation_id(value)?;
+    }
+    Ok(metadata)
+}
+
+fn parse_operation_id(value: &[u8]) -> Result<Option<ObjectId>, Error> {
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    if value.is_empty() {
+        return Ok(None);
+    }
+    ObjectId::from_hex(value)
+        .map(Some)
+        .map_err(|error| Error::InvalidSnapshot(format!("invalid operation trailer: {error}")))
+}
+
+fn next_undo_target(
+    repo: &gix::Repository,
+    tip: ObjectId,
+    previous: ObjectId,
+) -> Result<Option<ObjectId>, Error> {
+    let redo = repo.find_commit(tip).map_err(Error::git)?;
+    let Some(undo_id) = redo.parent_ids().next().map(|id| id.detach()) else {
+        return Ok(None);
+    };
+    let undo = operation_metadata(repo, undo_id)?;
+    if undo.action != Some(OperationAction::Undo) || undo.target != Some(previous) {
+        return Ok(None);
+    }
+    let Some(previous_undo_id) = repo
+        .find_commit(undo_id)
         .map_err(Error::git)?
         .parent_ids()
         .next()
         .map(|id| id.detach())
-        .ok_or(Error::NothingToUndo)?;
-    let state = read(repo, parent)?;
-    apply_state(repo, &state)?;
-    append(repo, &format!("op: undo {target}"))
+    else {
+        return Ok(None);
+    };
+    Ok(operation_metadata(repo, previous_undo_id)?.target)
+}
+
+/// Restore the state captured by an operation-log commit, retaining the old
+/// behavior for callers that need the direct object ID API.
+pub fn undo_at(repo: &gix::Repository, commit: Option<ObjectId>) -> Result<ObjectId, Error> {
+    if commit.is_some() {
+        return Err(Error::UndoTakesNoOperation);
+    }
+    undo(repo)
 }
 
 /// Resolve an operation commit specification using Git's revision parser.
