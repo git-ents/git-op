@@ -11,11 +11,10 @@ use crate::Error;
 
 const HOOK_NAME: &str = "reference-transaction";
 
-/// The generated block is shared by fresh installs and hook upgrades.
-/// TODO: Split this into readable shell lines once block rewriting can do so.
+/// Hook block written by fresh installs and hook upgrades.
 macro_rules! hook_line {
     () => {
-        "if git rev-parse --git-dir >/dev/null 2>&1; then hook=$(git rev-parse --git-path hooks/reference-transaction 2>/dev/null) || { status=$?; echo \"git-op: unable to determine hook path with exit $status\" >&2; exit \"$status\"; }; command -v git-op >/dev/null 2>&1 || { echo \"git-op: executable not found in PATH; install git-op or fix $hook\" >&2; exit 127; }; git-op reference-transaction \"$@\" || { status=$?; echo \"git-op: reference-transaction failed with exit $status\" >&2; exit \"$status\"; }; fi\n"
+        "if command -v git-op >/dev/null 2>&1; then git-op reference-transaction \"$@\"; fi\n"
     };
 }
 

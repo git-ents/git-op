@@ -616,6 +616,11 @@ fn append_internal(
     Err(Error::LostRace(MAX_APPEND_ATTEMPTS))
 }
 
+/// Flatten a detected invocation into a single-line trailer value.
+fn trailer_text(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
+}
+
 /// Write a snapshot commit through Git, optionally letting Git sign it.
 ///
 /// `git commit-tree` is used rather than constructing the commit object
@@ -644,7 +649,7 @@ fn write_commit(
     if let Some(invoked_by) = invoked_by {
         command
             .arg("-m")
-            .arg(format!("Invoked-by: {}", invoked_by.as_str()));
+            .arg(format!("Invoked-by: {}", trailer_text(invoked_by.as_str())));
     }
     if signing {
         command.arg("-S");
@@ -1734,21 +1739,14 @@ impl TryFrom<&str> for ReferenceTransactionPhase {
 
 /// Process one `reference-transaction` hook invocation.
 ///
-/// Only the committed phase attempts a snapshot, and only a transaction that
-/// actually changes the captured refs, config, or description produces a new
-/// commit; a captured transaction that leaves the state unchanged is a no-op.
-/// Transactions that contain only excluded refs are ignored. Updating
-/// [`OP_REF`] alone does not trigger a snapshot, which prevents the
-/// operation-log update from recursively invoking itself when Git runs hooks
-/// for ref transactions.
-///
-/// Git invokes this hook with `preparing`, `prepared`, `committed`, or
-/// `aborted`; the non-committed phases do not write an operation commit.
+/// Only the committed phase writes a snapshot, and only when the transaction
+/// changes a captured ref, config, or description; updating [`OP_REF`] alone
+/// never does. A committed transaction on a repository without an operation
+/// log records the initial snapshot.
 ///
 /// # Examples
 ///
-/// The hook's preparatory phase does not write an operation commit. This makes
-/// it safe for Git to invoke the hook before the ref transaction is complete.
+/// The preparing phase writes nothing:
 ///
 /// ```
 /// let unique = std::time::SystemTime::now()
@@ -1783,7 +1781,12 @@ pub fn reference_transaction(
         | ReferenceTransactionPhase::Prepared
         | ReferenceTransactionPhase::Aborted => Ok(()),
         ReferenceTransactionPhase::Committed => {
-            if transaction_changes_captured_refs(input)? {
+            if transaction_changes_captured_refs(input)?
+                || repo
+                    .try_find_reference(OP_REF)
+                    .map_err(Error::git)?
+                    .is_none()
+            {
                 append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
             }
             Ok(())
@@ -1792,12 +1795,6 @@ pub fn reference_transaction(
 }
 
 /// Determine whether hook input includes a captured ref update.
-///
-/// Each non-empty line must contain Git's three whitespace-separated fields:
-/// old object ID, new object ID, and reference name. Both LF and CRLF input
-/// are accepted. The parser deliberately returns a boolean rather than the
-/// affected names because the hook only needs to decide whether to append a
-/// snapshot.
 fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
     let mut captured = false;
     let mut saw_line = false;
@@ -2494,18 +2491,55 @@ mod tests {
         );
     }
 
-    /// Verify that an empty committed transaction leaves the operation log unchanged.
+    /// Verify that a `HEAD`-only transaction captures the initial state.
     #[test]
-    fn hook_accepts_empty_committed_transaction() {
+    fn hook_captures_initial_state_on_head_only_transaction() {
         let temporary = TemporaryRepository::new();
-        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, b"")
-            .expect("process empty transaction");
+        let input = b"0000000000000000000000000000000000000000 ref:refs/heads/main HEAD\n";
+        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, input)
+            .expect("process committed HEAD transaction");
         assert!(
             temporary
                 .repo
                 .try_find_reference(OP_REF)
                 .expect("look up operation ref")
-                .is_none()
+                .is_some()
+        );
+    }
+
+    /// Verify that trailer values flatten newlines.
+    #[test]
+    fn trailer_text_flattens_newlines() {
+        assert_eq!(trailer_text("git commit"), "git commit");
+        assert_eq!(trailer_text("git\nEvil: forged"), "git Evil: forged");
+    }
+
+    /// Verify that an empty committed transaction leaves an existing operation log unchanged.
+    #[test]
+    fn hook_accepts_empty_committed_transaction() {
+        let temporary = TemporaryRepository::new();
+        reference_transaction(
+            &temporary.repo,
+            ReferenceTransactionPhase::Committed,
+            b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
+        )
+        .expect("record initial snapshot");
+        let before = temporary
+            .repo
+            .try_find_reference(OP_REF)
+            .expect("look up operation ref")
+            .expect("operation ref exists")
+            .id();
+        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, b"")
+            .expect("process empty transaction");
+        assert_eq!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .expect("operation ref exists")
+                .id(),
+            before
         );
     }
 

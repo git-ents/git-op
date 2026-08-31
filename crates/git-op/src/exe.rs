@@ -59,9 +59,7 @@ pub(crate) fn open_repository() -> Result<gix::Repository, gix::discover::Error>
 
 /// Process a reference-transaction hook invocation from standard input.
 ///
-/// Git can invoke this hook while `git init` is still creating the
-/// repository, before there is anything to discover; that is treated as a
-/// clean no-op rather than an error.
+/// An undiscoverable repository, as during `git init`, is a clean no-op.
 fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> {
     let phase = ReferenceTransactionPhase::try_from(phase)?;
     let mut input = Vec::new();
@@ -69,9 +67,6 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
     let Ok(repo) = open_repository() else {
         return Ok(());
     };
-    if phase == ReferenceTransactionPhase::Committed {
-        ensure_clean(&repo)?;
-    }
     git_op::reference_transaction(&repo, phase, &input)?;
     Ok(())
 }
