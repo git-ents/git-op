@@ -922,9 +922,25 @@ pub fn ref_changes(
     };
     let current = SnapshotEntries::read(repo, commit)?;
     let previous = SnapshotEntries::read(repo, parent)?;
+    Ok(Some(ref_changes_between(
+        repo,
+        previous.r#refs,
+        current.r#refs,
+    )?))
+}
+
+/// Return the individual refs changed between two captured ref trees.
+///
+/// The tree IDs must identify the `refs` entries of serialized repository
+/// states. Results are ordered by full ref name.
+fn ref_changes_between(
+    repo: &gix::Repository,
+    previous: ObjectId,
+    current: ObjectId,
+) -> Result<Vec<RefChange>, Error> {
     let mut changes = Vec::new();
-    diff_ref_trees(repo, previous.r#refs, current.r#refs, "refs", &mut changes)?;
-    Ok(Some(changes))
+    diff_ref_trees(repo, previous, current, "refs", &mut changes)?;
+    Ok(changes)
 }
 
 /// Compare two captured ref trees, appending one [`RefChange`] per ref whose
@@ -1047,7 +1063,7 @@ fn snapshot_message(changed: Changes) -> Option<String> {
 }
 
 /// The result of a state-changing operation, including its logical target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionResult {
     /// The operation-log commit created by the action, or the existing tip for a no-op.
     pub operation: ObjectId,
@@ -1055,6 +1071,10 @@ pub struct ActionResult {
     pub target: ObjectId,
     /// The snapshot that was applied.
     pub restored: ObjectId,
+    /// The captured state components changed while applying the snapshot.
+    pub changes: Changes,
+    /// The refs changed while applying the snapshot, ordered by name.
+    pub ref_changes: Vec<RefChange>,
     /// Whether the action changed the repository and appended a log entry.
     pub changed: bool,
 }
@@ -1186,11 +1206,20 @@ fn apply_action_with_trailers(
     let Some(operation) = current_operation(repo)? else {
         return Err(Error::InvalidOperationRef);
     };
-    if SnapshotEntries::from_state(&current) == target_entries {
+    let current_entries = SnapshotEntries::from_state(&current);
+    let changes = Changes {
+        r#refs: current_entries.r#refs != target_entries.r#refs,
+        config: current_entries.config != target_entries.config,
+        description: current_entries.description != target_entries.description,
+    };
+    let ref_changes = ref_changes_between(repo, current_entries.r#refs, target_entries.r#refs)?;
+    if current_entries == target_entries {
         return Ok(ActionResult {
             operation,
             target: plan.target,
             restored: plan.restored,
+            changes,
+            ref_changes,
             changed: false,
         });
     }
@@ -1208,6 +1237,8 @@ fn apply_action_with_trailers(
         operation,
         target: plan.target,
         restored: plan.restored,
+        changes,
+        ref_changes,
         changed: true,
     })
 }
@@ -1760,7 +1791,17 @@ mod tests {
             "staged\n"
         );
 
-        restore(&temporary.repo, initial).expect("restore initial snapshot");
+        let result = restore_action(&temporary.repo, initial).expect("restore initial snapshot");
+        assert_eq!(
+            result.ref_changes,
+            vec![RefChange {
+                name: "refs/heads/main".to_owned(),
+                kind: RefChangeKind::Updated {
+                    old: Target::Object(second),
+                    new: Target::Object(first),
+                },
+            }]
+        );
 
         assert_eq!(temporary.repo.head_id().expect("read restored HEAD"), first);
         assert_eq!(

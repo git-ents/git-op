@@ -105,7 +105,7 @@ fn restore_command(
     }
     ensure_clean(&repo)?;
     let result = git_op::restore_action(&repo, oid)?;
-    println!("Restored to operation {}", short(&result.restored));
+    print_action_result("Restored to operation", &result);
     Ok(())
 }
 
@@ -142,7 +142,7 @@ fn undo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     ensure_clean(&repo)?;
     let result = git_op::undo_action(&repo)?;
-    println!("Undid operation {}", short(&result.target));
+    print_action_result("Undid operation", &result);
     Ok(())
 }
 
@@ -155,8 +155,39 @@ fn redo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     ensure_clean(&repo)?;
     let result = git_op::redo_action(&repo)?;
-    println!("Redid operation {}", short(&result.target));
+    print_action_result("Redid operation", &result);
     Ok(())
+}
+
+fn print_action_result(prefix: &str, result: &git_op::ActionResult) {
+    println!("{}", action_summary(prefix, result));
+}
+
+fn action_summary(prefix: &str, result: &git_op::ActionResult) -> String {
+    let mut summary = format!("{prefix} {}", short(&result.restored));
+    if !result.changed {
+        summary.push_str("; no updates");
+        return summary;
+    }
+    for change in &result.ref_changes {
+        let target = match &change.kind {
+            git_op::RefChangeKind::Created(target)
+            | git_op::RefChangeKind::Updated { new: target, .. } => target_summary(target),
+            git_op::RefChangeKind::Deleted(_) => "deleted".to_owned(),
+        };
+        summary.push_str(&format!("\n{} -> {target}", change.name));
+    }
+    for name in result.changes.file_names() {
+        summary.push_str(&format!("\n{name} updated"));
+    }
+    summary
+}
+
+fn target_summary(target: &gix::refs::Target) -> String {
+    match target {
+        gix::refs::Target::Object(oid) => short(oid),
+        gix::refs::Target::Symbolic(name) => format!("ref: {name}"),
+    }
 }
 
 fn short(oid: &gix::ObjectId) -> String {
@@ -170,7 +201,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::ensure_clean;
+    use super::{action_summary, ensure_clean};
 
     fn repository() -> (gix::Repository, std::path::PathBuf) {
         let unique = SystemTime::now()
@@ -180,6 +211,58 @@ mod tests {
         let path = std::env::temp_dir().join(format!("git-op-exe-{}-{unique}", std::process::id()));
         let repo = gix::init(&path).expect("initialize repository");
         (repo, path)
+    }
+
+    #[test]
+    fn action_summary_lists_ref_updates() {
+        let old = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+            .expect("parse old object ID");
+        let new = gix::ObjectId::from_hex(b"2222222222222222222222222222222222222222")
+            .expect("parse new object ID");
+        let result = git_op::ActionResult {
+            operation: old,
+            target: old,
+            restored: new,
+            changes: git_op::Changes {
+                refs: true,
+                config: false,
+                description: false,
+            },
+            ref_changes: vec![git_op::RefChange {
+                name: "refs/heads/main".to_owned(),
+                kind: git_op::RefChangeKind::Updated {
+                    old: gix::refs::Target::Object(old),
+                    new: gix::refs::Target::Object(new),
+                },
+            }],
+            changed: true,
+        };
+        assert_eq!(
+            action_summary("Restored to operation", &result),
+            "Restored to operation 222222222222\nrefs/heads/main -> 222222222222"
+        );
+    }
+
+    #[test]
+    fn action_summary_reports_noop() {
+        let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+            .expect("parse object ID");
+        let result = git_op::ActionResult {
+            operation: oid,
+            target: oid,
+            restored: oid,
+            changes: git_op::Changes {
+                refs: false,
+                config: false,
+                description: false,
+            },
+            ref_changes: Vec::new(),
+            changed: false,
+        };
+        assert_eq!(
+            action_summary("Restored to operation", &result),
+            "Restored to operation 111111111111; no updates"
+        );
     }
 
     #[test]
