@@ -39,6 +39,7 @@ const MAX_REF_LINES: usize = 10;
 struct Entry {
     id: String,
     abbreviated_id: String,
+    action: Option<&'static str>,
     time: gix::date::Time,
     /// Whether this is the most recent snapshot (`refs/op` itself), drawn
     /// with the `●` graph glyph. Set once at extraction time so it survives
@@ -330,6 +331,7 @@ fn extract_entries(
         entries.push(Entry {
             id: id.to_string(),
             abbreviated_id: commit.id().shorten_or_id().to_string(),
+            action: operation_action(&commit.message_raw_sloppy()),
             time,
             is_head: entries.is_empty(),
             changed,
@@ -337,6 +339,19 @@ fn extract_entries(
         });
     }
     Ok(entries)
+}
+
+fn operation_action(message: &[u8]) -> Option<&'static str> {
+    message.split(|byte| *byte == b'\n').find_map(|line| {
+        let value = line.strip_prefix(b"Git-op: ")?;
+        let action = value.split(|byte| *byte == b':').next()?;
+        match action {
+            b"undo" => Some("undo"),
+            b"redo" => Some("redo"),
+            b"restore" => Some("restore"),
+            _ => None,
+        }
+    })
 }
 
 /// Resolve the refs one snapshot changed into renderable lines.
@@ -413,6 +428,9 @@ fn render_default(out: &mut impl Write, entries: &[Entry], verbose: bool) -> io:
         write_styled(out, glyph_style, glyph)?;
         write!(out, "  ")?;
         write_styled(out, ID_STYLE, &entry.abbreviated_id)?;
+        if let Some(action) = entry.action {
+            write!(out, "  [{action}]")?;
+        }
         write!(out, "  ")?;
         write_styled(
             out,
@@ -524,6 +542,9 @@ fn write_target(out: &mut impl Write, target: &str, width: usize) -> io::Result<
 fn render_oneline(out: &mut impl Write, entries: &[Entry]) -> io::Result<()> {
     for entry in entries {
         write_styled(out, ID_STYLE, &entry.abbreviated_id)?;
+        if let Some(action) = entry.action {
+            write!(out, " [{action}]")?;
+        }
         writeln!(out, " {}", String::from_utf8_lossy(entry.summary()))?;
     }
     Ok(())
@@ -648,6 +669,7 @@ mod tests {
         Entry {
             id: id.to_owned(),
             abbreviated_id: abbreviated_id.to_owned(),
+            action: operation_action(message.as_bytes()),
             time: gix::date::Time {
                 seconds: 1_787_421_791,
                 offset: -4 * 3600,

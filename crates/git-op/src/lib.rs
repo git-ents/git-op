@@ -1204,7 +1204,7 @@ fn apply_action_with_trailer(
     apply_state(repo, &state)?;
     let message = match restored_operation {
         Some(restored) => format!(
-            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}\nUndone-operation: {trailer_target}\nRestored-operation: {restored}",
+            "op: {} {trailer_target}\n\nGit-op: {}:{trailer_target}\nundone-operation: {trailer_target}\nrestored-operation: {restored}",
             plan.action, plan.action
         ),
         None => format!(
@@ -1242,7 +1242,7 @@ fn operation_metadata(
     };
     for line in message.split(|byte| *byte == b'\n') {
         let Some(value) = line.strip_prefix(b"Git-op: ") else {
-            if let Some(value) = line.strip_prefix(b"Restored-operation: ") {
+            if let Some(value) = line.strip_prefix(b"restored-operation: ") {
                 metadata.restored = parse_operation_id(value)?;
             }
             continue;
@@ -1283,7 +1283,7 @@ fn next_undo_target(
         return Ok(None);
     };
     let undo = operation_metadata(repo, undo_id)?;
-    if undo.action != Some(OperationAction::Undo) || undo.target != Some(previous) {
+    if undo.action != Some(OperationAction::Undo) {
         return Ok(None);
     }
     let Some(previous_undo_id) = repo
@@ -1295,7 +1295,8 @@ fn next_undo_target(
     else {
         return Ok(None);
     };
-    Ok(operation_metadata(repo, previous_undo_id)?.target)
+    let target = operation_metadata(repo, previous_undo_id)?.target;
+    Ok(target.filter(|target| *target != previous))
 }
 
 /// Restore the state captured by an operation-log commit, retaining the old
