@@ -1107,7 +1107,7 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
         Some(OperationAction::Undo) => {
             let restored = metadata.restored.ok_or_else(|| {
                 Error::InvalidSnapshot(format!(
-                    "undo operation {tip} is missing Restored-operation"
+                    "undo operation {tip} is missing restored-operation"
                 ))
             })?;
             (

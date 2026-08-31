@@ -331,7 +331,7 @@ fn extract_entries(
         entries.push(Entry {
             id: id.to_string(),
             abbreviated_id: commit.id().shorten_or_id().to_string(),
-            action: operation_action(&commit.message_raw_sloppy()),
+            action: operation_action(commit.message_raw_sloppy()),
             time,
             is_head: entries.is_empty(),
             changed,
