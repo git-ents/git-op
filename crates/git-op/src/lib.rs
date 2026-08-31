@@ -147,6 +147,25 @@ pub enum Error {
     /// A snapshot contains a reference or metadata value that cannot be restored.
     #[error("invalid snapshot content: {0}")]
     InvalidSnapshot(String),
+    /// A snapshot ref targets an object that is missing from the object
+    /// database, so the restore cannot install refs onto it.
+    #[error("cannot restore: ref {ref_name} in snapshot targets missing object {oid}")]
+    PrunedObject {
+        /// The full name of the ref whose target is missing.
+        ref_name: String,
+        /// The object ID that no longer exists.
+        oid: ObjectId,
+    },
+    /// A snapshot branch targets an object that does not peel to a usable commit.
+    #[error(
+        "cannot restore: ref {ref_name} in snapshot targets {oid}, which does not peel to a commit with a tree"
+    )]
+    UnusableObject {
+        /// The full name of the ref whose target is unusable.
+        ref_name: String,
+        /// The object ID that cannot back a checkout.
+        oid: ObjectId,
+    },
 }
 
 impl Error {
@@ -1349,6 +1368,8 @@ fn apply_action_with_trailers(
     if current_entries.description != target_entries.description {
         changes.push(Changes::Description);
     }
+    let state = read(repo, plan.restored)?;
+    verify_snapshot_objects(repo, &state)?;
     if current_entries == target_entries {
         return Ok(ActionResult {
             operation,
@@ -1358,7 +1379,9 @@ fn apply_action_with_trailers(
             changed: false,
         });
     }
-    apply_state(repo, &read(repo, plan.restored)?)?;
+    let state = read(repo, plan.restored)?;
+    verify_snapshot_referents(repo, &state)?;
+    apply_state(repo, &state)?;
     let primary_target = primary_target.unwrap_or(plan.target);
     let mut message = format!(
         "op: {} {}\n\nGit-op: {}:{}",
@@ -1480,6 +1503,51 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
     Ok(oid)
 }
 
+/// Verify that every object targeted by a snapshot's refs still exists.
+///
+/// Ref targets captured in a snapshot are plain bytes that do not keep their
+/// objects reachable, so garbage collection can prune them after the snapshot
+/// was captured. Applying such a snapshot would move refs onto missing
+/// objects and leave the repository unusable.
+fn verify_snapshot_objects(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Error> {
+    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+    for (name, contents) in updates {
+        if let Target::Object(oid) = parse_ref_contents(&contents)? {
+            verify_object(repo, &name, oid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify one snapshot ref target can back the restored repository.
+fn verify_object(repo: &gix::Repository, ref_name: &str, oid: ObjectId) -> Result<(), Error> {
+    let Some(object) = repo.try_find_object(oid).map_err(Error::git)? else {
+        return Err(Error::PrunedObject {
+            ref_name: ref_name.to_owned(),
+            oid,
+        });
+    };
+    if !ref_name.starts_with("refs/heads/") {
+        return Ok(());
+    }
+    let commit =
+        object
+            .peel_to_kind(gix::objs::Kind::Commit)
+            .map_err(|_| Error::UnusableObject {
+                ref_name: ref_name.to_owned(),
+                oid,
+            })?;
+    commit
+        .peel_to_kind(gix::objs::Kind::Tree)
+        .map_err(|_| Error::UnusableObject {
+            ref_name: ref_name.to_owned(),
+            oid,
+        })?;
+    Ok(())
+}
+
 /// Apply a captured state to the repository's refs and metadata files.
 fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Error> {
     let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
@@ -1492,6 +1560,7 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
         .target()
         .into_owned();
     apply_ref_updates(repo, updates, captured)?;
+    verify_snapshot_objects(repo, state)?;
     set_head(repo, head)?;
     reset_worktree(repo)?;
     restore_metadata_file(
@@ -1996,6 +2065,65 @@ mod tests {
         );
     }
 
+    /// Verify that restoring a snapshot whose ref target has been pruned
+    /// aborts with an error and leaves the repository unmodified.
+    #[test]
+    fn restore_aborts_when_snapshot_ref_target_is_pruned() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let pruned = temporary
+            .repo
+            .head_id()
+            .expect("read pruned commit")
+            .detach();
+        let snapshot = append(&temporary.repo, "snapshot of pruned commit")
+            .expect("append snapshot of pruned commit");
+        git(&temporary, &["commit", "--amend", "-m", "one amended"]);
+        git(
+            &temporary,
+            &[
+                "reflog",
+                "expire",
+                "--expire=now",
+                "--expire-unreachable=now",
+                "--all",
+            ],
+        );
+        git(&temporary, &["gc", "--prune=now"]);
+
+        let status = Command::new("git")
+            .current_dir(&temporary.root)
+            .args(["cat-file", "-t", &pruned.to_string()])
+            .status()
+            .expect("check pruned object");
+        assert!(
+            !status.success(),
+            "object {pruned} survived garbage collection"
+        );
+
+        match restore_action(&temporary.repo, snapshot) {
+            Err(Error::PrunedObject { ref_name, oid }) => {
+                assert_eq!(ref_name, "refs/heads/main");
+                assert_eq!(oid, pruned);
+            }
+            result => panic!("expected PrunedObject, got {result:?}"),
+        }
+        let amended = temporary
+            .repo
+            .head_id()
+            .expect("read amended HEAD")
+            .detach()
+            .to_string();
+        assert_eq!(
+            git_output(&temporary, &["rev-parse", "refs/heads/main"]).trim(),
+            amended
+        );
+        git_output(&temporary, &["status"]);
+        git_output(&temporary, &["log", "--oneline", "-1"]);
+    }
+
     /// Verify that restoring a detached repository leaves `HEAD` detached at its current commit.
     #[test]
     fn restore_preserves_detached_head_commit() {
@@ -2184,6 +2312,102 @@ mod tests {
         let result = restore_action(&temporary.repo, current).expect("restore current");
         assert!(!result.changed);
         assert_eq!(result.operation, current);
+    }
+
+    /// Verify that a ref-level no-op restore leaves uncommitted index and
+    /// worktree changes untouched.
+    #[test]
+    fn restore_noop_preserves_uncommitted_changes() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let head = temporary.repo.head_id().expect("read HEAD").detach();
+        let snapshot = append(&temporary.repo, "snapshot").expect("append snapshot");
+
+        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
+        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
+        git(&temporary, &["add", "staged"]);
+        let dirty = git_output(&temporary, &["status", "--porcelain"]);
+        assert!(
+            !dirty.is_empty(),
+            "index and worktree should start desynced"
+        );
+
+        let result = restore_action(&temporary.repo, snapshot).expect("restore snapshot");
+        assert!(!result.changed);
+        assert_eq!(result.operation, snapshot);
+        assert_eq!(temporary.repo.head_id().expect("read HEAD"), head);
+        assert_eq!(
+            git_output(&temporary, &["status", "--porcelain"]),
+            dirty,
+            "uncommitted index and worktree changes must survive a no-op restore"
+        );
+    }
+
+    /// Verify that a no-op restore still reports snapshot refs that point at
+    /// missing objects instead of silently reporting success.
+    #[test]
+    fn restore_noop_reports_missing_snapshot_objects() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let missing = temporary.repo.head_id().expect("read commit").detach();
+        let snapshot = append(&temporary.repo, "snapshot").expect("append snapshot");
+        let hex = missing.to_string();
+        let loose = temporary
+            .repo
+            .git_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::remove_file(&loose).expect("remove loose commit object");
+
+        match restore_action(&temporary.repo, snapshot) {
+            Err(Error::PrunedObject { ref_name, oid }) => {
+                assert_eq!(ref_name, "refs/heads/main");
+                assert_eq!(oid, missing);
+            }
+            result => panic!("expected PrunedObject, got {result:?}"),
+        }
+    }
+
+    /// Verify that restoring a snapshot whose branch targets an existing
+    /// non-commit object is rejected before refs move.
+    #[test]
+    fn restore_aborts_when_snapshot_branch_targets_non_commit() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("blob"), b"blob\n").expect("write blob file");
+        let blob = git_output(&temporary, &["hash-object", "-w", "blob"])
+            .trim()
+            .to_owned();
+        // Git refuses to point a branch at a blob, so write the loose ref
+        // directly; a snapshot records ref targets as plain bytes either way.
+        std::fs::create_dir_all(temporary.repo.git_dir().join("refs/heads"))
+            .expect("create refs/heads");
+        std::fs::write(
+            temporary.repo.git_dir().join("refs/heads/broken"),
+            format!("{blob}\n"),
+        )
+        .expect("write loose ref");
+        let snapshot = append(&temporary.repo, "snapshot of blob branch")
+            .expect("append snapshot of blob branch");
+        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
+        let moved = temporary.repo.head_id().expect("read moved HEAD").detach();
+
+        match restore_action(&temporary.repo, snapshot) {
+            Err(Error::UnusableObject { ref_name, oid }) => {
+                assert_eq!(ref_name, "refs/heads/broken");
+                assert_eq!(oid.to_string(), blob);
+            }
+            result => panic!("expected UnusableObject, got {result:?}"),
+        }
+        assert_eq!(
+            temporary.repo.head_id().expect("read HEAD"),
+            moved,
+            "refs must not move when a branch target is unusable"
+        );
     }
 
     /// Verify that generated messages identify changed snapshot components.
