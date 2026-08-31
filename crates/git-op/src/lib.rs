@@ -57,6 +57,7 @@ enum OperationAction {
 struct OperationMetadata {
     action: Option<OperationAction>,
     target: Option<ObjectId>,
+    undone: Option<ObjectId>,
     restored: Option<ObjectId>,
 }
 
@@ -1238,11 +1239,14 @@ fn operation_metadata(
     let mut metadata = OperationMetadata {
         action: None,
         target: None,
+        undone: None,
         restored: None,
     };
     for line in message.split(|byte| *byte == b'\n') {
         let Some(value) = line.strip_prefix(b"Git-op: ") else {
-            if let Some(value) = line.strip_prefix(b"restored-operation: ") {
+            if let Some(value) = line.strip_prefix(b"undone-operation: ") {
+                metadata.undone = parse_operation_id(value)?;
+            } else if let Some(value) = line.strip_prefix(b"restored-operation: ") {
                 metadata.restored = parse_operation_id(value)?;
             }
             continue;
@@ -1283,7 +1287,7 @@ fn next_undo_target(
         return Ok(None);
     };
     let undo = operation_metadata(repo, undo_id)?;
-    if undo.action != Some(OperationAction::Undo) {
+    if undo.action != Some(OperationAction::Undo) || undo.undone != Some(previous) {
         return Ok(None);
     }
     let Some(previous_undo_id) = repo
