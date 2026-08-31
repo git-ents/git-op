@@ -39,7 +39,7 @@ const MAX_REF_LINES: usize = 10;
 struct Entry {
     id: String,
     abbreviated_id: String,
-    action: Option<&'static str>,
+    action: Option<git_op::Action>,
     time: gix::date::Time,
     /// Whether this is the most recent snapshot (`refs/op` itself), drawn
     /// with the `●` graph glyph. Set once at extraction time so it survives
@@ -56,17 +56,17 @@ struct Changed {
     /// Each changed ref, ordered by name.
     refs: Vec<RefLine>,
     /// The changed metadata files, in capture order.
-    files: Vec<&'static str>,
+    files: Vec<git_op::MetadataFile>,
 }
 
 impl Changed {
-    /// The names of the changed parts, in capture order.
-    fn names(&self) -> Vec<&'static str> {
+    /// The changed components, in capture order.
+    fn names(&self) -> Vec<git_op::Component> {
         let mut names = Vec::new();
         if !self.refs.is_empty() {
-            names.push("refs");
+            names.push(git_op::Component::Refs);
         }
-        names.extend(self.files.iter().copied());
+        names.extend(self.files.iter().copied().map(git_op::Component::File));
         names
     }
 }
@@ -343,16 +343,11 @@ fn extract_entries(
     Ok(entries)
 }
 
-fn operation_action(message: &[u8]) -> Option<&'static str> {
+fn operation_action(message: &[u8]) -> Option<git_op::Action> {
     message.split(|byte| *byte == b'\n').find_map(|line| {
         let value = line.strip_prefix(b"Git-op: ")?;
         let action = value.split(|byte| *byte == b':').next()?;
-        match action {
-            b"undo" => Some("undo"),
-            b"redo" => Some("redo"),
-            b"restore" => Some("restore"),
-            _ => None,
-        }
+        git_op::Action::try_from(action).ok()
     })
 }
 
@@ -714,7 +709,7 @@ mod tests {
                         ref_line("refs/heads/topic", Transition::Created(target("8087efa"))),
                         ref_line("refs/tags/v0.1.0", Transition::Deleted(target("047ae16"))),
                     ],
-                    files: vec!["config"],
+                    files: vec![git_op::MetadataFile::Config],
                 }),
                 "op: update refs and config\n",
             ),
@@ -779,7 +774,7 @@ mod tests {
                         new: target("dc80af7"),
                     },
                 )],
-                files: vec!["config"],
+                files: vec![git_op::MetadataFile::Config],
             }),
             "op: update refs\n\nInvoked-by: git commit\n",
         )];
@@ -866,7 +861,7 @@ mod tests {
                         new: target("dc80af7"),
                     },
                 )],
-                files: vec!["config"],
+                files: vec![git_op::MetadataFile::Config],
             }),
             "op: update refs and config\n\nlonger body ignored",
         )];
@@ -899,7 +894,7 @@ mod tests {
                             }),
                         ),
                     ],
-                    files: vec!["config"],
+                    files: vec![git_op::MetadataFile::Config],
                 }),
                 "op: update refs and config\n",
             ),

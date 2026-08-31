@@ -2,6 +2,8 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 
+use git_op::ReferenceTransactionPhase;
+
 use crate::cli::Command;
 
 /// Execute the selected command-line operation.
@@ -61,12 +63,13 @@ pub(crate) fn open_repository() -> Result<gix::Repository, gix::discover::Error>
 /// repository, before there is anything to discover; that is treated as a
 /// clean no-op rather than an error.
 fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let phase = ReferenceTransactionPhase::try_from(phase)?;
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let Ok(repo) = open_repository() else {
         return Ok(());
     };
-    if phase == "committed" {
+    if phase == ReferenceTransactionPhase::Committed {
         ensure_clean(&repo)?;
     }
     git_op::reference_transaction(&repo, phase, &input)?;

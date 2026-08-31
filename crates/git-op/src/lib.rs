@@ -3,7 +3,7 @@
 //! Snapshots are committed to [`OP_REF`]. The operation ref, remote refs, and
 //! pseudo references such as `HEAD` are excluded from snapshots.
 
-use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, fmt, fs, path::PathBuf, process::Command};
 
 use facet::Facet;
 use facet_git_tree::{RawBlob, RawTree};
@@ -46,16 +46,60 @@ pub struct AppendOptions {
     pub committer: Option<gix::actor::Signature>,
 }
 
+/// The operation recorded in a `Git-op` commit-message trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OperationAction {
+pub enum Action {
+    /// Reapply the state before the latest logical operation.
     Undo,
+    /// Reapply the next logical operation after an undo.
     Redo,
+    /// Restore one selected snapshot.
     Restore,
+}
+
+impl Action {
+    /// The trailer keyword for this action.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for Action {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_bytes())
+    }
+}
+
+impl TryFrom<&[u8]> for Action {
+    type Error = Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        match value {
+            b"undo" => Ok(Self::Undo),
+            b"redo" => Ok(Self::Redo),
+            b"restore" => Ok(Self::Restore),
+            _ => Err(Error::UnknownAction(
+                String::from_utf8_lossy(value).into_owned(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OperationMetadata {
-    actions: Vec<(OperationAction, ObjectId)>,
+    actions: Vec<(Action, ObjectId)>,
 }
 
 /// Errors produced while capturing, storing, or installing repository state.
@@ -82,6 +126,9 @@ pub enum Error {
     /// A reference-transaction hook received an unsupported phase.
     #[error("unsupported reference-transaction phase {0}")]
     InvalidPhase(String),
+    /// A `Git-op` trailer keyword was not `undo`, `redo`, or `restore`.
+    #[error("unknown operation action {0}")]
+    UnknownAction(String),
     /// The operation ref is not a direct reference to a commit.
     #[error("{OP_REF} must directly reference a commit")]
     InvalidOperationRef,
@@ -274,8 +321,11 @@ impl RefNode {
 /// assert_eq!(description.data, b"raw bytes\\xff\\n");
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
-fn read_repository_file(repo: &gix::Repository, name: &str) -> Result<Option<Vec<u8>>, Error> {
-    let path = repo.common_dir().join(name);
+fn read_repository_file(
+    repo: &gix::Repository,
+    file: MetadataFile,
+) -> Result<Option<Vec<u8>>, Error> {
+    let path = repo.common_dir().join(file.as_str());
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -354,8 +404,8 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
     }
 
     let ref_tree = write_ref_tree(repo, &ref_values)?;
-    let config = read_repository_file(repo, "config")?;
-    let description = read_repository_file(repo, "description")?;
+    let config = read_repository_file(repo, MetadataFile::Config)?;
+    let description = read_repository_file(repo, MetadataFile::Description)?;
     let config_oid = config
         .as_deref()
         .map(|bytes| repo.write_buf(Kind::Blob, bytes))
@@ -689,6 +739,56 @@ pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState,
     facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
 }
 
+/// A repository metadata file captured in snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataFile {
+    /// The repository's `config` file.
+    Config,
+    /// The repository's `description` file.
+    Description,
+}
+
+impl MetadataFile {
+    /// The file's name in the repository's common directory.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Description => "description",
+        }
+    }
+}
+
+impl fmt::Display for MetadataFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A component of the captured repository state, named by [`Changes::names`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Component {
+    /// The captured refs tree.
+    Refs,
+    /// A captured metadata file.
+    File(MetadataFile),
+}
+
+impl Component {
+    /// The component's name in log output and JSON.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refs => "refs",
+            Self::File(file) => file.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for Component {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The parts of the captured state that a snapshot changed relative to its parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Changes {
@@ -701,25 +801,25 @@ pub enum Changes {
 }
 
 impl Changes {
-    /// The names of the changed parts, in capture order.
-    pub fn names(changes: &[Self]) -> Vec<&'static str> {
+    /// The changed components, in capture order.
+    pub fn names(changes: &[Self]) -> Vec<Component> {
         changes
             .iter()
             .map(|change| match change {
-                Self::Refs(_) => "refs",
-                Self::Config => "config",
-                Self::Description => "description",
+                Self::Refs(_) => Component::Refs,
+                Self::Config => Component::File(MetadataFile::Config),
+                Self::Description => Component::File(MetadataFile::Description),
             })
             .collect()
     }
 
-    /// The names of the changed metadata files, in capture order.
-    pub fn file_names(changes: &[Self]) -> Vec<&'static str> {
+    /// The changed metadata files, in capture order.
+    pub fn file_names(changes: &[Self]) -> Vec<MetadataFile> {
         changes
             .iter()
             .filter_map(|change| match change {
-                Self::Config => Some("config"),
-                Self::Description => Some("description"),
+                Self::Config => Some(MetadataFile::Config),
+                Self::Description => Some(MetadataFile::Description),
                 Self::Refs(_) => None,
             })
             .collect()
@@ -865,7 +965,10 @@ impl SnapshotEntries {
 /// let changed = git_op::changes(&repo, update)
 ///     .expect("compute changes")
 ///     .expect("updated snapshot has a parent");
-/// assert_eq!(git_op::Changes::names(&changed), vec!["description"]);
+/// assert_eq!(
+///     git_op::Changes::names(&changed),
+///     vec![git_op::Component::File(git_op::MetadataFile::Description)]
+/// );
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn changes(repo: &gix::Repository, commit: ObjectId) -> Result<Option<Vec<Changes>>, Error> {
@@ -1069,14 +1172,20 @@ fn read_ref_target(repo: &gix::Repository, blob: ObjectId) -> Result<Target, Err
 }
 
 /// Compose the summary line for a generated snapshot commit, or `None` when
-/// `changed` has no changed parts.
+/// `changed` has no changed components.
 fn snapshot_message(changed: &[Changes]) -> Option<String> {
     let names = Changes::names(changed);
     let summary = match names.as_slice() {
         [] => return None,
-        [one] => (*one).to_owned(),
+        [one] => one.to_string(),
         [first, second] => format!("{first} and {second}"),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [rest @ .., last] => format!(
+            "{}, and {last}",
+            rest.iter()
+                .map(|part| part.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     };
     Some(format!("op: update {summary}"))
 }
@@ -1099,8 +1208,8 @@ pub struct ActionResult {
 /// A state transition that can be displayed without applying it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionPlan {
-    /// The action name used by the operation trailer.
-    pub action: &'static str,
+    /// The action recorded in the operation trailer.
+    pub action: Action,
     /// The operation identified by the transition.
     pub target: ObjectId,
     /// The snapshot that would become the repository state.
@@ -1117,7 +1226,7 @@ pub fn restore_action(repo: &gix::Repository, commit: ObjectId) -> Result<Action
     apply_action(
         repo,
         ActionPlan {
-            action: "restore",
+            action: Action::Restore,
             target: commit,
             restored: commit,
         },
@@ -1135,28 +1244,26 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     let metadata = operation_metadata(repo, tip)?;
     let action = metadata.actions.first().map(|(action, _)| *action);
     let (target, restored) = match action {
-        None | Some(OperationAction::Restore) => (
+        None | Some(Action::Restore) => (
             tip,
             parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
         ),
-        Some(OperationAction::Undo) => {
+        Some(Action::Undo) => {
             let restored = metadata
                 .actions
                 .iter()
-                .find_map(|(action, target)| {
-                    (*action == OperationAction::Restore).then_some(*target)
-                })
+                .find_map(|(action, target)| (*action == Action::Restore).then_some(*target))
                 .ok_or_else(|| missing_trailer(tip, "Git-op: restore"))?;
             (
                 restored,
                 parent_snapshot(repo, restored)?.ok_or(Error::NothingToUndo)?,
             )
         }
-        Some(OperationAction::Redo) => {
+        Some(Action::Redo) => {
             let target = metadata
                 .actions
                 .iter()
-                .find_map(|(action, target)| (*action == OperationAction::Redo).then_some(*target))
+                .find_map(|(action, target)| (*action == Action::Redo).then_some(*target))
                 .ok_or_else(|| missing_trailer(tip, "Git-op: redo"))?;
             (
                 target,
@@ -1165,7 +1272,7 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
         }
     };
     Ok(ActionPlan {
-        action: "undo",
+        action: Action::Undo,
         target,
         restored,
     })
@@ -1176,12 +1283,11 @@ pub fn undo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
     let operation = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
     let metadata = operation_metadata(repo, operation)?;
     let plan = plan_undo(repo)?;
-    let target =
-        if metadata.actions.first().map(|(action, _)| *action) == Some(OperationAction::Restore) {
-            operation
-        } else {
-            plan.target
-        };
+    let target = if metadata.actions.first().map(|(action, _)| *action) == Some(Action::Restore) {
+        operation
+    } else {
+        plan.target
+    };
     apply_action_with_trailers(repo, plan, Some(target), Some(plan.restored))
 }
 
@@ -1190,13 +1296,13 @@ pub fn plan_redo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     let tip = current_operation(repo)?.ok_or(Error::NothingToRedo)?;
     let metadata = operation_metadata(repo, tip)?;
     let target = match metadata.actions.first() {
-        Some((OperationAction::Undo, target)) => Some(*target),
-        Some((OperationAction::Redo, target)) => next_redo_target(repo, tip, *target)?,
+        Some((Action::Undo, target)) => Some(*target),
+        Some((Action::Redo, target)) => next_redo_target(repo, tip, *target)?,
         _ => None,
     }
     .ok_or(Error::NothingToRedo)?;
     Ok(ActionPlan {
-        action: "redo",
+        action: Action::Redo,
         target,
         restored: target,
     })
@@ -1208,7 +1314,7 @@ pub fn redo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
 }
 
 fn apply_action(repo: &gix::Repository, plan: ActionPlan) -> Result<ActionResult, Error> {
-    let restored = (plan.action == "redo").then_some(plan.restored);
+    let restored = matches!(plan.action, Action::Redo).then_some(plan.restored);
     apply_action_with_trailers(repo, plan, None, restored)
 }
 
@@ -1293,11 +1399,8 @@ fn operation_metadata(
             continue;
         };
         let (action, value) = value.split_at(separator);
-        let action = match action {
-            b"undo" => OperationAction::Undo,
-            b"redo" => OperationAction::Redo,
-            b"restore" => OperationAction::Restore,
-            _ => continue,
+        let Ok(action) = Action::try_from(action) else {
+            continue;
         };
         if let Some(target) = parse_operation_id(&value[1..])? {
             actions.push((action, target));
@@ -1326,7 +1429,7 @@ fn next_redo_target(
         return Ok(None);
     };
     let metadata = operation_metadata(repo, parent)?;
-    if !metadata.actions.contains(&(OperationAction::Undo, undone)) {
+    if !metadata.actions.contains(&(Action::Undo, undone)) {
         return Ok(None);
     }
     let Some(previous_undo) = parent_snapshot(repo, parent)? else {
@@ -1335,7 +1438,7 @@ fn next_redo_target(
     Ok(operation_metadata(repo, previous_undo)?
         .actions
         .iter()
-        .find_map(|(action, target)| (*action == OperationAction::Undo).then_some(*target)))
+        .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)))
 }
 
 /// Resolve an operation commit specification using Git's revision parser.
@@ -1386,10 +1489,14 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
     apply_ref_updates(repo, updates, captured)?;
     set_head(repo, head)?;
     reset_worktree(repo)?;
-    restore_metadata_file(repo, "config", state.config.map(|blob| blob.oid()))?;
     restore_metadata_file(
         repo,
-        "description",
+        MetadataFile::Config,
+        state.config.map(|blob| blob.oid()),
+    )?;
+    restore_metadata_file(
+        repo,
+        MetadataFile::Description,
         state.description.map(|blob| blob.oid()),
     )?;
     Ok(())
@@ -1562,10 +1669,10 @@ fn parse_ref_contents(contents: &[u8]) -> Result<Target, Error> {
 /// Restore or remove one repository metadata file from a snapshot blob.
 fn restore_metadata_file(
     repo: &gix::Repository,
-    name: &str,
+    file: MetadataFile,
     blob: Option<ObjectId>,
 ) -> Result<(), Error> {
-    let path = repo.common_dir().join(name);
+    let path = repo.common_dir().join(file.as_str());
     match blob {
         Some(blob) => {
             let data = repo.find_blob(blob).map_err(Error::git)?.data.to_vec();
@@ -1578,6 +1685,51 @@ fn restore_metadata_file(
         },
     }
     Ok(())
+}
+
+/// The phase Git reports when invoking a `reference-transaction` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceTransactionPhase {
+    /// The transaction is being prepared.
+    Preparing,
+    /// The transaction is prepared and about to be committed.
+    Prepared,
+    /// The transaction committed.
+    Committed,
+    /// The transaction was aborted.
+    Aborted,
+}
+
+impl ReferenceTransactionPhase {
+    /// The keyword Git passes to the hook for this phase.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Prepared => "prepared",
+            Self::Committed => "committed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+impl fmt::Display for ReferenceTransactionPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for ReferenceTransactionPhase {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "prepared" => Ok(Self::Prepared),
+            "committed" => Ok(Self::Committed),
+            "aborted" => Ok(Self::Aborted),
+            _ => Err(Error::InvalidPhase(value.to_owned())),
+        }
+    }
 }
 
 /// Process one `reference-transaction` hook invocation.
@@ -1609,8 +1761,12 @@ fn restore_metadata_file(
 /// ));
 /// std::fs::create_dir(&root).expect("create temporary repository directory");
 /// let repo = gix::init(&root).expect("initialize repository");
-/// git_op::reference_transaction(&repo, "prepared", b"transaction input\\n")
-///     .expect("process prepared transaction");
+/// git_op::reference_transaction(
+///     &repo,
+///     git_op::ReferenceTransactionPhase::Prepared,
+///     b"transaction input\\n",
+/// )
+/// .expect("process prepared transaction");
 /// assert!(repo
 ///     .try_find_reference(git_op::OP_REF)
 ///     .expect("look up operation ref")
@@ -1619,18 +1775,19 @@ fn restore_metadata_file(
 /// ```
 pub fn reference_transaction(
     repo: &gix::Repository,
-    phase: &str,
+    phase: ReferenceTransactionPhase,
     input: &[u8],
 ) -> Result<(), Error> {
     match phase {
-        "preparing" | "prepared" | "aborted" => Ok(()),
-        "committed" => {
+        ReferenceTransactionPhase::Preparing
+        | ReferenceTransactionPhase::Prepared
+        | ReferenceTransactionPhase::Aborted => Ok(()),
+        ReferenceTransactionPhase::Committed => {
             if transaction_changes_captured_refs(input)? {
                 append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
             }
             Ok(())
         }
-        phase => Err(Error::InvalidPhase(phase.to_owned())),
     }
 }
 
@@ -2321,7 +2478,11 @@ mod tests {
     fn hook_accepts_non_committed_phases() {
         let temporary = TemporaryRepository::new();
         let input = b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n";
-        for phase in ["preparing", "prepared", "aborted"] {
+        for phase in [
+            ReferenceTransactionPhase::Preparing,
+            ReferenceTransactionPhase::Prepared,
+            ReferenceTransactionPhase::Aborted,
+        ] {
             reference_transaction(&temporary.repo, phase, input).expect("process hook phase");
         }
         assert!(
@@ -2337,7 +2498,7 @@ mod tests {
     #[test]
     fn hook_accepts_empty_committed_transaction() {
         let temporary = TemporaryRepository::new();
-        reference_transaction(&temporary.repo, "committed", b"")
+        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, b"")
             .expect("process empty transaction");
         assert!(
             temporary
