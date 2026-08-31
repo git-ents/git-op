@@ -1558,9 +1558,14 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
         .target()
         .into_owned();
     apply_ref_updates(repo, updates, captured)?;
-    verify_snapshot_objects(repo, state)?;
     set_head(repo, head)?;
     reset_worktree(repo)?;
+    // Metadata is restored only after the ref transaction and the worktree
+    // reset: `reset_worktree` shells out to `git read-tree`, which reads the
+    // repository's config, so a snapshot config must not become active while
+    // the index and worktree are being rewritten. A snapshot's `core.worktree`
+    // or repository-format settings could otherwise redirect or break the
+    // destructive checkout after refs have already moved.
     restore_metadata_file(
         repo,
         MetadataFile::Config,
