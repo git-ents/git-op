@@ -11,3 +11,6 @@
 [branch "main"]
 	remote = origin
 	merge = refs/heads/main
+[branch "agent/refactor/stringly-typed"]
+	remote = origin
+	merge = refs/heads/agent/refactor/stringly-typed
