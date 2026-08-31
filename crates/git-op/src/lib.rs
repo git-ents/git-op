@@ -566,28 +566,45 @@ pub fn append_with_options(
     message: &str,
     options: AppendOptions,
 ) -> Result<ObjectId, Error> {
-    append_internal(repo, CommitMessage::Explicit(message), options)
+    append_internal(repo, CommitMessage::Explicit(message), options).map(|(operation, _)| operation)
+}
+
+/// The outcome of [`snap`]: the operation-log tip and who put it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapResult {
+    /// The operation-log commit that reflects the repository state after the
+    /// call: the newly appended snapshot, or the existing tip for a no-op.
+    pub operation: ObjectId,
+    /// Whether this call appended the snapshot, as opposed to finding the
+    /// log already current.
+    pub appended: bool,
+}
+
+/// Record repository state that is not yet on the operation log onto
+/// [`OP_REF`], with a generated commit message summarizing the changes.
+///
+/// A no-op when the operation log already reflects the repository state. The
+/// returned [`SnapResult`] reports whether this call appended anything, so
+/// callers never have to infer it from the ref value.
+pub fn snap(repo: &gix::Repository) -> Result<SnapResult, Error> {
+    let (operation, appended) =
+        append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
+    Ok(SnapResult {
+        operation,
+        appended,
+    })
 }
 
 fn append_internal(
     repo: &gix::Repository,
     requested_message: CommitMessage<'_>,
     options: AppendOptions,
-) -> Result<ObjectId, Error> {
+) -> Result<(ObjectId, bool), Error> {
     let refs = GixRefStore::new(repo);
     let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
-    let signing = commit_signing_enabled(repo)?;
     let invoked_by = matches!(requested_message, CommitMessage::Generated)
         .then(invocation::detect)
         .flatten();
-    let author = match options.author {
-        Some(author) => author,
-        None => refs.author().map_err(Error::git)?,
-    };
-    let committer = match options.committer {
-        Some(committer) => committer,
-        None => refs.signature().map_err(Error::git)?,
-    };
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let parent = operation_target(repo, &name)?;
@@ -599,10 +616,22 @@ fn append_internal(
                 let changed =
                     SnapshotEntries::from_state(&state).diff(&SnapshotEntries::read(repo, parent)?);
                 let Some(message) = snapshot_message(&changed) else {
-                    return Ok(parent);
+                    return Ok((parent, false));
                 };
                 message
             }
+        };
+        // Signing and identity are write-only prerequisites: resolve them
+        // only now that a commit will actually be written, so a no-op snap
+        // does not require configured commit identity.
+        let signing = commit_signing_enabled(repo)?;
+        let author = match options.author.clone() {
+            Some(author) => author,
+            None => refs.author().map_err(Error::git)?,
+        };
+        let committer = match options.committer.clone() {
+            Some(committer) => committer,
+            None => refs.signature().map_err(Error::git)?,
         };
         let tree = serialize(repo, &state)?;
         let commit_id = write_commit(
@@ -627,7 +656,7 @@ fn append_internal(
             },
         };
         match refs.apply(edit) {
-            Ok(()) => return Ok(commit_id),
+            Ok(()) => return Ok((commit_id, true)),
             Err(ApplyError::LostRace { .. }) => continue,
             Err(ApplyError::Backend(error)) => return Err(Error::git(error)),
         }
@@ -2376,11 +2405,95 @@ mod tests {
         }
     }
 
+    /// Verify that restoring a snapshot whose branch targets an existing
+    /// non-commit object is rejected before refs move.
+    #[test]
+    fn restore_aborts_when_snapshot_branch_targets_non_commit() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("blob"), b"blob\n").expect("write blob file");
+        let blob = git_output(&temporary, &["hash-object", "-w", "blob"])
+            .trim()
+            .to_owned();
+        // Git refuses to point a branch at a blob, so write the loose ref
+        // directly; a snapshot records ref targets as plain bytes either way.
+        std::fs::create_dir_all(temporary.repo.git_dir().join("refs/heads"))
+            .expect("create refs/heads");
+        std::fs::write(
+            temporary.repo.git_dir().join("refs/heads/broken"),
+            format!("{blob}\n"),
+        )
+        .expect("write loose ref");
+        let snapshot = append(&temporary.repo, "snapshot of blob branch")
+            .expect("append snapshot of blob branch");
+        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
+        let moved = temporary.repo.head_id().expect("read moved HEAD").detach();
+
+        match restore_action(&temporary.repo, snapshot) {
+            Err(Error::UnusableReferent { ref_name, oid }) => {
+                assert_eq!(ref_name, "refs/heads/broken");
+                assert_eq!(oid.to_string(), blob);
+            }
+            result => panic!("expected UnusableReferent, got {result:?}"),
+        }
+        assert_eq!(
+            temporary.repo.head_id().expect("read HEAD"),
+            moved,
+            "refs must not move when a branch target is unusable"
+        );
+    }
+
+    /// Verify that a no-op snap does not resolve write-only commit
+    /// prerequisites such as signing configuration or commit identity.
+    #[test]
+    fn snap_noop_does_not_resolve_commit_prerequisites() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["config", "--unset", "user.name"]);
+        git(&temporary, &["config", "--unset", "user.email"]);
+        // An invalid boolean makes commit_signing_enabled fail regardless of
+        // any globally configured identity.
+        git(&temporary, &["config", "commit.gpgSign", "maybe"]);
+
+        // Publish the parent snapshot directly with explicit signatures so
+        // its creation does not depend on the broken prerequisites that the
+        // captured state itself contains.
+        let state = capture(&temporary.repo).expect("capture state");
+        let tree = serialize(&temporary.repo, &state).expect("serialize state");
+        let signature = gix::actor::Signature {
+            name: "git-op test".into(),
+            email: "git-op@test".into(),
+            time: gix::date::Time {
+                seconds: 1_700_000_000,
+                offset: 0,
+            },
+        };
+        let parent = write_commit(
+            &temporary.repo,
+            tree,
+            None,
+            "op: capture initial repository state",
+            None,
+            &signature,
+            &signature,
+            false,
+        )
+        .expect("write parent snapshot");
+        GixRefStore::new(&temporary.repo)
+            .apply(RefEdit::Create {
+                name: RefName::new(OP_REF).expect("valid OP_REF"),
+                new: parent,
+            })
+            .expect("publish parent snapshot");
+
+        let snapped = snap(&temporary.repo).expect("snap on a current repository");
+        assert!(!snapped.appended);
+        assert_eq!(snapped.operation, parent);
+    }
+
     /// Verify that generated messages identify changed snapshot components.
     #[test]
     fn generated_snapshot_message_identifies_changes() {
         let temporary = TemporaryRepository::new();
-        let initial = append_internal(
+        let (initial, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2411,7 +2524,7 @@ mod tests {
             .success()
             .then_some(())
             .expect("update example ref succeeds");
-        let update = append_internal(
+        let (update, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2434,7 +2547,7 @@ mod tests {
     #[test]
     fn generated_snapshot_message_reports_single_change() {
         let temporary = TemporaryRepository::new();
-        let initial = append_internal(
+        let (initial, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2448,7 +2561,7 @@ mod tests {
             .success()
             .then_some(())
             .expect("update example ref succeeds");
-        let update = append_internal(
+        let (update, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2471,7 +2584,7 @@ mod tests {
     #[test]
     fn generated_snapshot_message_reports_three_changes() {
         let temporary = TemporaryRepository::new();
-        let initial = append_internal(
+        let (initial, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2494,7 +2607,7 @@ mod tests {
             b"example\n",
         )
         .expect("write description");
-        let update = append_internal(
+        let (update, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2518,13 +2631,13 @@ mod tests {
     #[test]
     fn generated_append_is_noop_when_nothing_changed() {
         let temporary = TemporaryRepository::new();
-        let initial = append_internal(
+        let (initial, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
         )
         .expect("append initial snapshot");
-        let repeat = append_internal(
+        let (repeat, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2542,12 +2655,62 @@ mod tests {
         );
     }
 
+    /// Verify that `snap` on an up-to-date repository returns the current tip
+    /// and leaves the operation ref untouched.
+    #[test]
+    fn snap_is_noop_when_log_is_current() {
+        let temporary = TemporaryRepository::new();
+        let initial = snap(&temporary.repo).expect("append initial snapshot");
+        assert!(initial.appended, "first snap appends the initial snapshot");
+        let snapped = snap(&temporary.repo).expect("snap up-to-date repository");
+        assert!(!snapped.appended, "second snap finds the log current");
+        assert_eq!(snapped.operation, initial.operation);
+        assert_eq!(
+            temporary
+                .repo
+                .find_reference(OP_REF)
+                .expect("read operation ref")
+                .target()
+                .try_id(),
+            Some(initial.operation.as_ref())
+        );
+    }
+
+    /// Verify that `snap` records drift, such as a direct edit to the
+    /// repository description that no reference transaction observed.
+    #[test]
+    fn snap_records_metadata_drift() {
+        let temporary = TemporaryRepository::new();
+        let initial = snap(&temporary.repo)
+            .expect("append initial snapshot")
+            .operation;
+        fs::write(
+            temporary.repo.common_dir().join("description"),
+            b"drifted description\n",
+        )
+        .expect("write description");
+        let snapped = snap(&temporary.repo)
+            .expect("snap drifted repository")
+            .operation;
+        assert_ne!(snapped, initial);
+        let changed = changes(&temporary.repo, snapped)
+            .expect("compute changes")
+            .expect("snapped snapshot has a parent");
+        assert!(matches!(changed.as_slice(), [Changes::Description]));
+        let state = read(&temporary.repo, snapped).expect("read snapped state");
+        let description = temporary
+            .repo
+            .find_blob(state.description.expect("description was captured").oid())
+            .expect("read description blob");
+        assert_eq!(description.data, b"drifted description\n");
+    }
+
     /// Verify that `changes` reports `None` for the initial snapshot and the
     /// correct parts changed for a later one.
     #[test]
     fn changes_reports_parts_changed_since_parent() {
         let temporary = TemporaryRepository::new();
-        let initial = append_internal(
+        let (initial, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),
@@ -2571,7 +2734,7 @@ mod tests {
             b"example\n",
         )
         .expect("write description");
-        let update = append_internal(
+        let (update, _) = append_internal(
             &temporary.repo,
             CommitMessage::Generated,
             AppendOptions::default(),

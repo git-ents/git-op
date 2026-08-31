@@ -30,6 +30,8 @@ pub(crate) enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Record the current repository state onto the operation log.
+    Snap,
     /// Show the recorded operation-log snapshots, most recent first.
     Log {
         /// Limit output to the first N snapshots.
@@ -75,9 +77,23 @@ pub(crate) enum Command {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, Command};
+
+    /// Verify that `snap` takes no arguments and is listed as a visible command.
+    #[test]
+    fn snap_parses_without_arguments_and_is_listed() {
+        let cli = Cli::try_parse_from(["git-op", "snap"]).expect("parse snap");
+        assert!(matches!(cli.command, Command::Snap));
+        assert!(Cli::try_parse_from(["git-op", "snap", "extra"]).is_err());
+        assert!(
+            Cli::command()
+                .get_subcommands()
+                .any(|command| command.get_name() == "snap" && !command.is_hide_set()),
+            "snap should be a visible subcommand"
+        );
+    }
 
     #[test]
     fn undo_is_zero_argument_and_accepts_dry_run() {
