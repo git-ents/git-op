@@ -53,12 +53,9 @@ enum OperationAction {
     Restore,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OperationMetadata {
-    action: Option<OperationAction>,
-    target: Option<ObjectId>,
-    undone: Option<ObjectId>,
-    restored: Option<ObjectId>,
+    actions: Vec<(OperationAction, ObjectId)>,
 }
 
 /// Errors produced while capturing, storing, or installing repository state.
@@ -100,9 +97,6 @@ pub enum Error {
     /// No operation was undone and can be redone.
     #[error("nothing to redo")]
     NothingToRedo,
-    /// The high-level undo command does not select an operation.
-    #[error("undo does not take an operation")]
-    UndoTakesNoOperation,
     /// A snapshot contains a reference or metadata value that cannot be restored.
     #[error("invalid snapshot content: {0}")]
     InvalidSnapshot(String),
@@ -1102,15 +1096,20 @@ pub fn undo(repo: &gix::Repository) -> Result<ObjectId, Error> {
 pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     let tip = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
     let metadata = operation_metadata(repo, tip)?;
-    let (target, restored) = match metadata.action {
+    let action = metadata.actions.first().map(|(action, _)| *action);
+    let (target, restored) = match action {
         None | Some(OperationAction::Restore) => (
             tip,
             parent_snapshot(repo, tip)?.ok_or(Error::NothingToUndo)?,
         ),
         Some(OperationAction::Undo) => {
             let restored = metadata
-                .restored
-                .ok_or_else(|| missing_trailer(tip, "restored-operation"))?;
+                .actions
+                .iter()
+                .find_map(|(action, target)| {
+                    (*action == OperationAction::Restore).then_some(*target)
+                })
+                .ok_or_else(|| missing_trailer(tip, "Git-op: restore"))?;
             (
                 restored,
                 parent_snapshot(repo, restored)?.ok_or(Error::NothingToUndo)?,
@@ -1118,8 +1117,10 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
         }
         Some(OperationAction::Redo) => {
             let target = metadata
-                .target
-                .ok_or_else(|| missing_trailer(tip, "Git-op"))?;
+                .actions
+                .iter()
+                .find_map(|(action, target)| (*action == OperationAction::Redo).then_some(*target))
+                .ok_or_else(|| missing_trailer(tip, "Git-op: redo"))?;
             (
                 target,
                 parent_snapshot(repo, target)?.ok_or(Error::NothingToUndo)?,
@@ -1135,23 +1136,26 @@ pub fn plan_undo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
 
 /// Apply the next undo transition and append its operation trailer.
 pub fn undo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
+    let operation = current_operation(repo)?.ok_or(Error::NothingToUndo)?;
+    let metadata = operation_metadata(repo, operation)?;
     let plan = plan_undo(repo)?;
-    apply_action_with_trailers(repo, plan, Some(plan.target), Some(plan.restored))
+    let target =
+        if metadata.actions.first().map(|(action, _)| *action) == Some(OperationAction::Restore) {
+            operation
+        } else {
+            plan.target
+        };
+    apply_action_with_trailers(repo, plan, Some(target), Some(plan.restored))
 }
 
 /// Select the next redo transition without changing the repository.
 pub fn plan_redo(repo: &gix::Repository) -> Result<ActionPlan, Error> {
     let tip = current_operation(repo)?.ok_or(Error::NothingToRedo)?;
     let metadata = operation_metadata(repo, tip)?;
-    let target = match metadata.action {
-        Some(OperationAction::Undo) => metadata.target,
-        Some(OperationAction::Redo) => {
-            let target = metadata
-                .target
-                .ok_or_else(|| missing_trailer(tip, "Git-op"))?;
-            next_redo_target(repo, tip, target)?
-        }
-        None | Some(OperationAction::Restore) => None,
+    let target = match metadata.actions.first() {
+        Some((OperationAction::Undo, target)) => Some(*target),
+        Some((OperationAction::Redo, target)) => next_redo_target(repo, tip, *target)?,
+        _ => None,
     }
     .ok_or(Error::NothingToRedo)?;
     Ok(ActionPlan {
@@ -1167,13 +1171,14 @@ pub fn redo_action(repo: &gix::Repository) -> Result<ActionResult, Error> {
 }
 
 fn apply_action(repo: &gix::Repository, plan: ActionPlan) -> Result<ActionResult, Error> {
-    apply_action_with_trailers(repo, plan, None, None)
+    let restored = (plan.action == "redo").then_some(plan.restored);
+    apply_action_with_trailers(repo, plan, None, restored)
 }
 
 fn apply_action_with_trailers(
     repo: &gix::Repository,
     plan: ActionPlan,
-    undone: Option<ObjectId>,
+    primary_target: Option<ObjectId>,
     restored: Option<ObjectId>,
 ) -> Result<ActionResult, Error> {
     let target_entries = SnapshotEntries::read(repo, plan.restored)?;
@@ -1190,15 +1195,13 @@ fn apply_action_with_trailers(
         });
     }
     apply_state(repo, &read(repo, plan.restored)?)?;
+    let primary_target = primary_target.unwrap_or(plan.target);
     let mut message = format!(
         "op: {} {}\n\nGit-op: {}:{}",
-        plan.action, plan.target, plan.action, plan.target
+        plan.action, primary_target, plan.action, primary_target
     );
-    if let Some(undone) = undone {
-        message.push_str(&format!("\nundone-operation: {undone}"));
-    }
     if let Some(restored) = restored {
-        message.push_str(&format!("\nrestored-operation: {restored}"));
+        message.push_str(&format!("\nGit-op: restore:{restored}"));
     }
     let operation = append(repo, &message)?;
     Ok(ActionResult {
@@ -1227,32 +1230,26 @@ fn operation_metadata(
         .map_err(Error::git)?
         .message_raw_sloppy()
         .to_vec();
-    let mut metadata = OperationMetadata {
-        action: None,
-        target: None,
-        undone: None,
-        restored: None,
-    };
+    let mut actions = Vec::new();
     for line in message.split(|byte| *byte == b'\n') {
-        if let Some(value) = line.strip_prefix(b"undone-operation: ") {
-            metadata.undone = parse_operation_id(value)?;
-        } else if let Some(value) = line.strip_prefix(b"restored-operation: ") {
-            metadata.restored = parse_operation_id(value)?;
-        } else if let Some(value) = line.strip_prefix(b"Git-op: ") {
-            let Some(separator) = value.iter().position(|byte| *byte == b':') else {
-                continue;
-            };
-            let (action, value) = value.split_at(separator);
-            metadata.action = match action {
-                b"undo" => Some(OperationAction::Undo),
-                b"redo" => Some(OperationAction::Redo),
-                b"restore" => Some(OperationAction::Restore),
-                _ => None,
-            };
-            metadata.target = parse_operation_id(&value[1..])?;
+        let Some(value) = line.strip_prefix(b"Git-op: ") else {
+            continue;
+        };
+        let Some(separator) = value.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let (action, value) = value.split_at(separator);
+        let action = match action {
+            b"undo" => OperationAction::Undo,
+            b"redo" => OperationAction::Redo,
+            b"restore" => OperationAction::Restore,
+            _ => continue,
+        };
+        if let Some(target) = parse_operation_id(&value[1..])? {
+            actions.push((action, target));
         }
     }
-    Ok(metadata)
+    Ok(OperationMetadata { actions })
 }
 
 fn parse_operation_id(value: &[u8]) -> Result<Option<ObjectId>, Error> {
@@ -1275,13 +1272,16 @@ fn next_redo_target(
         return Ok(None);
     };
     let metadata = operation_metadata(repo, parent)?;
-    if metadata.action != Some(OperationAction::Undo) || metadata.undone != Some(undone) {
+    if !metadata.actions.contains(&(OperationAction::Undo, undone)) {
         return Ok(None);
     }
-    let Some(next) = parent_snapshot(repo, parent)? else {
+    let Some(previous_undo) = parent_snapshot(repo, parent)? else {
         return Ok(None);
     };
-    Ok(operation_metadata(repo, next)?.target)
+    Ok(operation_metadata(repo, previous_undo)?
+        .actions
+        .iter()
+        .find_map(|(action, target)| (*action == OperationAction::Undo).then_some(*target)))
 }
 
 /// Resolve an operation commit specification using Git's revision parser.
@@ -1919,13 +1919,13 @@ mod tests {
         );
         assert!(
             message
-                .windows(b"undone-operation:".len())
-                .any(|window| window == b"undone-operation:")
+                .windows(b"Git-op: undo:".len())
+                .any(|window| window == b"Git-op: undo:")
         );
         assert!(
             message
-                .windows(b"restored-operation:".len())
-                .any(|window| window == b"restored-operation:")
+                .windows(b"Git-op: restore:".len())
+                .any(|window| window == b"Git-op: restore:")
         );
         assert_ne!(a, b);
     }
