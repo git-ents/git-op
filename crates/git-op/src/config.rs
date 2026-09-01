@@ -12,9 +12,13 @@ use crate::Error;
 const HOOK_NAME: &str = "reference-transaction";
 
 /// Hook block written by fresh installs and hook upgrades.
+///
+/// The hook fails open: when the `git-op` executable is missing it exits 0 so
+/// a lost operation log never blocks ref updates, warning only on the
+/// `committed` phase so ordinary transactions stay quiet.
 macro_rules! hook_line {
     () => {
-        "command -v git-op >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found. If you no longer wish for operations to be logged, delete the following file.\" \"$0\"; exit 2; }; git-op reference-transaction \"$@\"\n"
+        "command -v git-op >/dev/null 2>&1 || { [ \"$1\" = committed ] && printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found, so this operation was not recorded. If you no longer wish for operations to be logged, run: git op uninstall --local, or delete the following file.\" \"$0\"; exit 0; }; git-op reference-transaction \"$@\"\n"
     };
 }
 
@@ -403,5 +407,41 @@ mod tests {
         assert!(matches!(error, Error::HookExists(_)));
         let body = fs::read(hooks.hook_path()).expect("read hook after refused install");
         assert_eq!(body, foreign.as_bytes());
+    }
+
+    /// Verify that a missing git-op binary fails open: the hook exits 0 so ref
+    /// updates proceed, warning only on the committed phase.
+    #[cfg(unix)]
+    #[test]
+    fn missing_binary_fails_open_with_warning_only_on_committed_phase() {
+        let hooks = TemporaryHooksDir::new();
+        install_hook(&hooks.path).expect("install hook");
+        let run = |phase: &str| {
+            let output = Command::new("/bin/sh")
+                .arg(hooks.hook_path())
+                .arg(phase)
+                .env("PATH", "")
+                .output()
+                .expect("run hook without git-op on PATH");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        for phase in ["preparing", "prepared", "aborted"] {
+            let (code, stderr) = run(phase);
+            assert_eq!(code, Some(0), "{phase} phase must fail open");
+            assert_eq!(stderr, "", "{phase} phase must stay silent");
+        }
+        let (code, stderr) = run("committed");
+        assert_eq!(code, Some(0), "committed phase must fail open");
+        assert!(
+            stderr.contains("could not be found"),
+            "committed phase should warn: {stderr}"
+        );
+        assert!(
+            stderr.contains("git op uninstall --local"),
+            "warning should mention uninstalling: {stderr}"
+        );
     }
 }
