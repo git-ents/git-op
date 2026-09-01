@@ -57,18 +57,27 @@ pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
 
 /// Install the hook in Git's configured global template directory.
 ///
-/// This updates Git's global `init.templateDir` setting if it is not already
-/// configured. The global configuration and template directory are process-wide,
-/// so prefer [`install_local`](crate::install_local) when isolation matters.
+/// When `init.templateDir` is already configured, the hook is installed there
+/// and the directory gains any stock template files it is missing, so
+/// repositories initialized from it keep the files a default `git init`
+/// provides. Otherwise git-op claims a default template directory by writing
+/// `init.templateDir` into its own global config file and referencing that
+/// file from an `[include]` block appended to the global configuration;
+/// existing settings are never rewritten. The global configuration and
+/// template directory are process-wide, so prefer
+/// [`install_local`](crate::install_local) when isolation matters.
 pub fn install_global() -> Result<(), Error> {
-    install_hook(global_template_dir()?.join("hooks"))
+    let template = resolve_global_template()?;
+    seed_stock_templates(&template)?;
+    install_hook(template.join("hooks"))
 }
 
-/// Return the configured global template directory, initializing the default when absent.
+/// Resolve the global template directory, claiming a default one through an
+/// `[include]`d git-op config when Git has none configured.
 ///
 /// This is intentionally private because resolving or initializing the global
 /// template path is an implementation detail of [`install_global`].
-fn global_template_dir() -> Result<PathBuf, Error> {
+fn resolve_global_template() -> Result<PathBuf, Error> {
     if let Some(template) = git_config_global_template()? {
         return Ok(template);
     }
@@ -77,18 +86,126 @@ fn global_template_dir() -> Result<PathBuf, Error> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
         .ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))?;
-    let template = config_home.join("git/templates");
+    let template = default_template_dir(&config_home);
+    let op_config = config_home.join("git").join(OP_CONFIG_NAME);
+    write_op_config(&op_config, &template)?;
+    ensure_include(&["--global"], &op_config)?;
+    Ok(template)
+}
+
+/// The default global template directory git-op claims when Git has none.
+fn default_template_dir(config_home: &Path) -> PathBuf {
+    config_home.join("git/templates")
+}
+
+/// The name of the git-op-owned global config file holding `init.templateDir`.
+const OP_CONFIG_NAME: &str = "op-config";
+
+/// Write `template` as the `init.templateDir` value of the git-op-owned
+/// config file at `op_config`.
+///
+/// The file is written with `git config --file`, so Git handles the quoting
+/// of unusual paths. A previous install's file is updated in place.
+fn write_op_config(op_config: &Path, template: &Path) -> Result<(), Error> {
+    if let Some(parent) = op_config.parent() {
+        fs::create_dir_all(parent).map_err(Error::git)?;
+    }
     let status = Command::new("git")
-        .args(["config", "--global", "init.templateDir"])
-        .arg(&template)
+        .args(["config", "--file"])
+        .arg(op_config)
+        .args(["init.templateDir"])
+        .arg(template)
         .status()
         .map_err(Error::git)?;
     if !status.success() {
         return Err(Error::message(format!(
-            "git config --global failed with {status}"
+            "git config --file {} failed with {status}",
+            op_config.display()
         )));
     }
-    Ok(template)
+    Ok(())
+}
+
+/// Append an `[include] path` entry for `op_config` to the config selected by
+/// `scope` unless it already references it, reporting whether an entry was added.
+///
+/// `scope` selects the configuration: `["--global"]` for the user's global
+/// config, or `["--file", path]` for tests. Existing content is never
+/// rewritten; git appends the entry, creating the file when absent.
+fn ensure_include(scope: &[&str], op_config: &Path) -> Result<bool, Error> {
+    let present = Command::new("git")
+        .arg("config")
+        .args(scope)
+        .args(["--get-all", "--fixed-value", "include.path"])
+        .arg(op_config)
+        .status()
+        .map_err(Error::git)?
+        .success();
+    if present {
+        return Ok(false);
+    }
+    let status = Command::new("git")
+        .arg("config")
+        .args(scope)
+        .arg("include.path")
+        .arg(op_config)
+        .status()
+        .map_err(Error::git)?;
+    if !status.success() {
+        return Err(Error::message(format!(
+            "git config include.path failed with {status}"
+        )));
+    }
+    Ok(true)
+}
+
+/// Copy Git's stock template files into `template`, never overwriting.
+///
+/// A template directory carrying only git-op's hook would otherwise make
+/// `git init` produce repositories missing the stock `description`,
+/// `info/exclude`, and sample hooks. Files already present are left
+/// untouched, so reinstalls never clobber customizations.
+fn seed_stock_templates(template: &Path) -> Result<(), Error> {
+    fs::create_dir_all(template.join("hooks")).map_err(Error::git)?;
+    let Some(stock) = stock_template_dir() else {
+        return Ok(());
+    };
+    copy_absent(&stock, template)
+}
+
+/// Locate Git's installed stock template directory, if present.
+///
+/// Stock templates live at `<prefix>/share/git-core/templates`, two levels
+/// above the `<prefix>/libexec/git-core` directory `git --exec-path` reports.
+/// An unusual installation layout yields `None`, and installing proceeds
+/// without stock content rather than failing.
+fn stock_template_dir() -> Option<PathBuf> {
+    let output = Command::new("git").arg("--exec-path").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec_path = PathBuf::from(std::str::from_utf8(&output.stdout).ok()?.trim());
+    let stock = exec_path
+        .parent()?
+        .parent()?
+        .join("share/git-core/templates");
+    stock.is_dir().then_some(stock)
+}
+
+/// Copy `source` into `target`, creating directories and skipping existing files.
+fn copy_absent(source: &Path, target: &Path) -> Result<(), Error> {
+    if source.is_dir() {
+        fs::create_dir_all(target).map_err(Error::git)?;
+        for entry in fs::read_dir(source).map_err(Error::git)? {
+            let entry = entry.map_err(Error::git)?;
+            copy_absent(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if !target.exists() {
+        fs::copy(source, target).map_err(Error::git)?;
+    }
+    Ok(())
 }
 
 /// Resolve a path using Git's repository-aware path rules.
@@ -149,10 +266,19 @@ pub(crate) fn commit_signing_enabled(repo: &gix::Repository) -> Result<bool, Err
 /// Read the global template directory configured for Git.
 ///
 /// Git's exit status distinguishes an absent setting (`None`) from a command
-/// failure (`Err`).
+/// failure (`Err`). `--includes` is required because `git config` skips
+/// include directives when a specific file such as the global config is
+/// selected, and git-op's own `init.templateDir` is set through one.
 fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
     let output = Command::new("git")
-        .args(["config", "--global", "--path", "--get", "init.templateDir"])
+        .args([
+            "config",
+            "--global",
+            "--path",
+            "--includes",
+            "--get",
+            "init.templateDir",
+        ])
         .output()
         .map_err(Error::git)?;
     if output.status.success() {
@@ -443,5 +569,134 @@ mod tests {
             stderr.contains("git op uninstall --local"),
             "warning should mention uninstalling: {stderr}"
         );
+    }
+
+    /// Create a unique temporary directory and remove it when the returned
+    /// guard drops.
+    struct TemporaryDir {
+        path: PathBuf,
+    }
+
+    impl TemporaryDir {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEMP_HOOKS_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("git-op-{label}-{}-{sequence}", std::process::id()));
+            fs::create_dir(&path).expect("create temporary directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporaryDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Verify that stock template content fills a template directory without
+    /// overwriting files that are already there, and that unrelated files
+    /// survive.
+    #[test]
+    fn copy_absent_populates_missing_files_and_keeps_existing_ones() {
+        let root = TemporaryDir::new("copy-absent");
+        let stock = root.path.join("stock");
+        fs::create_dir_all(stock.join("hooks")).expect("create stock hooks");
+        fs::create_dir_all(stock.join("info")).expect("create stock info");
+        fs::write(stock.join("description"), b"stock description\n").expect("write description");
+        fs::write(stock.join("info/exclude"), b"stock exclude\n").expect("write exclude");
+        fs::write(stock.join("hooks/pre-commit.sample"), b"sample").expect("write sample");
+
+        let template = root.path.join("template");
+        fs::create_dir_all(template.join("hooks")).expect("create template hooks");
+        fs::write(template.join("description"), b"custom description\n")
+            .expect("write custom description");
+        fs::write(template.join("hooks/post-commit"), b"custom hook").expect("write custom hook");
+
+        copy_absent(&stock, &template).expect("copy stock templates");
+
+        assert_eq!(
+            fs::read(template.join("description")).expect("read description"),
+            b"custom description\n",
+            "existing files must not be overwritten"
+        );
+        assert_eq!(
+            fs::read(template.join("info/exclude")).expect("read exclude"),
+            b"stock exclude\n"
+        );
+        assert_eq!(
+            fs::read(template.join("hooks/pre-commit.sample")).expect("read sample"),
+            b"sample"
+        );
+        assert_eq!(
+            fs::read(template.join("hooks/post-commit")).expect("read custom hook"),
+            b"custom hook",
+            "unrelated template files must survive"
+        );
+
+        copy_absent(&stock, &template).expect("re-copy stock templates");
+        assert_eq!(
+            fs::read(template.join("description")).expect("read description again"),
+            b"custom description\n",
+            "copying must be idempotent"
+        );
+    }
+
+    /// Verify that the git-op-owned config file records the template directory
+    /// and that the appended `[include]` block makes it effective exactly once.
+    #[test]
+    fn include_block_activates_the_op_template_directory() {
+        let root = TemporaryDir::new("include");
+        let template = root.path.join("git/templates");
+        let op_config = root.path.join("git/op-config");
+        let config = root.path.join("gitconfig");
+
+        write_op_config(&op_config, &template).expect("write op config");
+        let configured: String = String::from_utf8(
+            Command::new("git")
+                .args(["config", "--file"])
+                .arg(&op_config)
+                .args(["--get", "init.templateDir"])
+                .output()
+                .expect("read op config")
+                .stdout,
+        )
+        .expect("op config is UTF-8");
+        assert_eq!(configured.trim(), template.to_str().expect("UTF-8 path"));
+
+        let config_scope = ["--file", config.to_str().expect("UTF-8 path")];
+        assert!(ensure_include(&config_scope, &op_config).expect("append include"));
+        assert!(
+            !ensure_include(&config_scope, &op_config).expect("re-append include"),
+            "a second install must not duplicate the include entry"
+        );
+
+        let values: String = String::from_utf8(
+            Command::new("git")
+                .arg("config")
+                .args(config_scope)
+                .args(["--get-all", "include.path"])
+                .output()
+                .expect("read include entries")
+                .stdout,
+        )
+        .expect("include entries are UTF-8");
+        assert_eq!(
+            values.lines().collect::<Vec<_>>(),
+            vec![op_config.to_str().expect("UTF-8 path")],
+            "exactly one include entry must reference the op config"
+        );
+
+        // `--file` skips include directives unless `--includes` is passed.
+        let resolved: String = String::from_utf8(
+            Command::new("git")
+                .arg("config")
+                .args(config_scope)
+                .args(["--includes", "--get", "init.templateDir"])
+                .output()
+                .expect("resolve included value")
+                .stdout,
+        )
+        .expect("resolved value is UTF-8");
+        assert_eq!(resolved.trim(), template.to_str().expect("UTF-8 path"));
     }
 }
