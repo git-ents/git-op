@@ -24,6 +24,7 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Restore { oid, dry_run } => restore_command(oid.as_deref(), dry_run),
         Command::Undo { dry_run } => undo_command(dry_run),
         Command::Redo { dry_run } => redo_command(dry_run),
+        Command::Show { oid } => show_command(oid.as_deref()),
     }
 }
 
@@ -208,6 +209,123 @@ fn redo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         &action_header("Redid operation", &result.target, None),
         &result,
     );
+    Ok(())
+}
+
+/// Decode one operation-log entry: its trailers, the refs it changed, and the
+/// metadata diffs it carries.
+fn show_command(specification: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = open_repository()?;
+    let oid = match specification {
+        Some(specification) => git_op::resolve_operation(&repo, specification)?,
+        None => {
+            let Some(tip) = repo.try_find_reference(git_op::OP_REF)? else {
+                return Err("no operation snapshots recorded".into());
+            };
+            tip.id().detach()
+        }
+    };
+    let commit = repo.find_commit(oid)?;
+    let message = commit.message_raw_sloppy();
+    let summary = message.split(|&byte| byte == b'\n').next().unwrap_or(&[]);
+    println!("{} {}", short(&oid), String::from_utf8_lossy(summary));
+    for line in message.split(|&byte| byte == b'\n') {
+        if let Some(value) = line.strip_prefix(b"Invoked-by: ") {
+            println!("Invoked by: {}", String::from_utf8_lossy(value));
+        } else if let Some(value) = line.strip_prefix(b"Git-op: ") {
+            println!("Action: {}", String::from_utf8_lossy(value));
+        }
+    }
+
+    let state = git_op::read(&repo, oid)?;
+    let previous = match git_op::parent_operation(&repo, oid)? {
+        Some(parent) => Some(git_op::read(&repo, parent)?),
+        None => None,
+    };
+
+    let changed_refs = match git_op::ref_changes(&repo, oid)? {
+        Some(refs) => refs,
+        None => git_op::captured_refs(&repo, oid)?,
+    };
+    if !changed_refs.is_empty() {
+        println!("refs:");
+        let width = changed_refs
+            .iter()
+            .map(|change| change.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for change in &changed_refs {
+            let (before, after) = ref_targets(&change.kind);
+            println!("  {:width$}  {} → {}", change.name, before, after);
+        }
+    }
+
+    show_metadata_diff(
+        &repo,
+        "config",
+        previous
+            .as_ref()
+            .and_then(|state| state.config)
+            .map(|blob| blob.oid()),
+        state.config.map(|blob| blob.oid()),
+    )?;
+    show_metadata_diff(
+        &repo,
+        "description",
+        previous
+            .as_ref()
+            .and_then(|state| state.description)
+            .map(|blob| blob.oid()),
+        state.description.map(|blob| blob.oid()),
+    )?;
+    Ok(())
+}
+
+/// Render a captured ref transition as its before and after targets.
+fn ref_targets(kind: &git_op::RefChangeKind) -> (String, String) {
+    let target = |target: &gix::refs::Target| match target {
+        gix::refs::Target::Object(oid) => short(oid),
+        gix::refs::Target::Symbolic(name) => format!("ref: {name}"),
+    };
+    match kind {
+        git_op::RefChangeKind::Created(new) => ("(new)".to_owned(), target(new)),
+        git_op::RefChangeKind::Deleted(old) => (target(old), "(deleted)".to_owned()),
+        git_op::RefChangeKind::Updated { old, new } => (target(old), target(new)),
+    }
+}
+
+/// Print the unified diff of one metadata file between two snapshot states.
+///
+/// A side a snapshot does not capture diffs against the empty blob, so an
+/// initial snapshot shows its file as all additions and a dropped file as all
+/// deletions.
+fn show_metadata_diff(
+    repo: &gix::Repository,
+    label: &str,
+    before: Option<gix::ObjectId>,
+    after: Option<gix::ObjectId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if before == after {
+        return Ok(());
+    }
+    use gix::objs::Write as _;
+    let empty = repo
+        .write_buf(gix::objs::Kind::Blob, b"")
+        .map_err(|error| format!("write empty blob failed: {error}"))?;
+    let output = std::process::Command::new("git")
+        .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
+        .env("GIT_DIR", repo.git_dir())
+        .args([
+            "diff",
+            &before.unwrap_or(empty).to_string(),
+            &after.unwrap_or(empty).to_string(),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git diff failed with {}", output.status).into());
+    }
+    println!("{label}:");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
 }
 
