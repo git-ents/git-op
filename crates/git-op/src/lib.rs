@@ -17,7 +17,7 @@ mod config;
 mod invocation;
 
 use config::commit_signing_enabled;
-pub use config::{install_global, install_local};
+pub use config::{install_global, install_local, uninstall_global, uninstall_local};
 use invocation::InvokedBy;
 
 /// The ref containing the latest repository-state snapshot.
@@ -1843,7 +1843,8 @@ impl TryFrom<&str> for ReferenceTransactionPhase {
 /// Only the committed phase writes a snapshot, and only when the transaction
 /// changes a captured ref, config, or description; updating [`OP_REF`] alone
 /// never does. A committed transaction on a repository without an operation
-/// log records the initial snapshot.
+/// log records the initial snapshot. Deleting [`OP_REF`] uninstalls the local
+/// hook instead and records nothing, so the log stays deleted.
 ///
 /// # Examples
 ///
@@ -1882,6 +1883,14 @@ pub fn reference_transaction(
         | ReferenceTransactionPhase::Prepared
         | ReferenceTransactionPhase::Aborted => Ok(()),
         ReferenceTransactionPhase::Committed => {
+            if transaction_deletes_operation_ref(input)? {
+                // Deleting the operation log uninstalls git-op from this
+                // repository: the committed deletion removes the local hook
+                // so nothing records snapshots again, and no snapshot is
+                // captured either way, so the deletion is not resurrected by
+                // a capture of the surviving state.
+                return uninstall_local(repo);
+            }
             if transaction_changes_captured_refs(input)?
                 || repo
                     .try_find_reference(OP_REF)
@@ -1895,16 +1904,25 @@ pub fn reference_transaction(
     }
 }
 
-/// Determine whether hook input includes a captured ref update.
-fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
-    let mut captured = false;
-    let mut saw_line = false;
+/// One ref update from reference-transaction hook input.
+struct TransactionUpdate<'a> {
+    /// The new value: an object ID, or all zeros for a deletion.
+    new: &'a [u8],
+    /// The full name of the updated ref.
+    name: &'a [u8],
+}
+
+/// Parse reference-transaction hook input into ref updates.
+///
+/// Each non-empty line holds `old-value new-value ref-name`; anything else is
+/// malformed.
+fn transaction_updates(input: &[u8]) -> Result<Vec<TransactionUpdate<'_>>, Error> {
+    let mut updates = Vec::new();
     for line in input.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
-        saw_line = true;
         let fields: Vec<_> = line
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
@@ -1914,12 +1932,28 @@ fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
                 String::from_utf8_lossy(line).into_owned(),
             ));
         }
-        captured |= is_captured_ref(fields[2]);
+        updates.push(TransactionUpdate {
+            new: fields[1],
+            name: fields[2],
+        });
     }
-    if !saw_line {
-        return Ok(false);
-    }
-    Ok(captured)
+    Ok(updates)
+}
+
+/// Determine whether hook input includes a captured ref update.
+fn transaction_changes_captured_refs(input: &[u8]) -> Result<bool, Error> {
+    Ok(transaction_updates(input)?
+        .iter()
+        .any(|update| is_captured_ref(update.name)))
+}
+
+/// Determine whether hook input deletes the operation ref.
+///
+/// Git reports a deletion with an all-zero new value.
+fn transaction_deletes_operation_ref(input: &[u8]) -> Result<bool, Error> {
+    Ok(transaction_updates(input)?.iter().any(|update| {
+        update.name == OP_REF.as_bytes() && update.new.iter().all(|&byte| byte == b'0')
+    }))
 }
 
 #[cfg(test)]
@@ -1932,6 +1966,9 @@ mod tests {
     };
 
     static NEXT_TEMP_REPOSITORY: AtomicUsize = AtomicUsize::new(0);
+
+    /// The all-zero object ID Git reports for ref deletions.
+    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
     /// Own a temporary repository and remove it when the test finishes.
     struct TemporaryRepository {
@@ -2901,5 +2938,117 @@ mod tests {
     fn hook_parser_accepts_empty_transactions() {
         assert!(!transaction_changes_captured_refs(b"\n").expect("empty transaction"));
         assert!(!transaction_changes_captured_refs(b"\r\n").expect("empty transaction"));
+    }
+
+    /// Verify that a committed deletion of the operation ref uninstalls the
+    /// local hook and is not resurrected by a capture.
+    #[test]
+    fn op_ref_deletion_uninstalls_the_local_hook() {
+        let temporary = TemporaryRepository::new();
+        install_local(&temporary.repo).expect("install hook");
+        append(&temporary.repo, "snapshot").expect("append snapshot");
+        let tip = temporary
+            .repo
+            .try_find_reference(OP_REF)
+            .expect("look up operation ref")
+            .expect("operation ref exists")
+            .target()
+            .try_id()
+            .expect("direct operation ref")
+            .to_owned();
+        // Git deletes the ref before invoking the committed-phase hook, and
+        // gix applies the deletion without firing the installed hook, keeping
+        // the simulation hermetic.
+        temporary
+            .repo
+            .edit_reference(GixRefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(tip)),
+                    log: RefLog::AndReference,
+                },
+                name: FullName::try_from(OP_REF).expect("valid operation ref name"),
+                deref: false,
+            })
+            .expect("delete operation ref");
+
+        reference_transaction(
+            &temporary.repo,
+            ReferenceTransactionPhase::Committed,
+            format!("{tip} {ZERO_OID} {OP_REF}\n").as_bytes(),
+        )
+        .expect("process deletion transaction");
+
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none(),
+            "a deleted operation log must not be resurrected"
+        );
+        assert!(
+            !temporary
+                .repo
+                .git_dir()
+                .join("hooks/reference-transaction")
+                .exists(),
+            "the committed deletion must remove the local hook"
+        );
+    }
+
+    /// Verify that a deletion seen before the committed phase changes nothing.
+    #[test]
+    fn op_ref_deletion_on_prepared_phase_leaves_the_hook() {
+        let temporary = TemporaryRepository::new();
+        install_local(&temporary.repo).expect("install hook");
+        let tip = ZERO_OID;
+
+        reference_transaction(
+            &temporary.repo,
+            ReferenceTransactionPhase::Prepared,
+            format!("{tip} {ZERO_OID} {OP_REF}\n").as_bytes(),
+        )
+        .expect("process prepared deletion transaction");
+
+        assert!(
+            temporary
+                .repo
+                .git_dir()
+                .join("hooks/reference-transaction")
+                .exists(),
+            "only the committed phase uninstalls"
+        );
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none()
+        );
+    }
+
+    /// Verify that the hook parser recognizes only operation-ref deletions.
+    #[test]
+    fn hook_parser_detects_operation_ref_deletions() {
+        let oid = "1111111111111111111111111111111111111111";
+        assert!(
+            transaction_deletes_operation_ref(format!("{oid} {ZERO_OID} {OP_REF}\n").as_bytes())
+                .expect("parse deletion")
+        );
+        assert!(
+            !transaction_deletes_operation_ref(format!("{ZERO_OID} {oid} {OP_REF}\n").as_bytes())
+                .expect("parse creation"),
+            "creating the operation ref is not a deletion"
+        );
+        assert!(
+            !transaction_deletes_operation_ref(
+                format!("{oid} {ZERO_OID} refs/heads/main\n").as_bytes()
+            )
+            .expect("parse branch deletion")
+        );
+        assert!(
+            !transaction_deletes_operation_ref(b"").expect("parse empty input"),
+            "empty input deletes nothing"
+        );
     }
 }

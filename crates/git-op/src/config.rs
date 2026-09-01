@@ -82,12 +82,8 @@ fn resolve_global_template() -> Result<PathBuf, Error> {
         return Ok(template);
     }
 
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))?;
-    let template = default_template_dir(&config_home);
-    let op_config = config_home.join("git").join(OP_CONFIG_NAME);
+    let template = default_template_dir(&config_home()?);
+    let op_config = config_home()?.join("git").join(OP_CONFIG_NAME);
     write_op_config(&op_config, &template)?;
     ensure_include(&["--global"], &op_config)?;
     Ok(template)
@@ -206,6 +202,166 @@ fn copy_absent(source: &Path, target: &Path) -> Result<(), Error> {
         fs::copy(source, target).map_err(Error::git)?;
     }
     Ok(())
+}
+
+/// The XDG config home, or an error when neither it nor HOME is set.
+fn config_home() -> Result<PathBuf, Error> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
+        .ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))
+}
+
+/// Remove the `reference-transaction` hook from this repository.
+///
+/// A hook whose non-comment lines are all git-op's own is removed entirely.
+/// A hook that mixes git-op lines with other commands keeps the other
+/// commands and loses ours, and a hook that invokes no git-op hook is left
+/// untouched, so uninstalling is safe to repeat and never deletes a hook
+/// git-op did not write.
+pub fn uninstall_local(repo: &gix::Repository) -> Result<(), Error> {
+    uninstall_hook(&git_path(repo, "hooks")?)
+}
+
+/// Remove the hook from Git's global template directory and every template
+/// directory, config file, and `[include]` entry git-op installed.
+///
+/// A user-configured template directory keeps everything except git-op's own
+/// hook. The default template directory git-op claims is removed only when
+/// nothing outside git-op's and Git's stock files is present. The global
+/// configuration loses only the include entry referencing git-op's config
+/// file. The global configuration and template directory are process-wide,
+/// so prefer [`uninstall_local`](crate::uninstall_local) when isolation
+/// matters.
+pub fn uninstall_global() -> Result<(), Error> {
+    let configured = git_config_global_template()?;
+    let default = default_template_dir(&config_home()?);
+    match configured.as_deref() {
+        Some(template) => uninstall_hook(&template.join("hooks"))?,
+        None => uninstall_hook(&default.join("hooks"))?,
+    }
+    if configured.is_none() || configured.as_deref() == Some(default.as_path()) {
+        remove_unmodified_template(&default)?;
+    }
+    remove_global_claim()
+}
+
+/// Remove git-op's hook from `hooks`, leaving anything else untouched.
+fn uninstall_hook(hooks: &Path) -> Result<(), Error> {
+    let path = hooks.join(HOOK_NAME);
+    let existing = match fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(Error::message(format!(
+                "refusing to uninstall hook {}: not valid UTF-8",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(Error::git(error)),
+    };
+    let stripped = strip_managed_lines(&existing);
+    if stripped == existing {
+        return Ok(());
+    }
+    if stripped
+        .lines()
+        .all(|line| line.trim().is_empty() || line.starts_with("#!"))
+    {
+        return fs::remove_file(path).map_err(Error::git);
+    }
+    replace_hook(hooks, &path, &stripped)
+}
+
+/// Remove every git-op-owned line, preserving all other lines byte for byte.
+fn strip_managed_lines(existing: &str) -> String {
+    existing
+        .split_inclusive('\n')
+        .filter(|line| !invokes_git_op(line.trim_end_matches(['\n', '\r'])))
+        .collect()
+}
+
+/// Remove the claimed template directory when git-op's install created it.
+///
+/// The directory goes away only once its hook is gone and no file outside
+/// git-op's and Git's stock set is present; anything else means the
+/// directory holds content git-op did not put there.
+fn remove_unmodified_template(template: &Path) -> Result<(), Error> {
+    if template.join("hooks").join(HOOK_NAME).exists() || !template_is_unmodified(template) {
+        return Ok(());
+    }
+    match fs::remove_dir_all(template) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::git(error)),
+    }
+}
+
+/// Whether every file under `template` is one git-op's install could have
+/// written: the stock `description`, `info/exclude`, sample hooks, or
+/// git-op's own hook.
+fn template_is_unmodified(template: &Path) -> bool {
+    fn walk(dir: &Path, prefix: &str) -> bool {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let relative = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                if !walk(&path, &relative) {
+                    return false;
+                }
+            } else if relative != "description"
+                && relative != "info/exclude"
+                && relative != format!("hooks/{HOOK_NAME}")
+                && !(relative.starts_with("hooks/") && name.ends_with(".sample"))
+            {
+                return false;
+            }
+        }
+        true
+    }
+    walk(template, "")
+}
+
+/// Remove the `[include]` entry and config file git-op added to claim the
+/// default template directory, when present.
+///
+/// The include entry is unset first so Git never observes a dangling include.
+/// Exit status 5 means no matching entry remains, which is the desired state.
+fn remove_global_claim() -> Result<(), Error> {
+    let op_config = config_home()?.join("git").join(OP_CONFIG_NAME);
+    let status = Command::new("git")
+        .args([
+            "config",
+            "--global",
+            "--unset-all",
+            "--fixed-value",
+            "include.path",
+        ])
+        .arg(&op_config)
+        .status()
+        .map_err(Error::git)?;
+    if !status.success() && status.code() != Some(5) {
+        return Err(Error::message(format!(
+            "git config --unset-all include.path failed with {status}"
+        )));
+    }
+    match fs::remove_file(op_config) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::git(error)),
+    }
 }
 
 /// Resolve a path using Git's repository-aware path rules.
