@@ -3,7 +3,12 @@
 //! Snapshots are committed to [`OP_REF`]. The operation ref, remote refs, and
 //! pseudo references such as `HEAD` are excluded from snapshots.
 
-use std::{collections::BTreeMap, fmt, fs, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use facet::Facet;
 use facet_git_tree::{RawBlob, RawTree};
@@ -166,6 +171,38 @@ pub enum Error {
         /// The object ID that cannot back a checkout.
         oid: ObjectId,
     },
+    /// Restoring would overwrite untracked files or discard uncommitted
+    /// changes, so the blocked paths are reported instead.
+    #[error("cannot restore: {}", collision_list(.collisions))]
+    OverwrittenPaths {
+        /// The blocked paths, ordered by name.
+        collisions: Vec<PathCollision>,
+    },
+}
+
+/// A path whose untracked file or uncommitted changes a restore would overwrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCollision {
+    /// The worktree-relative path.
+    pub path: String,
+    /// Whether an untracked file would be overwritten, as opposed to
+    /// uncommitted changes being discarded.
+    pub untracked: bool,
+}
+
+/// Render the collision list of an [`Error::OverwrittenPaths`] message.
+fn collision_list(collisions: &[PathCollision]) -> String {
+    collisions
+        .iter()
+        .map(|collision| {
+            if collision.untracked {
+                format!("{} (untracked file)", collision.path)
+            } else {
+                format!("{} (uncommitted changes)", collision.path)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Error {
@@ -1422,6 +1459,7 @@ fn apply_action_with_trailers(
             changed: false,
         });
     }
+    ensure_no_local_collisions(repo, &state)?;
     apply_state(repo, &state)?;
     let primary_target = primary_target.unwrap_or(plan.target);
     let mut message = format!(
@@ -1679,6 +1717,222 @@ fn reset_worktree(repo: &gix::Repository) -> Result<(), Error> {
             "git read-tree --reset -u {head} failed with {status}"
         )))
     }
+}
+
+/// The tree the worktree is reset to when `state` is applied, or `None` when
+/// no reset can be predicted.
+///
+/// A symbolic HEAD is reset to the snapshot's captured tip of the current
+/// branch, and a detached HEAD to the commit it already names. A branch the
+/// snapshot does not capture leaves the reset to fail later, and a symbolic
+/// captured ref is too unusual to predict.
+fn snapshot_worktree_tree(
+    repo: &gix::Repository,
+    state: &RepositoryState,
+) -> Result<Option<ObjectId>, Error> {
+    if let Some(branch) = repo.head_name().map_err(Error::git)? {
+        let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+        let mut updates = Vec::new();
+        collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+        let Some((_, contents)) = updates
+            .iter()
+            .find(|(name, _)| name.as_bytes() == branch.as_bstr().as_bytes())
+        else {
+            return Ok(None);
+        };
+        return match parse_ref_contents(contents)? {
+            Target::Object(oid) => {
+                let commit = repo.find_commit(oid).map_err(Error::git)?;
+                Ok(Some(commit.tree_id().map_err(Error::git)?.detach()))
+            }
+            Target::Symbolic(_) => Ok(None),
+        };
+    }
+    match repo.head_id() {
+        Ok(head) => {
+            let commit = repo.find_commit(head.detach()).map_err(Error::git)?;
+            Ok(Some(commit.tree_id().map_err(Error::git)?.detach()))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Refuse to apply `state` when the reset would overwrite untracked files or
+/// discard uncommitted changes, matching `git checkout`'s protection.
+///
+/// `git read-tree --reset -u` clobbers any worktree path the target tree
+/// touches, including untracked files and worktree modifications to tracked
+/// files whose index entry already matches the target, so the protection has
+/// to be our own. Only genuinely affected paths block the restore: unrelated
+/// untracked files and clean paths proceed.
+fn ensure_no_local_collisions(
+    repo: &gix::Repository,
+    state: &RepositoryState,
+) -> Result<(), Error> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let Some(target) = snapshot_worktree_tree(repo, state)? else {
+        return Ok(());
+    };
+    let target_paths = tree_paths(workdir, target)?;
+    let status = status_paths(workdir)?;
+    let differing = index_differences(workdir, target)?;
+
+    let mut collisions: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
+    for path in &status.untracked {
+        if target_paths.contains(path) {
+            collisions.insert(path.clone(), true);
+        } else if let Some(ancestor) = ancestors(path).find(|name| target_paths.contains(*name)) {
+            // The target holds a file where the untracked directory sits.
+            collisions.insert(ancestor.to_owned(), true);
+        }
+    }
+    for path in &target_paths {
+        if let Some(obstruction) = ancestors(path).find(|name| status.untracked.contains(*name)) {
+            // An untracked file blocks a directory the target needs.
+            collisions.insert(obstruction.to_owned(), true);
+        }
+    }
+    for path in &status.staged {
+        if differing.contains(path) {
+            collisions.insert(path.clone(), false);
+        }
+    }
+    for path in &status.worktree_modified {
+        collisions.insert(path.clone(), false);
+    }
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(Error::OverwrittenPaths {
+        collisions: collisions
+            .into_iter()
+            .map(|(path, untracked)| PathCollision { path, untracked })
+            .collect(),
+    })
+}
+
+/// The directory prefixes of a path, nearest first: `a/b/c` yields `a/b`, `a`.
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    let mut current = path;
+    std::iter::from_fn(move || {
+        let index = current.rfind('/')?;
+        current = &current[..index];
+        Some(current)
+    })
+}
+
+/// The paths of every file in `tree`, as worktree-relative names.
+fn tree_paths(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> {
+    run_git_lines(
+        workdir,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &tree.to_hex().to_string(),
+        ],
+    )
+}
+
+/// The paths whose index entry differs from `tree`.
+fn index_differences(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> {
+    run_git_lines(
+        workdir,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &tree.to_hex().to_string(),
+        ],
+    )
+}
+
+/// Run Git in `workdir` and split NUL-separated output into a set of paths.
+fn run_git_lines(workdir: &Path, args: &[&str]) -> Result<HashSet<String>, Error> {
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args(args)
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Err(Error::message(format!(
+            "git {} failed with {}",
+            args.first().copied().unwrap_or("git"),
+            output.status
+        )));
+    }
+    Ok(output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+/// The worktree state classes `git status` reports.
+struct WorktreeStatus {
+    /// Paths Git considers untracked.
+    untracked: HashSet<String>,
+    /// Paths whose worktree content differs from the index, excluding files
+    /// deleted in the worktree: the reset restores those from the index,
+    /// losing nothing, so like `git checkout` they do not block a restore.
+    worktree_modified: HashSet<String>,
+    /// Paths whose index entry differs from `HEAD`, including rename sources.
+    staged: HashSet<String>,
+}
+
+/// Classify `git status --porcelain` output. Rename records contribute both
+/// endpoints.
+fn status_paths(workdir: &Path) -> Result<WorktreeStatus, Error> {
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Err(Error::message(format!(
+            "git status failed with {}",
+            output.status
+        )));
+    }
+    let mut status = WorktreeStatus {
+        untracked: HashSet::new(),
+        worktree_modified: HashSet::new(),
+        staged: HashSet::new(),
+    };
+    let mut records = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let (statuses, path) = record.split_at(2);
+        let path = String::from_utf8_lossy(&path[1..]).into_owned();
+        if statuses[0] == b'?' && statuses[1] == b'?' {
+            status.untracked.insert(path);
+            continue;
+        }
+        if statuses[0] != b' ' {
+            status.staged.insert(path.clone());
+        }
+        if statuses[1] != b' ' && statuses[1] != b'D' {
+            status.worktree_modified.insert(path.clone());
+        }
+        if statuses.contains(&b'R') || statuses.contains(&b'C') {
+            // Rename records carry the original path as a second field.
+            if let Some(original) = records.next() {
+                status
+                    .staged
+                    .insert(String::from_utf8_lossy(original).into_owned());
+            }
+        }
+    }
+    Ok(status)
 }
 
 /// Flatten a nested refs tree into Git ref-file contents.
@@ -2114,13 +2368,6 @@ mod tests {
             .detach();
         assert_ne!(first, second);
         append(&temporary.repo, "current snapshot").expect("append current snapshot");
-        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
-        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
-        git(&temporary, &["add", "staged"]);
-        assert_eq!(
-            git_output(&temporary, &["diff", "--cached", "--name-only"]),
-            "staged\n"
-        );
 
         let result = restore_action(&temporary.repo, initial).expect("restore initial snapshot");
         assert_eq!(
@@ -2229,8 +2476,6 @@ mod tests {
             .detach();
         assert_ne!(first, second);
         append(&temporary.repo, "current snapshot").expect("append current snapshot");
-        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
-        git(&temporary, &["add", "staged"]);
 
         restore(&temporary.repo, initial).expect("restore initial snapshot");
 
@@ -2427,6 +2672,158 @@ mod tests {
             git_output(&temporary, &["status", "--porcelain"]),
             dirty,
             "uncommitted index and worktree changes must survive a no-op restore"
+        );
+    }
+
+    /// Verify that unrelated untracked files do not block a restore and
+    /// survive it.
+    #[test]
+    fn restore_proceeds_with_unrelated_untracked_files() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        std::fs::write(temporary.root.join("unrelated"), b"untracked\n")
+            .expect("write unrelated untracked file");
+
+        restore(&temporary.repo, initial).expect("restore with unrelated untracked file");
+
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("unrelated")).expect("read untracked file"),
+            "untracked\n",
+            "unrelated untracked files must survive a restore"
+        );
+    }
+
+    /// Verify that a restore refuses to overwrite a colliding untracked file
+    /// and leaves the repository untouched.
+    #[test]
+    fn restore_refuses_to_overwrite_untracked_files() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        fs::remove_file(temporary.root.join("tracked")).expect("remove tracked file");
+        git(&temporary, &["commit", "-am", "two"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        std::fs::write(temporary.root.join("tracked"), b"untracked\n")
+            .expect("write colliding untracked file");
+
+        let error =
+            restore_action(&temporary.repo, initial).expect_err("untracked collision must refuse");
+        assert!(
+            matches!(error, Error::OverwrittenPaths { ref collisions }
+                if collisions.len() == 1
+                    && collisions[0]
+                        == PathCollision { path: "tracked".to_owned(), untracked: true }),
+            "expected the untracked collision, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("tracked")).expect("read untracked file"),
+            "untracked\n",
+            "the colliding file must be untouched"
+        );
+        assert_eq!(
+            git_output(&temporary, &["status", "--porcelain"]),
+            "?? tracked\n",
+            "refs must not move when the restore is refused"
+        );
+    }
+
+    /// Verify that a restore refuses to discard unstaged worktree
+    /// modifications on a path the target tree touches.
+    #[test]
+    fn restore_refuses_unstaged_modifications_on_affected_paths() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
+        git(&temporary, &["commit", "-am", "two"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        // Even an index entry matching the target loses the worktree change:
+        // read-tree --reset -u rewrites the file, so the path must block.
+        git(&temporary, &["checkout", "--", "tracked"]);
+        std::fs::write(temporary.root.join("tracked"), b"local edit\n")
+            .expect("modify tracked file");
+
+        let error =
+            restore_action(&temporary.repo, initial).expect_err("unstaged change must refuse");
+        assert!(
+            matches!(error, Error::OverwrittenPaths { ref collisions }
+                if collisions.len() == 1
+                    && collisions[0]
+                        == PathCollision { path: "tracked".to_owned(), untracked: false }),
+            "expected the uncommitted change, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("tracked")).expect("read tracked file"),
+            "local edit\n"
+        );
+    }
+
+    /// Verify that a restore refuses to discard staged changes on a path the
+    /// target tree would change.
+    #[test]
+    fn restore_refuses_staged_changes_on_affected_paths() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
+        git(&temporary, &["commit", "-am", "two"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        std::fs::write(temporary.root.join("tracked"), b"staged\n").expect("stage change");
+        git(&temporary, &["add", "tracked"]);
+
+        let error =
+            restore_action(&temporary.repo, initial).expect_err("staged change must refuse");
+        assert!(matches!(error, Error::OverwrittenPaths { .. }));
+        assert_eq!(
+            git_output(&temporary, &["diff", "--cached", "--name-only"]),
+            "tracked\n",
+            "the staged change must survive the refused restore"
+        );
+    }
+
+    /// Verify that a restore refuses when the target deletes a file carrying
+    /// uncommitted changes.
+    #[test]
+    fn restore_refuses_when_target_deletes_a_dirty_file() {
+        let temporary = TemporaryRepository::new();
+        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
+        git(&temporary, &["add", "tracked"]);
+        git(&temporary, &["commit", "-m", "one"]);
+        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
+        std::fs::write(temporary.root.join("victim"), b"victim\n").expect("write victim file");
+        git(&temporary, &["add", "victim"]);
+        git(&temporary, &["commit", "-m", "add victim"]);
+        append(&temporary.repo, "current snapshot").expect("append current snapshot");
+
+        std::fs::write(temporary.root.join("victim"), b"dirty\n").expect("modify victim file");
+
+        let error =
+            restore_action(&temporary.repo, initial).expect_err("dirty deletion must refuse");
+        assert!(
+            matches!(error, Error::OverwrittenPaths { ref collisions }
+                if collisions.len() == 1
+                    && collisions[0]
+                        == PathCollision { path: "victim".to_owned(), untracked: false }),
+            "expected the victim path, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.root.join("victim")).expect("read victim file"),
+            "dirty\n"
         );
     }
 

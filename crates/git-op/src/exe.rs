@@ -27,6 +27,10 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Reject writes while the worktree is dirty.
+///
+/// Installing from a dirty worktree is refused so the hook reflects a
+/// deliberate repository state rather than one mid-change.
 fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>> {
     let Some(workdir) = repo.workdir() else {
         return Ok(());
@@ -141,7 +145,6 @@ fn restore_command(
         println!("Would restore to operation {}", short(&oid));
         return Ok(());
     }
-    ensure_clean(&repo)?;
     let result = git_op::restore_action(&repo, oid)?;
     print_action_result("Restored to operation", &result);
     Ok(())
@@ -178,7 +181,6 @@ fn undo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Would undo operation {}", short(&plan.target));
         return Ok(());
     }
-    ensure_clean(&repo)?;
     let result = git_op::undo_action(&repo)?;
     print_action_result("Undid operation", &result);
     Ok(())
@@ -191,7 +193,6 @@ fn redo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Would redo operation {}", short(&plan.target));
         return Ok(());
     }
-    ensure_clean(&repo)?;
     let result = git_op::redo_action(&repo)?;
     print_action_result("Redid operation", &result);
     Ok(())
