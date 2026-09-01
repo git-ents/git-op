@@ -580,19 +580,33 @@ pub struct SnapResult {
     pub appended: bool,
 }
 
+/// The outcome of a [`snap`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapOutcome {
+    /// The repository state was recorded, or the log already reflected it.
+    Recorded(SnapResult),
+    /// HEAD is detached, so nothing was recorded: normal ref writes carry no
+    /// branch context worth logging.
+    Detached,
+}
+
 /// Record repository state that is not yet on the operation log onto
 /// [`OP_REF`], with a generated commit message summarizing the changes.
 ///
-/// A no-op when the operation log already reflects the repository state. The
-/// returned [`SnapResult`] reports whether this call appended anything, so
-/// callers never have to infer it from the ref value.
-pub fn snap(repo: &gix::Repository) -> Result<SnapResult, Error> {
+/// A no-op when the operation log already reflects the repository state, and
+/// a silent no-op when HEAD is detached. The returned [`SnapOutcome`] reports
+/// whether this call appended anything, so callers never have to infer it
+/// from the ref value.
+pub fn snap(repo: &gix::Repository) -> Result<SnapOutcome, Error> {
+    if repo.head_name().map_err(Error::git)?.is_none() {
+        return Ok(SnapOutcome::Detached);
+    }
     let (operation, appended) =
         append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
-    Ok(SnapResult {
+    Ok(SnapOutcome::Recorded(SnapResult {
         operation,
         appended,
-    })
+    }))
 }
 
 fn append_internal(
@@ -1897,7 +1911,9 @@ pub fn reference_transaction(
                     .map_err(Error::git)?
                     .is_none()
             {
-                append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
+                // A detached HEAD records nothing; deletion handling above
+                // still applies to detached repositories.
+                snap(repo)?;
             }
             Ok(())
         }
@@ -2522,6 +2538,9 @@ mod tests {
             .expect("publish parent snapshot");
 
         let snapped = snap(&temporary.repo).expect("snap on a current repository");
+        let SnapOutcome::Recorded(snapped) = snapped else {
+            panic!("snap on a branch records or finds the current state");
+        };
         assert!(!snapped.appended);
         assert_eq!(snapped.operation, parent);
     }
@@ -2697,9 +2716,17 @@ mod tests {
     #[test]
     fn snap_is_noop_when_log_is_current() {
         let temporary = TemporaryRepository::new();
-        let initial = snap(&temporary.repo).expect("append initial snapshot");
+        let SnapOutcome::Recorded(initial) =
+            snap(&temporary.repo).expect("append initial snapshot")
+        else {
+            panic!("first snap on a branch records the initial snapshot");
+        };
         assert!(initial.appended, "first snap appends the initial snapshot");
-        let snapped = snap(&temporary.repo).expect("snap up-to-date repository");
+        let SnapOutcome::Recorded(snapped) =
+            snap(&temporary.repo).expect("snap up-to-date repository")
+        else {
+            panic!("snap on a branch records or finds the current state");
+        };
         assert!(!snapped.appended, "second snap finds the log current");
         assert_eq!(snapped.operation, initial.operation);
         assert_eq!(
@@ -2718,17 +2745,21 @@ mod tests {
     #[test]
     fn snap_records_metadata_drift() {
         let temporary = TemporaryRepository::new();
-        let initial = snap(&temporary.repo)
-            .expect("append initial snapshot")
-            .operation;
+        let SnapOutcome::Recorded(initial) =
+            snap(&temporary.repo).expect("append initial snapshot")
+        else {
+            panic!("snap on a branch records the initial snapshot");
+        };
+        let initial = initial.operation;
         fs::write(
             temporary.repo.common_dir().join("description"),
             b"drifted description\n",
         )
         .expect("write description");
-        let snapped = snap(&temporary.repo)
-            .expect("snap drifted repository")
-            .operation;
+        let snapped = match snap(&temporary.repo).expect("snap drifted repository") {
+            SnapOutcome::Recorded(snapped) => snapped.operation,
+            SnapOutcome::Detached => panic!("snap on a branch records the drifted state"),
+        };
         assert_ne!(snapped, initial);
         let changed = changes(&temporary.repo, snapped)
             .expect("compute changes")
@@ -2894,6 +2925,83 @@ mod tests {
                 .try_find_reference(OP_REF)
                 .expect("look up operation ref")
                 .is_some()
+        );
+    }
+
+    /// Verify that a detached HEAD records nothing: normal ref writes carry no
+    /// branch context, so neither the hook nor a manual snap captures one.
+    #[test]
+    fn snap_skips_detached_head() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        git(&temporary, &["checkout", "--detach"]);
+
+        let snapped = snap(&temporary.repo).expect("snap detached repository");
+        assert_eq!(snapped, SnapOutcome::Detached);
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none(),
+            "a detached HEAD must not start an operation log"
+        );
+    }
+
+    /// Verify that a committed transaction on a detached HEAD records nothing.
+    #[test]
+    fn hook_skips_detached_head() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        git(&temporary, &["checkout", "--detach"]);
+
+        reference_transaction(
+            &temporary.repo,
+            ReferenceTransactionPhase::Committed,
+            b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
+        )
+        .expect("process committed transaction on a detached head");
+
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none(),
+            "a detached HEAD must not start an operation log"
+        );
+    }
+
+    /// Verify that deleting the operation log still uninstalls on a detached
+    /// HEAD, and that no snapshot is captured either way.
+    #[test]
+    fn op_ref_deletion_uninstalls_on_detached_head() {
+        let temporary = TemporaryRepository::new();
+        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
+        git(&temporary, &["checkout", "--detach"]);
+        install_local(&temporary.repo).expect("install hook");
+
+        reference_transaction(
+            &temporary.repo,
+            ReferenceTransactionPhase::Committed,
+            format!("{ZERO_OID} {ZERO_OID} {OP_REF}\n").as_bytes(),
+        )
+        .expect("process deletion transaction on a detached head");
+
+        assert!(
+            !temporary
+                .repo
+                .git_dir()
+                .join("hooks/reference-transaction")
+                .exists(),
+            "deletion handling takes precedence over the detached no-op"
+        );
+        assert!(
+            temporary
+                .repo
+                .try_find_reference(OP_REF)
+                .expect("look up operation ref")
+                .is_none()
         );
     }
 

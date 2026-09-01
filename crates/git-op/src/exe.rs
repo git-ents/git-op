@@ -99,16 +99,24 @@ fn uninstall(local: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Record any repository state not yet on the operation log, reporting whether
-/// this invocation appended a snapshot.
+/// Record any repository state not yet on the operation log, reporting the
+/// outcome of the request.
 fn snap_command() -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
-    let snapped = git_op::snap(&repo)?;
-    println!("{}", snap_summary(&snapped));
+    println!("{}", snap_outcome_summary(&git_op::snap(&repo)?));
     Ok(())
 }
 
 /// Describe a snap outcome, attributing a snapshot to this invocation only
+/// when this call actually appended it.
+fn snap_outcome_summary(outcome: &git_op::SnapOutcome) -> String {
+    match outcome {
+        git_op::SnapOutcome::Recorded(snapped) => snap_summary(snapped),
+        git_op::SnapOutcome::Detached => "HEAD is detached; no snapshot recorded".to_owned(),
+    }
+}
+
+/// Describe a recorded snap, attributing a snapshot to this invocation only
 /// when this call actually appended it.
 fn snap_summary(snapped: &git_op::SnapResult) -> String {
     if snapped.appended {
@@ -240,7 +248,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{action_summary, ensure_clean, snap_summary};
+    use super::{action_summary, ensure_clean, snap_outcome_summary, snap_summary};
 
     fn repository() -> (gix::Repository, std::path::PathBuf) {
         let unique = SystemTime::now()
@@ -327,6 +335,24 @@ mod tests {
         assert_eq!(
             snap_outcome_summary(&recorded),
             "Operation log is current (1111111)"
+        );
+    }
+
+    /// Verify that a detached HEAD reports an informational no-op.
+    #[test]
+    fn snap_outcome_reports_detached_head() {
+        assert_eq!(
+            snap_outcome_summary(&git_op::SnapOutcome::Detached),
+            "HEAD is detached; no snapshot recorded"
+        );
+        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult {
+            operation: gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+                .expect("parse object ID"),
+            appended: false,
+        });
+        assert_eq!(
+            snap_outcome_summary(&recorded),
+            "Operation log is current (111111111111)"
         );
     }
 
