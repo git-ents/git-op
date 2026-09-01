@@ -146,7 +146,10 @@ fn restore_command(
         return Ok(());
     }
     let result = git_op::restore_action(&repo, oid)?;
-    print_action_result("Restored to operation", &result);
+    print_action_result(
+        &action_header("Restored to operation", &result.target, None),
+        &result,
+    );
     Ok(())
 }
 
@@ -178,11 +181,18 @@ fn undo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repository()?;
     let plan = git_op::plan_undo(&repo)?;
     if dry_run {
-        println!("Would undo operation {}", short(&plan.target));
+        println!(
+            "Would undo operation {} (restoring {})",
+            short(&plan.target),
+            short(&plan.restored)
+        );
         return Ok(());
     }
     let result = git_op::undo_action(&repo)?;
-    print_action_result("Undid operation", &result);
+    print_action_result(
+        &action_header("Undid operation", &result.target, Some(&result.restored)),
+        &result,
+    );
     Ok(())
 }
 
@@ -194,16 +204,29 @@ fn redo_command(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let result = git_op::redo_action(&repo)?;
-    print_action_result("Redid operation", &result);
+    print_action_result(
+        &action_header("Redid operation", &result.target, None),
+        &result,
+    );
     Ok(())
 }
 
-fn print_action_result(prefix: &str, result: &git_op::ActionResult) {
-    println!("{}", action_summary(prefix, result));
+fn print_action_result(header: &str, result: &git_op::ActionResult) {
+    println!("{}", action_summary(header, result));
 }
 
-fn action_summary(prefix: &str, result: &git_op::ActionResult) -> String {
-    let mut summary = format!("{prefix} {}", short(&result.restored));
+/// Compose the header describing an action's outcome, leading with the
+/// operation the action acted on so dry-run and real-run agree, and naming
+/// the snapshot the repository was left at when the two differ.
+fn action_header(verb: &str, target: &gix::ObjectId, restored: Option<&gix::ObjectId>) -> String {
+    match restored {
+        Some(restored) => format!("{verb} {} (restored {})", short(target), short(restored)),
+        None => format!("{verb} {}", short(target)),
+    }
+}
+
+fn action_summary(header: &str, result: &git_op::ActionResult) -> String {
+    let mut summary = header.to_owned();
     if !result.changed {
         summary.push_str("; no updates");
         return summary;
@@ -249,14 +272,22 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{action_summary, ensure_clean, snap_outcome_summary, snap_summary};
-
+    use super::{action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary};
     fn repository() -> (gix::Repository, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Nanoseconds alone can collide between tests that start in the same
+        // clock tick, and sharing a directory would flake the tests.
+        static NEXT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("git-op-exe-{}-{unique}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "git-op-exe-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
         let repo = gix::init(&path).expect("initialize repository");
         (repo, path)
     }
@@ -269,7 +300,7 @@ mod tests {
             .expect("parse new object ID");
         let result = git_op::ActionResult {
             operation: old,
-            target: old,
+            target: new,
             restored: new,
             changes: vec![git_op::Changes::Refs(vec![git_op::RefChange {
                 name: "refs/heads/main".to_owned(),
@@ -281,11 +312,17 @@ mod tests {
             changed: true,
         };
         assert_eq!(
-            action_summary("Restored to operation", &result),
+            action_summary(
+                &action_header("Restored to operation", &result.target, None),
+                &result
+            ),
             "Restored to operation 2222222\nrefs/heads/main -> 2222222"
         );
+        assert_eq!(
+            action_header("Undid operation", &old, Some(&new)),
+            "Undid operation 1111111 (restored 2222222)"
+        );
     }
-
     #[test]
     fn action_summary_reports_noop() {
         let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
@@ -298,7 +335,10 @@ mod tests {
             changed: false,
         };
         assert_eq!(
-            action_summary("Restored to operation", &result),
+            action_summary(
+                &action_header("Restored to operation", &result.target, None),
+                &result
+            ),
             "Restored to operation 1111111; no updates"
         );
     }
