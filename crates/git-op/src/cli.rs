@@ -79,6 +79,11 @@ pub(crate) enum Command {
         #[arg(short = 'n', long)]
         dry_run: bool,
     },
+    /// Decode one operation-log entry.
+    Show {
+        /// The operation commit to decode, defaulting to the log tip.
+        oid: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -144,6 +149,20 @@ mod tests {
         };
         assert_eq!(oid.as_deref(), Some("abc123"));
         assert!(dry_run);
+    }
+
+    #[test]
+    fn show_takes_an_optional_operation() {
+        let cli = Cli::try_parse_from(["git-op", "show"]).expect("parse show");
+        let Command::Show { oid } = cli.command else {
+            panic!("expected the show command");
+        };
+        assert_eq!(oid, None);
+        let cli = Cli::try_parse_from(["git-op", "show", "abc123"]).expect("parse show with oid");
+        let Command::Show { oid } = cli.command else {
+            panic!("expected the show command");
+        };
+        assert_eq!(oid.as_deref(), Some("abc123"));
     }
 
     #[test]

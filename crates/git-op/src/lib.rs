@@ -1548,6 +1548,34 @@ fn next_redo_target(
         .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)))
 }
 
+/// The first parent of an operation snapshot, or `None` for the initial one.
+pub fn parent_operation(
+    repo: &gix::Repository,
+    commit: ObjectId,
+) -> Result<Option<ObjectId>, Error> {
+    parent_snapshot(repo, commit)
+}
+
+/// Every ref a snapshot captured, each as a `Created` change.
+///
+/// The initial snapshot has no parent to diff against, so its captured refs
+/// are reported as creations.
+pub fn captured_refs(repo: &gix::Repository, commit: ObjectId) -> Result<Vec<RefChange>, Error> {
+    let state = read(repo, commit)?;
+    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+    updates
+        .into_iter()
+        .map(|(name, contents)| {
+            Ok(RefChange {
+                name,
+                kind: RefChangeKind::Created(parse_ref_contents(&contents)?),
+            })
+        })
+        .collect()
+}
+
 /// Resolve an operation commit specification using Git's revision parser.
 ///
 /// This accepts full and abbreviated object IDs, as well as any commit
