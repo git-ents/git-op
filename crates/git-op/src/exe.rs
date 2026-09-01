@@ -11,6 +11,7 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
         Command::Install { local } => install(local),
+        Command::Uninstall { local } => uninstall(local),
         Command::Snap => snap_command(),
         Command::Log {
             max_count,
@@ -83,6 +84,17 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
             ensure_clean(&repo)?;
         }
         git_op::install_global()?;
+    }
+    Ok(())
+}
+
+/// Remove the hook from the current repository or Git's global template.
+fn uninstall(local: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if local {
+        let repo = open_repository()?;
+        git_op::uninstall_local(&repo)?;
+    } else {
+        git_op::uninstall_global()?;
     }
     Ok(())
 }

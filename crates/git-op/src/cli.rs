@@ -30,6 +30,12 @@ pub(crate) enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Remove the reference-transaction hook globally or from one repository.
+    Uninstall {
+        /// Uninstall only from the current repository instead of Git's global template.
+        #[arg(long)]
+        local: bool,
+    },
     /// Record the current repository state onto the operation log.
     Snap,
     /// Show the recorded operation-log snapshots, most recent first.
@@ -103,6 +109,21 @@ mod tests {
         };
         assert!(dry_run);
         assert!(Cli::try_parse_from(["git-op", "undo", "abc123"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_takes_an_optional_local_flag() {
+        let cli = Cli::try_parse_from(["git-op", "uninstall"]).expect("parse uninstall");
+        let Command::Uninstall { local } = cli.command else {
+            panic!("expected the uninstall command");
+        };
+        assert!(!local);
+        let cli = Cli::try_parse_from(["git-op", "uninstall", "--local"])
+            .expect("parse uninstall --local");
+        let Command::Uninstall { local } = cli.command else {
+            panic!("expected the uninstall --local command");
+        };
+        assert!(local);
     }
 
     #[test]
