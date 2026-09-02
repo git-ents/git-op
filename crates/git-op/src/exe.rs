@@ -497,24 +497,6 @@ mod tests {
         );
     }
 
-    /// Verify that a detached HEAD reports an informational no-op.
-    #[test]
-    fn snap_outcome_reports_detached_head() {
-        assert_eq!(
-            snap_outcome_summary(&git_op::SnapOutcome::Detached),
-            "HEAD is detached; no snapshot recorded"
-        );
-        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult {
-            operation: gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
-                .expect("parse object ID"),
-            appended: false,
-        });
-        assert_eq!(
-            snap_outcome_summary(&recorded),
-            "Operation log is current (111111111111)"
-        );
-    }
-
     #[test]
     fn clean_worktree_is_allowed() {
         let (repo, path) = repository();

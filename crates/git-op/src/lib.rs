@@ -2875,7 +2875,7 @@ mod tests {
         std::fs::remove_file(&loose).expect("remove loose commit object");
 
         match restore_action(&temporary.repo, snapshot) {
-            Err(Error::PrunedReferent { ref_name, oid }) => {
+            Err(Error::PrunedObject { ref_name, oid }) => {
                 assert_eq!(ref_name, "refs/heads/main");
                 assert_eq!(oid, missing);
             }
@@ -2907,7 +2907,7 @@ mod tests {
         let moved = temporary.repo.head_id().expect("read moved HEAD").detach();
 
         match restore_action(&temporary.repo, snapshot) {
-            Err(Error::UnusableReferent { ref_name, oid }) => {
+            Err(Error::UnusableObject { ref_name, oid }) => {
                 assert_eq!(ref_name, "refs/heads/broken");
                 assert_eq!(oid.to_string(), blob);
             }
