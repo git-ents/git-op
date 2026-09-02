@@ -487,6 +487,7 @@ dependencies = [
  "facet-git-tree",
  "gix",
  "gix-refstore",
+ "tempfile",
  "thiserror",
 ]
 

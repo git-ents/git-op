@@ -727,42 +727,20 @@ mod tests {
         );
     }
 
-    /// Create a unique temporary directory and remove it when the returned
-    /// guard drops.
-    struct TemporaryDir {
-        path: PathBuf,
-    }
-
-    impl TemporaryDir {
-        fn new(label: &str) -> Self {
-            let sequence = NEXT_TEMP_HOOKS_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("git-op-{label}-{}-{sequence}", std::process::id()));
-            fs::create_dir(&path).expect("create temporary directory");
-            Self { path }
-        }
-    }
-
-    impl Drop for TemporaryDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
     /// Verify that stock template content fills a template directory without
     /// overwriting files that are already there, and that unrelated files
     /// survive.
     #[test]
     fn copy_absent_populates_missing_files_and_keeps_existing_ones() {
-        let root = TemporaryDir::new("copy-absent");
-        let stock = root.path.join("stock");
+        let root = tempfile::TempDir::new().expect("create temporary directory");
+        let stock = root.path().join("stock");
         fs::create_dir_all(stock.join("hooks")).expect("create stock hooks");
         fs::create_dir_all(stock.join("info")).expect("create stock info");
         fs::write(stock.join("description"), b"stock description\n").expect("write description");
         fs::write(stock.join("info/exclude"), b"stock exclude\n").expect("write exclude");
         fs::write(stock.join("hooks/pre-commit.sample"), b"sample").expect("write sample");
 
-        let template = root.path.join("template");
+        let template = root.path().join("template");
         fs::create_dir_all(template.join("hooks")).expect("create template hooks");
         fs::write(template.join("description"), b"custom description\n")
             .expect("write custom description");
@@ -801,10 +779,10 @@ mod tests {
     /// and that the appended `[include]` block makes it effective exactly once.
     #[test]
     fn include_block_activates_the_op_template_directory() {
-        let root = TemporaryDir::new("include");
-        let template = root.path.join("git/templates");
-        let op_config = root.path.join("git/op-config");
-        let config = root.path.join("gitconfig");
+        let root = tempfile::TempDir::new().expect("create temporary directory");
+        let template = root.path().join("git/templates");
+        let op_config = root.path().join("git/op-config");
+        let config = root.path().join("gitconfig");
 
         write_op_config(&op_config, &template).expect("write op config");
         let configured: String = String::from_utf8(
