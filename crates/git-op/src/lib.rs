@@ -1434,19 +1434,12 @@ fn apply_action_with_trailers(
         return Err(Error::InvalidOperationRef);
     };
     let current_entries = SnapshotEntries::from_state(&current);
-    let mut changes = Vec::new();
-    if current_entries.r#refs != target_entries.r#refs {
-        changes.push(Changes::Refs(ref_changes_between(
-            repo,
-            current_entries.r#refs,
-            target_entries.r#refs,
-        )?));
-    }
-    if current_entries.config != target_entries.config {
-        changes.push(Changes::Config);
-    }
-    if current_entries.description != target_entries.description {
-        changes.push(Changes::Description);
+    let mut changes = current_entries.diff(&target_entries);
+    if let Some(Changes::Refs(refs)) = changes
+        .iter_mut()
+        .find(|change| matches!(change, Changes::Refs(_)))
+    {
+        *refs = ref_changes_between(repo, current_entries.r#refs, target_entries.r#refs)?;
     }
     let state = read(repo, plan.restored)?;
     verify_snapshot_objects(repo, &state)?;
