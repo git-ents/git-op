@@ -18,7 +18,7 @@ const HOOK_NAME: &str = "reference-transaction";
 /// phase so ordinary transactions stay quiet.
 macro_rules! hook_line {
     () => {
-        "command -v git-op >/dev/null 2>&1 || { [ \"$1\" = committed ] && printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found, so this operation was not recorded. If you no longer wish for operations to be logged, run: git op uninstall --local, or delete the following file.\" \"$0\"; exit 0; }; git-op reference-transaction \"$@\"\n"
+        "command -v git-op >/dev/null 2>&1 || { [ \"$1\" = committed ] && printf >&2 \"\\n%s\\n\\n    %s\\n\" \"This repository has an operation log enabled via Git Op, but the 'git-op' executable could not be found, so this operation was not recorded. If you no longer wish for operations to be logged, run: git-op uninstall, or delete the following file.\" \"$0\"; exit 0; }; git-op reference-transaction \"$@\"\n"
     };
 }
 
@@ -58,37 +58,33 @@ pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
 /// Install the hook in Git's configured global template directory.
 ///
 /// When `init.templateDir` is already configured, the hook is installed there
-/// and the directory gains any stock template files it is missing, so
-/// repositories initialized from it keep the files a default `git init`
-/// provides. Otherwise git-op claims a default template directory by writing
+/// and nothing else is touched: the directory belongs to its configuration,
+/// so git-op neither adds nor later removes files it did not write.
+/// Otherwise git-op claims a default template directory by writing
 /// `init.templateDir` into its own global config file and referencing that
 /// file from an `[include]` block appended to the global configuration;
-/// existing settings are never rewritten. The global configuration and
-/// template directory are process-wide, so prefer
+/// existing settings are never rewritten. A claimed directory gains any
+/// stock template files it is missing, so repositories initialized from it
+/// keep the files a default `git init` provides. The global configuration
+/// and template directory are process-wide, so prefer
 /// [`install_local`](crate::install_local) when isolation matters.
 pub fn install_global() -> Result<(), Error> {
-    let template = resolve_global_template()?;
-    seed_stock_templates(&template)?;
-    install_hook(template.join("hooks"))
+    match git_config_global_template()? {
+        Some(template) => install_hook(template.join("hooks")),
+        None => {
+            let config_home = config_home()?;
+            let template = default_template_dir(&config_home);
+            let op_config = config_home.join("git").join(OP_CONFIG_NAME);
+            write_op_config(&op_config, &template)?;
+            ensure_include(&["--global"], &op_config)?;
+            seed_stock_templates(&template)?;
+            install_hook(template.join("hooks"))
+        }
+    }
 }
 
 /// Resolve the global template directory, claiming a default one through an
 /// `[include]`d git-op config when Git has none configured.
-///
-/// This is intentionally private because resolving or initializing the global
-/// template path is an implementation detail of [`install_global`].
-fn resolve_global_template() -> Result<PathBuf, Error> {
-    if let Some(template) = git_config_global_template()? {
-        return Ok(template);
-    }
-
-    let template = default_template_dir(&config_home()?);
-    let op_config = config_home()?.join("git").join(OP_CONFIG_NAME);
-    write_op_config(&op_config, &template)?;
-    ensure_include(&["--global"], &op_config)?;
-    Ok(template)
-}
-
 /// The default global template directory git-op claims when Git has none.
 fn default_template_dir(config_home: &Path) -> PathBuf {
     config_home.join("git/templates")
@@ -206,10 +202,14 @@ fn copy_absent(source: &Path, target: &Path) -> Result<(), Error> {
 
 /// The XDG config home, or an error when neither it nor HOME is set.
 fn config_home() -> Result<PathBuf, Error> {
+    config_home_optional().ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))
+}
+
+/// The XDG config home, or `None` when neither it nor HOME is set.
+fn config_home_optional() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .ok_or_else(|| Error::message("neither XDG_CONFIG_HOME nor HOME is set"))
 }
 
 /// Remove the `reference-transaction` hook from this repository.
@@ -226,24 +226,51 @@ pub fn uninstall_local(repo: &gix::Repository) -> Result<(), Error> {
 /// Remove the hook from Git's global template directory and every template
 /// directory, config file, and `[include]` entry git-op installed.
 ///
-/// A user-configured template directory keeps everything except git-op's own
-/// hook. The default template directory git-op claims is removed only when
-/// nothing outside git-op's and Git's stock files is present. The global
+/// A template directory the user configured keeps everything except
+/// git-op's own hook, even when its path matches the default one git-op
+/// would claim, so the user's `init.templateDir` setting never dangles. The
+/// default template directory git-op claimed is removed only when nothing
+/// outside git-op's and Git's stock files is present. The global
 /// configuration loses only the include entry referencing git-op's config
 /// file. The global configuration and template directory are process-wide,
 /// so prefer [`uninstall_local`](crate::uninstall_local) when isolation
 /// matters.
 pub fn uninstall_global() -> Result<(), Error> {
-    let configured = git_config_global_template()?;
-    let default = default_template_dir(&config_home()?);
-    match configured.as_deref() {
-        Some(template) => uninstall_hook(&template.join("hooks"))?,
-        None => uninstall_hook(&default.join("hooks"))?,
+    if let Some(template) = git_config_global_template()? {
+        uninstall_hook(&template.join("hooks"))?;
     }
-    if configured.is_none() || configured.as_deref() == Some(default.as_path()) {
-        remove_unmodified_template(&default)?;
+    // Ownership is tracked by git-op's own config file, so a directory the
+    // user configured is never mistaken for a claimed one. Without a config
+    // home nothing can have been claimed, so its absence stops here rather
+    // than failing the whole uninstall.
+    if let Some(config_home) = config_home_optional() {
+        if let Some(claimed) = claimed_template(&config_home)? {
+            uninstall_hook(&claimed.join("hooks"))?;
+            remove_unmodified_template(&claimed)?;
+        }
+        remove_global_claim(&config_home)?;
     }
-    remove_global_claim()
+    Ok(())
+}
+
+/// The template directory git-op's own config file claims, if it exists.
+fn claimed_template(config_home: &Path) -> Result<Option<PathBuf>, Error> {
+    let op_config = config_home.join("git").join(OP_CONFIG_NAME);
+    if !op_config.is_file() {
+        return Ok(None);
+    }
+    let output = Command::new("git")
+        .args(["config", "--file"])
+        .arg(&op_config)
+        .args(["--get", "init.templateDir"])
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    )))
 }
 
 /// Remove git-op's hook from `hooks`, leaving anything else untouched.
@@ -339,8 +366,8 @@ fn template_is_unmodified(template: &Path) -> bool {
 ///
 /// The include entry is unset first so Git never observes a dangling include.
 /// Exit status 5 means no matching entry remains, which is the desired state.
-fn remove_global_claim() -> Result<(), Error> {
-    let op_config = config_home()?.join("git").join(OP_CONFIG_NAME);
+fn remove_global_claim(config_home: &Path) -> Result<(), Error> {
+    let op_config = config_home.join("git").join(OP_CONFIG_NAME);
     let status = Command::new("git")
         .args([
             "config",
@@ -722,7 +749,7 @@ mod tests {
             "committed phase should warn: {stderr}"
         );
         assert!(
-            stderr.contains("git op uninstall --local"),
+            stderr.contains("git-op uninstall"),
             "warning should mention uninstalling: {stderr}"
         );
     }

@@ -10,8 +10,8 @@ use crate::cli::Command;
 pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
-        Command::Install { global } => install(!global),
-        Command::Uninstall { global } => uninstall(!global),
+        Command::Install { global } => install(global),
+        Command::Uninstall { global } => uninstall(global),
         Command::Snap => snap_command(),
         Command::Log {
             max_count,
@@ -79,8 +79,8 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// Install the hook in the current repository or Git's global template.
-fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if local {
+fn install(global: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !global {
         let repo = open_repository()?;
         ensure_clean(&repo)?;
         git_op::install_local(&repo)?;
@@ -96,8 +96,8 @@ fn install(local: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Remove the hook from the current repository or Git's global template.
-fn uninstall(local: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if local {
+fn uninstall(global: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !global {
         let repo = open_repository()?;
         git_op::uninstall_local(&repo)?;
         println!("Uninstalled git-op from this repository");
@@ -116,8 +116,7 @@ fn snap_command() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Describe a snap outcome, attributing a snapshot to this invocation only
-/// when this call actually appended it.
+/// Describe a snap outcome.
 fn snap_outcome_summary(outcome: &git_op::SnapOutcome) -> String {
     match outcome {
         git_op::SnapOutcome::Recorded(snapped) => snap_summary(snapped),
@@ -312,17 +311,21 @@ fn show_metadata_diff(
     if before == after {
         return Ok(());
     }
-    use gix::objs::Write as _;
-    let empty = repo
-        .write_buf(gix::objs::Kind::Blob, b"")
-        .map_err(|error| format!("write empty blob failed: {error}"))?;
+    // The well-known empty blob keeps `show` read-only: writing one into the
+    // object database would make an inspection command mutate the repository.
+    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
     let output = std::process::Command::new("git")
         .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
         .env("GIT_DIR", repo.git_dir())
         .args([
             "diff",
-            &before.unwrap_or(empty).to_string(),
-            &after.unwrap_or(empty).to_string(),
+            &before
+                .map(|oid| oid.to_string())
+                .unwrap_or(EMPTY_BLOB.to_owned()),
+            &after
+                .map(|oid| oid.to_string())
+                .unwrap_or(EMPTY_BLOB.to_owned()),
+            "--",
         ])
         .output()?;
     if !output.status.success() {

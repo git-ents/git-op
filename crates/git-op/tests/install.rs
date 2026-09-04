@@ -73,3 +73,57 @@ fn global_is_opt_in() {
     assert!(!home.path().join(".config/git/op-config").exists());
     assert!(!home.path().join(".config/git/templates").exists());
 }
+
+/// A template directory the user configured belongs to them: git-op installs
+/// its hook there without adding stock files, and uninstall removes only the
+/// hook, never the directory — even when its path matches the default one
+/// git-op would claim.
+#[test]
+fn user_configured_template_directory_is_never_seeded_or_deleted() {
+    let root = TempDir::new().expect("create working directory");
+    let home = TempDir::new().expect("create home");
+    // The user configures exactly the path git-op would claim by default.
+    let templates = home.path().join(".config/git/templates");
+    std::fs::create_dir_all(templates.join("hooks")).expect("create templates");
+    std::fs::write(templates.join("custom"), b"custom\n").expect("write custom file");
+    let set_template = Command::new("git")
+        .args(["config", "--global", "init.templateDir"])
+        .arg(&templates)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("configure template directory");
+    assert!(set_template.success());
+    let hook = templates.join("hooks/reference-transaction");
+
+    run("install --global", root.path(), home.path());
+    assert!(hook.is_file());
+    assert!(
+        !templates.join("description").exists(),
+        "a user-configured template directory must not gain stock files"
+    );
+    assert!(
+        !home.path().join(".config/git/op-config").exists(),
+        "a user-configured template directory must not be claimed"
+    );
+
+    run("uninstall --global", root.path(), home.path());
+    assert!(!hook.exists());
+    assert!(
+        templates.is_dir() && templates.join("custom").is_file(),
+        "a user-configured template directory must survive uninstall"
+    );
+    let still_configured = Command::new("git")
+        .args(["config", "--global", "--get", "init.templateDir"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("read configured template directory");
+    assert!(still_configured.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&still_configured.stdout).trim(),
+        templates.to_str().expect("UTF-8 path")
+    );
+}
