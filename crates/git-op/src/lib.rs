@@ -171,6 +171,12 @@ pub enum Error {
         /// The object ID that cannot back a checkout.
         oid: ObjectId,
     },
+    /// The snapshot would remove a branch checked out in a worktree.
+    #[error("cannot restore: snapshot does not contain checked-out branch {branch}")]
+    CheckedOutBranch {
+        /// The branch that would become unborn if removed.
+        branch: String,
+    },
     /// Restoring would overwrite untracked files or discard uncommitted
     /// changes, so the blocked paths are reported instead.
     #[error("cannot restore: {}", collision_list(.collisions))]
@@ -405,7 +411,7 @@ fn operation_target(repo: &gix::Repository, name: &RefName) -> Result<Option<Obj
     };
     let parent = parent.to_owned();
     repo.find_commit(parent)
-        .map_err(|_| Error::InvalidOperationRef)?;
+        .map_err(|_error| Error::InvalidOperationRef)?;
     Ok(Some(parent))
 }
 
@@ -448,14 +454,23 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
         .all()
         .map_err(Error::git)?
     {
-        let reference = reference.map_err(Error::git)?;
+        let reference = match reference {
+            Ok(reference) => reference,
+            Err(error) if error.to_string().contains("refs/heads/.invalid") => continue,
+            Err(error) => return Err(Error::git(error)),
+        };
         let raw_name = reference.name().as_bstr();
         if !is_captured_ref(raw_name.as_bytes()) {
             continue;
         }
+        if matches!(reference.target(), gix::refs::TargetRef::Symbolic(target)
+            if target.as_bstr().as_bytes().ends_with(b"/.invalid"))
+        {
+            continue;
+        }
         let name = raw_name
             .to_str()
-            .map_err(|_| Error::InvalidRef(raw_name.to_string()))?;
+            .map_err(|_error| Error::InvalidRef(raw_name.to_string()))?;
         ref_values.insert(name.to_owned(), ref_contents(&reference));
     }
 
@@ -606,15 +621,22 @@ pub fn append_with_options(
     append_internal(repo, CommitMessage::Explicit(message), options).map(|(operation, _)| operation)
 }
 
-/// The outcome of [`snap`]: the operation-log tip and who put it there.
+/// The result of recording repository state on the operation log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapResult {
-    /// The operation-log commit that reflects the repository state after the
-    /// call: the newly appended snapshot, or the existing tip for a no-op.
-    pub operation: ObjectId,
-    /// Whether this call appended the snapshot, as opposed to finding the
-    /// log already current.
-    pub appended: bool,
+pub enum SnapResult {
+    /// This call appended the snapshot.
+    Appended(ObjectId),
+    /// The existing operation-log tip already reflected the repository state.
+    Current(ObjectId),
+}
+
+impl SnapResult {
+    /// The operation-log commit reflecting the repository state.
+    pub const fn operation(self) -> ObjectId {
+        match self {
+            Self::Appended(operation) | Self::Current(operation) => operation,
+        }
+    }
 }
 
 /// The outcome of a [`snap`] request.
@@ -640,10 +662,12 @@ pub fn snap(repo: &gix::Repository) -> Result<SnapOutcome, Error> {
     }
     let (operation, appended) =
         append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
-    Ok(SnapOutcome::Recorded(SnapResult {
-        operation,
-        appended,
-    }))
+    let result = if appended {
+        SnapResult::Appended(operation)
+    } else {
+        SnapResult::Current(operation)
+    };
+    Ok(SnapOutcome::Recorded(result))
 }
 
 fn append_internal(
@@ -652,7 +676,7 @@ fn append_internal(
     options: AppendOptions,
 ) -> Result<(ObjectId, bool), Error> {
     let refs = GixRefStore::new(repo);
-    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let name = RefName::new(OP_REF).map_err(|_error| Error::InvalidRef(OP_REF.to_owned()))?;
     let invoked_by = matches!(requested_message, CommitMessage::Generated)
         .then(invocation::detect)
         .flatten();
@@ -687,13 +711,15 @@ fn append_internal(
         let tree = serialize(repo, &state)?;
         let commit_id = write_commit(
             repo,
-            tree,
-            parent,
-            &message,
-            invoked_by.as_ref(),
-            &author,
-            &committer,
-            signing,
+            CommitTreeRequest {
+                tree,
+                parent,
+                message: &message,
+                invoked_by: invoked_by.as_ref(),
+                author: &author,
+                committer: &committer,
+                signing,
+            },
         )?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
@@ -725,36 +751,36 @@ fn trailer_text(value: &str) -> String {
 /// `git commit-tree` is used rather than constructing the commit object
 /// directly so Git's configured signing implementation can add a `gpgsig`
 /// header. It does not invoke commit hooks.
-#[allow(clippy::too_many_arguments)]
-fn write_commit(
-    repo: &gix::Repository,
+struct CommitTreeRequest<'a> {
     tree: ObjectId,
     parent: Option<ObjectId>,
-    message: &str,
-    invoked_by: Option<&InvokedBy>,
-    author: &gix::actor::Signature,
-    committer: &gix::actor::Signature,
+    message: &'a str,
+    invoked_by: Option<&'a InvokedBy>,
+    author: &'a gix::actor::Signature,
+    committer: &'a gix::actor::Signature,
     signing: bool,
-) -> Result<ObjectId, Error> {
+}
+
+fn write_commit(repo: &gix::Repository, commit: CommitTreeRequest<'_>) -> Result<ObjectId, Error> {
     let mut command = Command::new("git");
     command
         .current_dir(repo.current_dir())
         .arg("commit-tree")
-        .arg(tree.to_hex().to_string());
-    if let Some(parent) = parent {
+        .arg(commit.tree.to_hex().to_string());
+    if let Some(parent) = commit.parent {
         command.args(["-p", &parent.to_hex().to_string()]);
     }
-    command.arg("-m").arg(message);
-    if let Some(invoked_by) = invoked_by {
+    command.arg("-m").arg(commit.message);
+    if let Some(invoked_by) = commit.invoked_by {
         command
             .arg("-m")
             .arg(format!("Invoked-by: {}", trailer_text(invoked_by.as_str())));
     }
-    if signing {
+    if commit.signing {
         command.arg("-S");
     }
-    let author = format_signature(author)?;
-    let committer = format_signature(committer)?;
+    let author = format_signature(commit.author)?;
+    let committer = format_signature(commit.committer)?;
     let output = command
         .env("GIT_DIR", repo.git_dir())
         .env("GIT_AUTHOR_NAME", author.name)
@@ -1233,7 +1259,7 @@ fn ref_tree_entries(
         let name = entry
             .filename
             .to_str()
-            .map_err(|_| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
+            .map_err(|_error| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
         let kind = match entry.mode.kind() {
             kind @ (gix::objs::tree::EntryKind::Tree | gix::objs::tree::EntryKind::Blob) => kind,
             kind => {
@@ -1304,9 +1330,9 @@ pub struct ActionResult {
     /// The snapshot that was applied.
     pub restored: ObjectId,
     /// The captured state components changed while applying the snapshot.
+    /// An empty list means the selected state was already current and no log
+    /// entry was appended.
     pub changes: Vec<Changes>,
-    /// Whether the action changed the repository and appended a log entry.
-    pub changed: bool,
 }
 
 /// A state transition that can be displayed without applying it.
@@ -1434,19 +1460,12 @@ fn apply_action_with_trailers(
         return Err(Error::InvalidOperationRef);
     };
     let current_entries = SnapshotEntries::from_state(&current);
-    let mut changes = Vec::new();
-    if current_entries.r#refs != target_entries.r#refs {
-        changes.push(Changes::Refs(ref_changes_between(
-            repo,
-            current_entries.r#refs,
-            target_entries.r#refs,
-        )?));
-    }
-    if current_entries.config != target_entries.config {
-        changes.push(Changes::Config);
-    }
-    if current_entries.description != target_entries.description {
-        changes.push(Changes::Description);
+    let mut changes = current_entries.diff(&target_entries);
+    if let Some(Changes::Refs(refs)) = changes
+        .iter_mut()
+        .find(|change| matches!(change, Changes::Refs(_)))
+    {
+        *refs = ref_changes_between(repo, current_entries.r#refs, target_entries.r#refs)?;
     }
     let state = read(repo, plan.restored)?;
     verify_snapshot_objects(repo, &state)?;
@@ -1456,9 +1475,9 @@ fn apply_action_with_trailers(
             target: plan.target,
             restored: plan.restored,
             changes,
-            changed: false,
         });
     }
+    refuse_checked_out_branch_removal(repo, &state)?;
     ensure_no_local_collisions(repo, &state)?;
     apply_state(repo, &state)?;
     let primary_target = primary_target.unwrap_or(plan.target);
@@ -1475,7 +1494,6 @@ fn apply_action_with_trailers(
         target: plan.target,
         restored: plan.restored,
         changes,
-        changed: true,
     })
 }
 
@@ -1484,7 +1502,7 @@ fn missing_trailer(commit: ObjectId, trailer: &str) -> Error {
 }
 
 fn current_operation(repo: &gix::Repository) -> Result<Option<ObjectId>, Error> {
-    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let name = RefName::new(OP_REF).map_err(|_error| Error::InvalidRef(OP_REF.to_owned()))?;
     operation_target(repo, &name)
 }
 
@@ -1509,7 +1527,10 @@ fn operation_metadata(
         let Ok(action) = Action::try_from(action) else {
             continue;
         };
-        if let Some(target) = parse_operation_id(&value[1..])? {
+        let Some(value) = value.strip_prefix(b":") else {
+            continue;
+        };
+        if let Some(target) = parse_operation_id(value)? {
             actions.push((action, target));
         }
     }
@@ -1531,21 +1552,24 @@ fn next_redo_target(
     redo: ObjectId,
     undone: ObjectId,
 ) -> Result<Option<ObjectId>, Error> {
-    let parent = parent_snapshot(repo, redo)?;
-    let Some(parent) = parent else {
-        return Ok(None);
-    };
-    let metadata = operation_metadata(repo, parent)?;
-    if !metadata.actions.contains(&(Action::Undo, undone)) {
-        return Ok(None);
+    // Redo operations form a chain above the original undo operations. Walk
+    // through that chain until finding the undo that produced `undone`; its
+    // parent identifies the next older state to reapply.
+    let mut operation = parent_snapshot(repo, redo)?;
+    while let Some(commit) = operation {
+        let metadata = operation_metadata(repo, commit)?;
+        if metadata.actions.contains(&(Action::Undo, undone)) {
+            let Some(previous_undo) = parent_snapshot(repo, commit)? else {
+                return Ok(None);
+            };
+            return Ok(operation_metadata(repo, previous_undo)?
+                .actions
+                .iter()
+                .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)));
+        }
+        operation = parent_snapshot(repo, commit)?;
     }
-    let Some(previous_undo) = parent_snapshot(repo, parent)? else {
-        return Ok(None);
-    };
-    Ok(operation_metadata(repo, previous_undo)?
-        .actions
-        .iter()
-        .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)))
+    Ok(None)
 }
 
 /// The first parent of an operation snapshot, or `None` for the initial one.
@@ -1604,7 +1628,7 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
     .map_err(|error| {
         Error::InvalidSnapshot(format!("Git returned an invalid operation ID: {error}"))
     })?;
-    read(repo, oid).map_err(|_| {
+    read(repo, oid).map_err(|_error| {
         Error::InvalidSnapshot(format!("{specification:?} is not an operation snapshot"))
     })?;
     Ok(oid)
@@ -1639,16 +1663,15 @@ fn verify_object(repo: &gix::Repository, ref_name: &str, oid: ObjectId) -> Resul
     if !ref_name.starts_with("refs/heads/") {
         return Ok(());
     }
-    let commit =
-        object
-            .peel_to_kind(gix::objs::Kind::Commit)
-            .map_err(|_| Error::UnusableObject {
-                ref_name: ref_name.to_owned(),
-                oid,
-            })?;
+    let commit = object
+        .peel_to_kind(gix::objs::Kind::Commit)
+        .map_err(|_error| Error::UnusableObject {
+            ref_name: ref_name.to_owned(),
+            oid,
+        })?;
     commit
         .peel_to_kind(gix::objs::Kind::Tree)
-        .map_err(|_| Error::UnusableObject {
+        .map_err(|_error| Error::UnusableObject {
             ref_name: ref_name.to_owned(),
             oid,
         })?;
@@ -1693,7 +1716,7 @@ fn set_head(repo: &gix::Repository, head: Target) -> Result<(), Error> {
     let Target::Symbolic(branch) = head else {
         return Ok(());
     };
-    let head = FullName::try_from("HEAD").expect("HEAD is a valid full ref name");
+    let head = FullName::try_from("HEAD").map_err(Error::git)?;
     repo.edit_reference(GixRefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1785,6 +1808,39 @@ fn snapshot_worktree_tree(
     }
 }
 
+/// Refuse to remove the branch currently checked out by this worktree.
+fn refuse_checked_out_branch_removal(
+    repo: &gix::Repository,
+    state: &RepositoryState,
+) -> Result<(), Error> {
+    let output = Command::new("git")
+        .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
+        .env("GIT_DIR", repo.git_dir())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Err(Error::message(format!(
+            "git worktree list failed with {}",
+            output.status
+        )));
+    }
+    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Some(branch) = line.strip_prefix(b"branch ") else {
+            continue;
+        };
+        if updates.iter().all(|(name, _)| name.as_bytes() != branch) {
+            return Err(Error::CheckedOutBranch {
+                branch: String::from_utf8_lossy(branch).into_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Refuse to apply `state` when the reset would overwrite untracked files or
 /// discard uncommitted changes, matching `git checkout`'s protection.
 ///
@@ -1846,8 +1902,8 @@ fn ensure_no_local_collisions(
 fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     let mut current = path;
     std::iter::from_fn(move || {
-        let index = current.rfind('/')?;
-        current = &current[..index];
+        let (parent, _) = current.rsplit_once('/')?;
+        current = parent;
         Some(current)
     })
 }
@@ -1939,19 +1995,29 @@ fn status_paths(workdir: &Path) -> Result<WorktreeStatus, Error> {
         .split(|&byte| byte == 0)
         .filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
-        let (statuses, path) = record.split_at(2);
-        let path = String::from_utf8_lossy(&path[1..]).into_owned();
-        if statuses[0] == b'?' && statuses[1] == b'?' {
+        let Some((&index_status, record)) = record.split_first() else {
+            return Err(Error::message("git status returned an empty record"));
+        };
+        let Some((&worktree_status, path)) = record.split_first() else {
+            return Err(Error::message("git status returned a truncated record"));
+        };
+        let Some(path) = path.strip_prefix(b" ") else {
+            return Err(Error::message("git status returned a malformed record"));
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        if (index_status, worktree_status) == (b'?', b'?') {
             status.untracked.insert(path);
             continue;
         }
-        if statuses[0] != b' ' {
+        if index_status != b' ' {
             status.staged.insert(path.clone());
         }
-        if statuses[1] != b' ' && statuses[1] != b'D' {
+        if worktree_status != b' ' && worktree_status != b'D' {
             status.worktree_modified.insert(path.clone());
         }
-        if statuses.contains(&b'R') || statuses.contains(&b'C') {
+        if [index_status, worktree_status].contains(&b'R')
+            || [index_status, worktree_status].contains(&b'C')
+        {
             // Rename records carry the original path as a second field.
             if let Some(original) = records.next() {
                 status
@@ -1971,7 +2037,7 @@ fn collect_ref_updates(
     updates: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<(), Error> {
     for entry in tree.decode().map_err(Error::git)?.entries {
-        let name = entry.filename.to_str().map_err(|_| {
+        let name = entry.filename.to_str().map_err(|_error| {
             Error::InvalidSnapshot(format!("non-UTF-8 reference path under {prefix}"))
         })?;
         let path = format!("{prefix}/{name}");
@@ -2012,11 +2078,12 @@ fn apply_ref_updates(
         .map_err(Error::git)?
     {
         let reference = reference.map_err(Error::git)?;
-        let name = reference.name().as_bstr().to_str().map_err(|_| {
+        let name = reference.name().as_bstr().to_str().map_err(|_error| {
             Error::InvalidSnapshot("repository contains a non-UTF-8 ref name".to_owned())
         })?;
         if is_captured_ref(name.as_bytes()) && !captured.contains(name) {
-            let name = FullName::try_from(name).map_err(|_| Error::InvalidRef(name.to_owned()))?;
+            let name =
+                FullName::try_from(name).map_err(|_error| Error::InvalidRef(name.to_owned()))?;
             edits.push(GixRefEdit {
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(reference.target().into_owned()),
@@ -2029,7 +2096,7 @@ fn apply_ref_updates(
     }
     for (name, contents) in updates {
         let name =
-            FullName::try_from(name.as_str()).map_err(|_| Error::InvalidRef(name.clone()))?;
+            FullName::try_from(name.as_str()).map_err(|_error| Error::InvalidRef(name.clone()))?;
         let target = parse_ref_contents(&contents)?;
         let expected = repo
             .try_find_reference(name.as_ref())
@@ -2058,14 +2125,14 @@ fn parse_ref_contents(contents: &[u8]) -> Result<Target, Error> {
     let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
     if let Some(target) = contents.strip_prefix(b"ref: ") {
         let target = std::str::from_utf8(target)
-            .map_err(|_| Error::InvalidSnapshot("symbolic ref is not UTF-8".to_owned()))?;
+            .map_err(|_error| Error::InvalidSnapshot("symbolic ref is not UTF-8".to_owned()))?;
         return Ok(Target::Symbolic(FullName::try_from(target).map_err(
-            |_| Error::InvalidSnapshot("invalid symbolic ref target".to_owned()),
+            |_error| Error::InvalidSnapshot("invalid symbolic ref target".to_owned()),
         )?));
     }
     ObjectId::from_hex(contents)
         .map(Target::Object)
-        .map_err(|_| Error::InvalidSnapshot("invalid ref object ID".to_owned()))
+        .map_err(|_error| Error::InvalidSnapshot("invalid ref object ID".to_owned()))
 }
 
 /// Restore or remove one repository metadata file from a snapshot blob.
@@ -2221,19 +2288,16 @@ fn transaction_updates(input: &[u8]) -> Result<Vec<TransactionUpdate<'_>>, Error
         if line.is_empty() {
             continue;
         }
-        let fields: Vec<_> = line
+        let mut fields = line
             .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect();
-        if fields.len() != 3 {
+            .filter(|field| !field.is_empty());
+        let parsed = (fields.next(), fields.next(), fields.next(), fields.next());
+        let (Some(_old), Some(new), Some(name), None) = parsed else {
             return Err(Error::InvalidHookInput(
                 String::from_utf8_lossy(line).into_owned(),
             ));
-        }
-        updates.push(TransactionUpdate {
-            new: fields[1],
-            name: fields[2],
-        });
+        };
+        updates.push(TransactionUpdate { new, name });
     }
     Ok(updates)
 }
@@ -2255,1333 +2319,12 @@ fn transaction_deletes_operation_ref(input: &[u8]) -> Result<bool, Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        path::PathBuf,
-        process::Command,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
-
-    static NEXT_TEMP_REPOSITORY: AtomicUsize = AtomicUsize::new(0);
-
-    /// The all-zero object ID Git reports for ref deletions.
-    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
-
-    /// Own a temporary repository and remove it when the test finishes.
-    struct TemporaryRepository {
-        root: PathBuf,
-        repo: gix::Repository,
-    }
-
-    impl TemporaryRepository {
-        /// Create a repository with deterministic commit identity settings.
-        fn new() -> Self {
-            let root = loop {
-                let sequence = NEXT_TEMP_REPOSITORY.fetch_add(1, Ordering::Relaxed);
-                let candidate = std::env::temp_dir()
-                    .join(format!("git-op-test-{}-{sequence}", std::process::id()));
-                match fs::create_dir(&candidate) {
-                    Ok(()) => break candidate,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => panic!("create temporary repository directory: {error}"),
-                }
-            };
-            gix::init(&root).expect("initialize temporary repository");
-            for (key, value) in [("user.name", "git-op test"), ("user.email", "git-op@test")] {
-                let status = Command::new("git")
-                    .current_dir(&root)
-                    .args(["config", "--local", key, value])
-                    .status()
-                    .expect("configure temporary repository");
-                assert!(status.success(), "git config {key} failed with {status}");
-            }
-            let repo = gix::open(&root).expect("reopen configured temporary repository");
-            Self { root, repo }
-        }
-    }
-
-    impl Drop for TemporaryRepository {
-        /// Remove the temporary repository after the test completes.
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    /// Verify that the test repository can create a snapshot commit.
-    #[test]
-    fn temporary_repository_has_commit_identity() {
-        let temporary = TemporaryRepository::new();
-        append(&temporary.repo, "test snapshot").expect("append snapshot");
-    }
-
-    #[test]
-    fn generated_commit_records_invoking_command() {
-        let temporary = TemporaryRepository::new();
-        let tree = temporary
-            .repo
-            .write_buf(Kind::Tree, b"")
-            .expect("write empty tree");
-        let signature = gix::actor::Signature {
-            name: "git-op test".into(),
-            email: "git-op@test".into(),
-            time: gix::date::Time {
-                seconds: 1_700_000_000,
-                offset: 0,
-            },
-        };
-        let commit = write_commit(
-            &temporary.repo,
-            tree,
-            None,
-            "op: capture initial repository state",
-            Some(&InvokedBy("git commit".to_owned())),
-            &signature,
-            &signature,
-            false,
-        )
-        .expect("write operation commit");
-        assert_eq!(
-            temporary
-                .repo
-                .find_commit(commit)
-                .expect("find operation commit")
-                .message_raw_sloppy(),
-            b"op: capture initial repository state\n\nInvoked-by: git commit\n"
-        );
-    }
-
-    /// Run Git in a temporary repository and require successful completion.
-    fn git(temporary: &TemporaryRepository, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(&temporary.root)
-            .args(args)
-            .status()
-            .expect("run Git");
-        assert!(status.success(), "git {args:?} failed with {status}");
-    }
-
-    fn git_output(temporary: &TemporaryRepository, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(&temporary.root)
-            .args(args)
-            .output()
-            .expect("run Git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed with {}",
-            output.status
-        );
-        String::from_utf8(output.stdout).expect("Git output is UTF-8")
-    }
-
-    /// Verify that restoring a branch ref also updates its symbolic `HEAD` target.
-    #[test]
-    fn restore_updates_head_for_current_branch() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let first = temporary
-            .repo
-            .head_id()
-            .expect("read first commit")
-            .detach();
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
-        let second = temporary
-            .repo
-            .head_id()
-            .expect("read second commit")
-            .detach();
-        assert_ne!(first, second);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        let result = restore_action(&temporary.repo, initial).expect("restore initial snapshot");
-        assert_eq!(
-            result.changes,
-            vec![Changes::Refs(vec![RefChange {
-                name: "refs/heads/main".to_owned(),
-                kind: RefChangeKind::Updated {
-                    old: Target::Object(second),
-                    new: Target::Object(first),
-                },
-            }])]
-        );
-
-        assert_eq!(temporary.repo.head_id().expect("read restored HEAD"), first);
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("tracked")).expect("read restored file"),
-            "initial\n"
-        );
-        assert_eq!(git_output(&temporary, &["status", "--porcelain"]), "");
-        assert_eq!(
-            temporary
-                .repo
-                .head_name()
-                .expect("read HEAD name")
-                .map(|name| name.to_string()),
-            Some("refs/heads/main".to_owned())
-        );
-    }
-
-    /// Verify that restoring a snapshot whose ref target has been pruned
-    /// aborts with an error and leaves the repository unmodified.
-    #[test]
-    fn restore_aborts_when_snapshot_ref_target_is_pruned() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let pruned = temporary
-            .repo
-            .head_id()
-            .expect("read pruned commit")
-            .detach();
-        let snapshot = append(&temporary.repo, "snapshot of pruned commit")
-            .expect("append snapshot of pruned commit");
-        git(&temporary, &["commit", "--amend", "-m", "one amended"]);
-        git(
-            &temporary,
-            &[
-                "reflog",
-                "expire",
-                "--expire=now",
-                "--expire-unreachable=now",
-                "--all",
-            ],
-        );
-        git(&temporary, &["gc", "--prune=now"]);
-
-        let status = Command::new("git")
-            .current_dir(&temporary.root)
-            .args(["cat-file", "-t", &pruned.to_string()])
-            .status()
-            .expect("check pruned object");
-        assert!(
-            !status.success(),
-            "object {pruned} survived garbage collection"
-        );
-
-        match restore_action(&temporary.repo, snapshot) {
-            Err(Error::PrunedObject { ref_name, oid }) => {
-                assert_eq!(ref_name, "refs/heads/main");
-                assert_eq!(oid, pruned);
-            }
-            result => panic!("expected PrunedObject, got {result:?}"),
-        }
-        let amended = temporary
-            .repo
-            .head_id()
-            .expect("read amended HEAD")
-            .detach()
-            .to_string();
-        assert_eq!(
-            git_output(&temporary, &["rev-parse", "refs/heads/main"]).trim(),
-            amended
-        );
-        git_output(&temporary, &["status"]);
-        git_output(&temporary, &["log", "--oneline", "-1"]);
-    }
-
-    /// Verify that restoring a detached repository leaves `HEAD` detached at its current commit.
-    #[test]
-    fn restore_preserves_detached_head_commit() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
-        let first = temporary
-            .repo
-            .head_id()
-            .expect("read first commit")
-            .detach();
-        git(&temporary, &["checkout", "--detach", &first.to_string()]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
-        let second = temporary
-            .repo
-            .head_id()
-            .expect("read second commit")
-            .detach();
-        assert_ne!(first, second);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        restore(&temporary.repo, initial).expect("restore initial snapshot");
-
-        assert_eq!(
-            temporary.repo.head_id().expect("read restored HEAD"),
-            second
-        );
-        assert!(
-            temporary
-                .repo
-                .head_name()
-                .expect("read HEAD name")
-                .is_none()
-        );
-    }
-
-    /// Verify that restoring and then undoing returns refs and checkout state.
-    #[test]
-    fn restore_then_undo_restores_original_state() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"original\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let target = append(&temporary.repo, "target snapshot").expect("append target snapshot");
-        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
-        git(&temporary, &["commit", "-am", "two"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        let original_head = temporary
-            .repo
-            .head_id()
-            .expect("read original HEAD")
-            .detach();
-        let hooks = temporary.root.join("hooks");
-        fs::create_dir(&hooks).expect("create hooks directory");
-        let hook = hooks.join("reference-transaction");
-        fs::write(&hook, b"#!/bin/sh\nexit 1\n").expect("write rejecting hook");
-        let status = Command::new("chmod")
-            .args(["+x", hook.to_str().expect("hook path is UTF-8")])
-            .status()
-            .expect("make hook executable");
-        assert!(status.success(), "chmod failed with {status}");
-        git(
-            &temporary,
-            &[
-                "config",
-                "core.hooksPath",
-                hooks.to_str().expect("hooks path is UTF-8"),
-            ],
-        );
-
-        let restored = restore(&temporary.repo, target).expect("restore target snapshot");
-        undo(&temporary.repo).expect("undo restore");
-        assert_ne!(restored, target);
-
-        assert_eq!(
-            temporary.repo.head_id().expect("read restored HEAD"),
-            original_head
-        );
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("tracked")).expect("read restored file"),
-            "changed\n"
-        );
-        assert_eq!(
-            git_output(&temporary, &["status", "--porcelain"]),
-            "?? hooks/\n"
-        );
-    }
-
-    #[test]
-    fn undo_and_redo_follow_the_logical_transition_table() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "base"]);
-        let a = append(&temporary.repo, "A").expect("append A");
-        let initial_description = fs::read(temporary.repo.common_dir().join("description"))
-            .expect("read initial description");
-        fs::write(temporary.repo.common_dir().join("description"), b"B\n").expect("write B");
-        let b = append(&temporary.repo, "B").expect("append B");
-        fs::write(temporary.repo.common_dir().join("description"), b"C\n").expect("write C");
-        let c = append(&temporary.repo, "C").expect("append C");
-
-        let undo_c = undo_action(&temporary.repo).expect("undo C");
-        assert_eq!(undo_c.target, c);
-        assert_eq!(
-            fs::read(temporary.repo.common_dir().join("description")).expect("read B"),
-            b"B\n"
-        );
-        let undo_b = undo_action(&temporary.repo).expect("undo B");
-        assert_eq!(undo_b.target, b);
-        assert_eq!(
-            fs::read(temporary.repo.common_dir().join("description")).expect("read A"),
-            initial_description
-        );
-
-        let redo_b = redo_action(&temporary.repo).expect("redo B");
-        assert_eq!(redo_b.target, b);
-        let redo_c = redo_action(&temporary.repo).expect("redo C");
-        assert_eq!(redo_c.target, c);
-        assert_eq!(
-            fs::read(temporary.repo.common_dir().join("description")).expect("read C"),
-            b"C\n"
-        );
-        assert!(matches!(
-            redo_action(&temporary.repo),
-            Err(Error::NothingToRedo)
-        ));
-
-        let operation = temporary
-            .repo
-            .find_commit(undo_c.operation)
-            .expect("read undo operation");
-        let message = operation.message_raw_sloppy();
-        assert!(
-            message
-                .windows(b"Git-op: undo:".len())
-                .any(|window| window == b"Git-op: undo:")
-        );
-        assert!(
-            message
-                .windows(b"Git-op: undo:".len())
-                .any(|window| window == b"Git-op: undo:")
-        );
-        assert!(
-            message
-                .windows(b"Git-op: restore:".len())
-                .any(|window| window == b"Git-op: restore:")
-        );
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn new_work_after_undo_ends_the_redo_chain() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "base"]);
-        append(&temporary.repo, "A").expect("append A");
-        fs::write(temporary.repo.common_dir().join("description"), b"B\n").expect("write B");
-        append(&temporary.repo, "B").expect("append B");
-        fs::write(temporary.repo.common_dir().join("description"), b"C\n").expect("write C");
-        let c = append(&temporary.repo, "C").expect("append C");
-        undo_action(&temporary.repo).expect("undo C");
-        fs::write(temporary.repo.common_dir().join("description"), b"D\n").expect("write D");
-        append(&temporary.repo, "D").expect("append D");
-
-        assert!(matches!(
-            redo_action(&temporary.repo),
-            Err(Error::NothingToRedo)
-        ));
-        undo_action(&temporary.repo).expect("undo D");
-        assert_eq!(
-            fs::read(temporary.repo.common_dir().join("description")).expect("read B"),
-            b"B\n"
-        );
-        restore(&temporary.repo, c).expect("restore C");
-        assert_eq!(
-            fs::read(temporary.repo.common_dir().join("description")).expect("read C"),
-            b"C\n"
-        );
-    }
-
-    #[test]
-    fn restore_of_current_state_does_not_append() {
-        let temporary = TemporaryRepository::new();
-        let current = append(&temporary.repo, "current").expect("append current");
-        let result = restore_action(&temporary.repo, current).expect("restore current");
-        assert!(!result.changed);
-        assert_eq!(result.operation, current);
-    }
-
-    /// Verify that a ref-level no-op restore leaves uncommitted index and
-    /// worktree changes untouched.
-    #[test]
-    fn restore_noop_preserves_uncommitted_changes() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let head = temporary.repo.head_id().expect("read HEAD").detach();
-        let snapshot = append(&temporary.repo, "snapshot").expect("append snapshot");
-
-        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
-        std::fs::write(temporary.root.join("staged"), b"staged\n").expect("write staged file");
-        git(&temporary, &["add", "staged"]);
-        let dirty = git_output(&temporary, &["status", "--porcelain"]);
-        assert!(
-            !dirty.is_empty(),
-            "index and worktree should start desynced"
-        );
-
-        let result = restore_action(&temporary.repo, snapshot).expect("restore snapshot");
-        assert!(!result.changed);
-        assert_eq!(result.operation, snapshot);
-        assert_eq!(temporary.repo.head_id().expect("read HEAD"), head);
-        assert_eq!(
-            git_output(&temporary, &["status", "--porcelain"]),
-            dirty,
-            "uncommitted index and worktree changes must survive a no-op restore"
-        );
-    }
-
-    /// Verify that unrelated untracked files do not block a restore and
-    /// survive it.
-    #[test]
-    fn restore_proceeds_with_unrelated_untracked_files() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        std::fs::write(temporary.root.join("unrelated"), b"untracked\n")
-            .expect("write unrelated untracked file");
-
-        restore(&temporary.repo, initial).expect("restore with unrelated untracked file");
-
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("unrelated")).expect("read untracked file"),
-            "untracked\n",
-            "unrelated untracked files must survive a restore"
-        );
-    }
-
-    /// Verify that a restore refuses to overwrite a colliding untracked file
-    /// and leaves the repository untouched.
-    #[test]
-    fn restore_refuses_to_overwrite_untracked_files() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        fs::remove_file(temporary.root.join("tracked")).expect("remove tracked file");
-        git(&temporary, &["commit", "-am", "two"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        std::fs::write(temporary.root.join("tracked"), b"untracked\n")
-            .expect("write colliding untracked file");
-
-        let error =
-            restore_action(&temporary.repo, initial).expect_err("untracked collision must refuse");
-        assert!(
-            matches!(error, Error::OverwrittenPaths { ref collisions }
-                if collisions.len() == 1
-                    && collisions[0]
-                        == PathCollision { path: "tracked".to_owned(), untracked: true }),
-            "expected the untracked collision, got {error:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("tracked")).expect("read untracked file"),
-            "untracked\n",
-            "the colliding file must be untouched"
-        );
-        assert_eq!(
-            git_output(&temporary, &["status", "--porcelain"]),
-            "?? tracked\n",
-            "refs must not move when the restore is refused"
-        );
-    }
-
-    /// Verify that a restore refuses to discard unstaged worktree
-    /// modifications on a path the target tree touches.
-    #[test]
-    fn restore_refuses_unstaged_modifications_on_affected_paths() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
-        git(&temporary, &["commit", "-am", "two"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        // Even an index entry matching the target loses the worktree change:
-        // read-tree --reset -u rewrites the file, so the path must block.
-        git(&temporary, &["checkout", "--", "tracked"]);
-        std::fs::write(temporary.root.join("tracked"), b"local edit\n")
-            .expect("modify tracked file");
-
-        let error =
-            restore_action(&temporary.repo, initial).expect_err("unstaged change must refuse");
-        assert!(
-            matches!(error, Error::OverwrittenPaths { ref collisions }
-                if collisions.len() == 1
-                    && collisions[0]
-                        == PathCollision { path: "tracked".to_owned(), untracked: false }),
-            "expected the uncommitted change, got {error:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("tracked")).expect("read tracked file"),
-            "local edit\n"
-        );
-    }
-
-    /// Verify that a restore refuses to discard staged changes on a path the
-    /// target tree would change.
-    #[test]
-    fn restore_refuses_staged_changes_on_affected_paths() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        std::fs::write(temporary.root.join("tracked"), b"changed\n").expect("change tracked file");
-        git(&temporary, &["commit", "-am", "two"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        std::fs::write(temporary.root.join("tracked"), b"staged\n").expect("stage change");
-        git(&temporary, &["add", "tracked"]);
-
-        let error =
-            restore_action(&temporary.repo, initial).expect_err("staged change must refuse");
-        assert!(matches!(error, Error::OverwrittenPaths { .. }));
-        assert_eq!(
-            git_output(&temporary, &["diff", "--cached", "--name-only"]),
-            "tracked\n",
-            "the staged change must survive the refused restore"
-        );
-    }
-
-    /// Verify that a restore refuses when the target deletes a file carrying
-    /// uncommitted changes.
-    #[test]
-    fn restore_refuses_when_target_deletes_a_dirty_file() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let initial = append(&temporary.repo, "initial snapshot").expect("append initial snapshot");
-        std::fs::write(temporary.root.join("victim"), b"victim\n").expect("write victim file");
-        git(&temporary, &["add", "victim"]);
-        git(&temporary, &["commit", "-m", "add victim"]);
-        append(&temporary.repo, "current snapshot").expect("append current snapshot");
-
-        std::fs::write(temporary.root.join("victim"), b"dirty\n").expect("modify victim file");
-
-        let error =
-            restore_action(&temporary.repo, initial).expect_err("dirty deletion must refuse");
-        assert!(
-            matches!(error, Error::OverwrittenPaths { ref collisions }
-                if collisions.len() == 1
-                    && collisions[0]
-                        == PathCollision { path: "victim".to_owned(), untracked: false }),
-            "expected the victim path, got {error:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(temporary.root.join("victim")).expect("read victim file"),
-            "dirty\n"
-        );
-    }
-
-    /// Verify that a no-op restore still reports snapshot refs that point at
-    /// missing objects instead of silently reporting success.
-    #[test]
-    fn restore_noop_reports_missing_snapshot_referents() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("tracked"), b"initial\n").expect("write tracked file");
-        git(&temporary, &["add", "tracked"]);
-        git(&temporary, &["commit", "-m", "one"]);
-        let missing = temporary.repo.head_id().expect("read commit").detach();
-        let snapshot = append(&temporary.repo, "snapshot").expect("append snapshot");
-        let hex = missing.to_string();
-        let loose = temporary
-            .repo
-            .git_dir()
-            .join("objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
-        std::fs::remove_file(&loose).expect("remove loose commit object");
-
-        match restore_action(&temporary.repo, snapshot) {
-            Err(Error::PrunedObject { ref_name, oid }) => {
-                assert_eq!(ref_name, "refs/heads/main");
-                assert_eq!(oid, missing);
-            }
-            result => panic!("expected PrunedReferent, got {result:?}"),
-        }
-    }
-
-    /// Verify that restoring a snapshot whose branch targets an existing
-    /// non-commit object is rejected before refs move.
-    #[test]
-    fn restore_aborts_when_snapshot_branch_targets_non_commit() {
-        let temporary = TemporaryRepository::new();
-        std::fs::write(temporary.root.join("blob"), b"blob\n").expect("write blob file");
-        let blob = git_output(&temporary, &["hash-object", "-w", "blob"])
-            .trim()
-            .to_owned();
-        // Git refuses to point a branch at a blob, so write the loose ref
-        // directly; a snapshot records ref targets as plain bytes either way.
-        std::fs::create_dir_all(temporary.repo.git_dir().join("refs/heads"))
-            .expect("create refs/heads");
-        std::fs::write(
-            temporary.repo.git_dir().join("refs/heads/broken"),
-            format!("{blob}\n"),
-        )
-        .expect("write loose ref");
-        let snapshot = append(&temporary.repo, "snapshot of blob branch")
-            .expect("append snapshot of blob branch");
-        git(&temporary, &["commit", "--allow-empty", "-m", "two"]);
-        let moved = temporary.repo.head_id().expect("read moved HEAD").detach();
-
-        match restore_action(&temporary.repo, snapshot) {
-            Err(Error::UnusableObject { ref_name, oid }) => {
-                assert_eq!(ref_name, "refs/heads/broken");
-                assert_eq!(oid.to_string(), blob);
-            }
-            result => panic!("expected UnusableReferent, got {result:?}"),
-        }
-        assert_eq!(
-            temporary.repo.head_id().expect("read HEAD"),
-            moved,
-            "refs must not move when a branch target is unusable"
-        );
-    }
-
-    /// Verify that a no-op snap does not resolve write-only commit
-    /// prerequisites such as signing configuration or commit identity.
-    #[test]
-    fn snap_noop_does_not_resolve_commit_prerequisites() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["config", "--unset", "user.name"]);
-        git(&temporary, &["config", "--unset", "user.email"]);
-        // An invalid boolean makes commit_signing_enabled fail regardless of
-        // any globally configured identity.
-        git(&temporary, &["config", "commit.gpgSign", "maybe"]);
-
-        // Publish the parent snapshot directly with explicit signatures so
-        // its creation does not depend on the broken prerequisites that the
-        // captured state itself contains.
-        let state = capture(&temporary.repo).expect("capture state");
-        let tree = serialize(&temporary.repo, &state).expect("serialize state");
-        let signature = gix::actor::Signature {
-            name: "git-op test".into(),
-            email: "git-op@test".into(),
-            time: gix::date::Time {
-                seconds: 1_700_000_000,
-                offset: 0,
-            },
-        };
-        let parent = write_commit(
-            &temporary.repo,
-            tree,
-            None,
-            "op: capture initial repository state",
-            None,
-            &signature,
-            &signature,
-            false,
-        )
-        .expect("write parent snapshot");
-        GixRefStore::new(&temporary.repo)
-            .apply(RefEdit::Create {
-                name: RefName::new(OP_REF).expect("valid OP_REF"),
-                new: parent,
-            })
-            .expect("publish parent snapshot");
-
-        let snapped = snap(&temporary.repo).expect("snap on a current repository");
-        let SnapOutcome::Recorded(snapped) = snapped else {
-            panic!("snap on a branch records or finds the current state");
-        };
-        assert!(!snapped.appended);
-        assert_eq!(snapped.operation, parent);
-    }
-
-    /// Verify that generated messages identify changed snapshot components.
-    #[test]
-    fn generated_snapshot_message_identifies_changes() {
-        let temporary = TemporaryRepository::new();
-        let (initial, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append initial snapshot");
-        assert_eq!(
-            temporary
-                .repo
-                .find_commit(initial)
-                .expect("find initial snapshot")
-                .message()
-                .expect("read initial message")
-                .summary()
-                .as_bytes(),
-            b"op: capture initial repository state"
-        );
-
-        fs::write(
-            temporary.repo.common_dir().join("description"),
-            b"example\n",
-        )
-        .expect("write description");
-        Command::new("git")
-            .current_dir(&temporary.root)
-            .args(["update-ref", "refs/heads/example", &initial.to_string()])
-            .status()
-            .expect("update example ref")
-            .success()
-            .then_some(())
-            .expect("update example ref succeeds");
-        let (update, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append changed snapshot");
-        assert_eq!(
-            temporary
-                .repo
-                .find_commit(update)
-                .expect("find changed snapshot")
-                .message()
-                .expect("read changed message")
-                .summary()
-                .as_bytes(),
-            b"op: update refs and description"
-        );
-    }
-
-    /// Verify that a single changed part produces a singular update message.
-    #[test]
-    fn generated_snapshot_message_reports_single_change() {
-        let temporary = TemporaryRepository::new();
-        let (initial, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append initial snapshot");
-        Command::new("git")
-            .current_dir(&temporary.root)
-            .args(["update-ref", "refs/heads/example", &initial.to_string()])
-            .status()
-            .expect("update example ref")
-            .success()
-            .then_some(())
-            .expect("update example ref succeeds");
-        let (update, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append changed snapshot");
-        assert_eq!(
-            temporary
-                .repo
-                .find_commit(update)
-                .expect("find changed snapshot")
-                .message()
-                .expect("read changed message")
-                .summary()
-                .as_bytes(),
-            b"op: update refs"
-        );
-    }
-
-    /// Verify that three changed parts are joined with an Oxford comma.
-    #[test]
-    fn generated_snapshot_message_reports_three_changes() {
-        let temporary = TemporaryRepository::new();
-        let (initial, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append initial snapshot");
-        Command::new("git")
-            .current_dir(&temporary.root)
-            .args(["update-ref", "refs/heads/example", &initial.to_string()])
-            .status()
-            .expect("update example ref")
-            .success()
-            .then_some(())
-            .expect("update example ref succeeds");
-        let config_path = temporary.repo.common_dir().join("config");
-        let mut config = fs::read(&config_path).expect("read config");
-        config.extend_from_slice(b"[extra]\n\tflag = true\n");
-        fs::write(&config_path, config).expect("write config");
-        fs::write(
-            temporary.repo.common_dir().join("description"),
-            b"example\n",
-        )
-        .expect("write description");
-        let (update, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append changed snapshot");
-        assert_eq!(
-            temporary
-                .repo
-                .find_commit(update)
-                .expect("find changed snapshot")
-                .message()
-                .expect("read changed message")
-                .summary()
-                .as_bytes(),
-            b"op: update refs, config, and description"
-        );
-    }
-
-    /// Verify that a generated append with nothing to record neither creates a
-    /// commit nor advances the operation ref.
-    #[test]
-    fn generated_append_is_noop_when_nothing_changed() {
-        let temporary = TemporaryRepository::new();
-        let (initial, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append initial snapshot");
-        let (repeat, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append unchanged snapshot");
-        assert_eq!(repeat, initial);
-        assert_eq!(
-            temporary
-                .repo
-                .find_reference(OP_REF)
-                .expect("read operation ref")
-                .target()
-                .try_id(),
-            Some(initial.as_ref())
-        );
-    }
-
-    /// Verify that `snap` on an up-to-date repository returns the current tip
-    /// and leaves the operation ref untouched.
-    #[test]
-    fn snap_is_noop_when_log_is_current() {
-        let temporary = TemporaryRepository::new();
-        let SnapOutcome::Recorded(initial) =
-            snap(&temporary.repo).expect("append initial snapshot")
-        else {
-            panic!("first snap on a branch records the initial snapshot");
-        };
-        assert!(initial.appended, "first snap appends the initial snapshot");
-        let SnapOutcome::Recorded(snapped) =
-            snap(&temporary.repo).expect("snap up-to-date repository")
-        else {
-            panic!("snap on a branch records or finds the current state");
-        };
-        assert!(!snapped.appended, "second snap finds the log current");
-        assert_eq!(snapped.operation, initial.operation);
-        assert_eq!(
-            temporary
-                .repo
-                .find_reference(OP_REF)
-                .expect("read operation ref")
-                .target()
-                .try_id(),
-            Some(initial.operation.as_ref())
-        );
-    }
-
-    /// Verify that `snap` records drift, such as a direct edit to the
-    /// repository description that no reference transaction observed.
-    #[test]
-    fn snap_records_metadata_drift() {
-        let temporary = TemporaryRepository::new();
-        let SnapOutcome::Recorded(initial) =
-            snap(&temporary.repo).expect("append initial snapshot")
-        else {
-            panic!("snap on a branch records the initial snapshot");
-        };
-        let initial = initial.operation;
-        fs::write(
-            temporary.repo.common_dir().join("description"),
-            b"drifted description\n",
-        )
-        .expect("write description");
-        let snapped = match snap(&temporary.repo).expect("snap drifted repository") {
-            SnapOutcome::Recorded(snapped) => snapped.operation,
-            SnapOutcome::Detached => panic!("snap on a branch records the drifted state"),
-        };
-        assert_ne!(snapped, initial);
-        let changed = changes(&temporary.repo, snapped)
-            .expect("compute changes")
-            .expect("snapped snapshot has a parent");
-        assert!(matches!(changed.as_slice(), [Changes::Description]));
-        let state = read(&temporary.repo, snapped).expect("read snapped state");
-        let description = temporary
-            .repo
-            .find_blob(state.description.expect("description was captured").oid())
-            .expect("read description blob");
-        assert_eq!(description.data, b"drifted description\n");
-    }
-
-    /// Verify that `changes` reports `None` for the initial snapshot and the
-    /// correct parts changed for a later one.
-    #[test]
-    fn changes_reports_parts_changed_since_parent() {
-        let temporary = TemporaryRepository::new();
-        let (initial, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append initial snapshot");
-        assert_eq!(
-            changes(&temporary.repo, initial).expect("compute changes"),
-            None
-        );
-
-        Command::new("git")
-            .current_dir(&temporary.root)
-            .args(["update-ref", "refs/heads/example", &initial.to_string()])
-            .status()
-            .expect("update example ref")
-            .success()
-            .then_some(())
-            .expect("update example ref succeeds");
-        fs::write(
-            temporary.repo.common_dir().join("description"),
-            b"example\n",
-        )
-        .expect("write description");
-        let (update, _) = append_internal(
-            &temporary.repo,
-            CommitMessage::Generated,
-            AppendOptions::default(),
-        )
-        .expect("append changed snapshot");
-        let changed = changes(&temporary.repo, update)
-            .expect("compute changes")
-            .expect("updated snapshot has a parent");
-        assert!(
-            matches!(changed.as_slice(), [Changes::Refs(refs), Changes::Description] if refs.len() == 1)
-        );
-    }
-
-    /// Verify that operation, remote, and pseudo refs are excluded.
-    #[test]
-    fn ref_filter_excludes_operation_and_remote_refs() {
-        assert!(is_captured_ref(b"refs/heads/main"));
-        assert!(is_captured_ref(b"refs/tags/v1"));
-        assert!(!is_captured_ref(OP_REF.as_bytes()));
-        assert!(!is_captured_ref(b"refs/remotes/origin/main"));
-        assert!(!is_captured_ref(b"HEAD"));
-    }
-
-    /// Verify that conflicting ref paths are rejected.
-    #[test]
-    fn ref_tree_rejects_file_directory_conflicts() {
-        let refs = BTreeMap::from([
-            ("refs/heads/main".to_owned(), Vec::new()),
-            ("refs/heads/main/topic".to_owned(), Vec::new()),
-        ]);
-        assert!(matches!(
-            validate_ref_paths(&refs),
-            Err(Error::ConflictingRefs { .. })
-        ));
-    }
-
-    /// Verify that hook input identifies only captured refs.
-    #[test]
-    fn hook_parser_classifies_only_captured_refs() {
-        let oid = b"0000000000000000000000000000000000000000";
-        assert!(
-            transaction_changes_captured_refs(
-                &[oid.as_slice(), oid.as_slice(), b"refs/heads/main", b"\n"].concat()
-            )
-            .is_err()
-        );
-        assert!(
-            transaction_changes_captured_refs(
-                &[
-                    oid.as_slice(),
-                    b" ",
-                    b"1111111111111111111111111111111111111111",
-                    b" ",
-                    b"refs/heads/main\n"
-                ]
-                .concat()
-            )
-            .expect("valid transaction")
-        );
-        assert!(
-            !transaction_changes_captured_refs(
-                &[
-                    oid.as_slice(),
-                    b" ",
-                    b"1111111111111111111111111111111111111111",
-                    b" ",
-                    b"refs/remotes/origin/main\n"
-                ]
-                .concat()
-            )
-            .expect("valid transaction")
-        );
-        assert!(
-            !transaction_changes_captured_refs(
-                &[
-                    oid.as_slice(),
-                    b" ",
-                    b"1111111111111111111111111111111111111111",
-                    b" ",
-                    OP_REF.as_bytes(),
-                    b"\n"
-                ]
-                .concat()
-            )
-            .expect("valid transaction")
-        );
-    }
-
-    /// Verify that every non-committed hook phase is accepted without a snapshot.
-    #[test]
-    fn hook_accepts_non_committed_phases() {
-        let temporary = TemporaryRepository::new();
-        let input = b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n";
-        for phase in [
-            ReferenceTransactionPhase::Preparing,
-            ReferenceTransactionPhase::Prepared,
-            ReferenceTransactionPhase::Aborted,
-        ] {
-            reference_transaction(&temporary.repo, phase, input).expect("process hook phase");
-        }
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none()
-        );
-    }
-
-    /// Verify that a `HEAD`-only transaction captures the initial state.
-    #[test]
-    fn hook_captures_initial_state_on_head_only_transaction() {
-        let temporary = TemporaryRepository::new();
-        let input = b"0000000000000000000000000000000000000000 ref:refs/heads/main HEAD\n";
-        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, input)
-            .expect("process committed HEAD transaction");
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_some()
-        );
-    }
-
-    /// Verify that a detached HEAD records nothing: normal ref writes carry no
-    /// branch context, so neither the hook nor a manual snap captures one.
-    #[test]
-    fn snap_skips_detached_head() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
-        git(&temporary, &["checkout", "--detach"]);
-
-        let snapped = snap(&temporary.repo).expect("snap detached repository");
-        assert_eq!(snapped, SnapOutcome::Detached);
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none(),
-            "a detached HEAD must not start an operation log"
-        );
-    }
-
-    /// Verify that a committed transaction on a detached HEAD records nothing.
-    #[test]
-    fn hook_skips_detached_head() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
-        git(&temporary, &["checkout", "--detach"]);
-
-        reference_transaction(
-            &temporary.repo,
-            ReferenceTransactionPhase::Committed,
-            b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
-        )
-        .expect("process committed transaction on a detached head");
-
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none(),
-            "a detached HEAD must not start an operation log"
-        );
-    }
-
-    /// Verify that deleting the operation log still uninstalls on a detached
-    /// HEAD, and that no snapshot is captured either way.
-    #[test]
-    fn op_ref_deletion_uninstalls_on_detached_head() {
-        let temporary = TemporaryRepository::new();
-        git(&temporary, &["commit", "--allow-empty", "-m", "one"]);
-        git(&temporary, &["checkout", "--detach"]);
-        install_local(&temporary.repo).expect("install hook");
-
-        reference_transaction(
-            &temporary.repo,
-            ReferenceTransactionPhase::Committed,
-            format!("{ZERO_OID} {ZERO_OID} {OP_REF}\n").as_bytes(),
-        )
-        .expect("process deletion transaction on a detached head");
-
-        assert!(
-            !temporary
-                .repo
-                .git_dir()
-                .join("hooks/reference-transaction")
-                .exists(),
-            "deletion handling takes precedence over the detached no-op"
-        );
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none()
-        );
-    }
-
-    /// Verify that trailer values flatten newlines.
-    #[test]
-    fn trailer_text_flattens_newlines() {
-        assert_eq!(trailer_text("git commit"), "git commit");
-        assert_eq!(trailer_text("git\nEvil: forged"), "git Evil: forged");
-    }
-
-    /// Verify that an empty committed transaction leaves an existing operation log unchanged.
-    #[test]
-    fn hook_accepts_empty_committed_transaction() {
-        let temporary = TemporaryRepository::new();
-        reference_transaction(
-            &temporary.repo,
-            ReferenceTransactionPhase::Committed,
-            b"0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
-        )
-        .expect("record initial snapshot");
-        let before = temporary
-            .repo
-            .try_find_reference(OP_REF)
-            .expect("look up operation ref")
-            .expect("operation ref exists")
-            .id();
-        reference_transaction(&temporary.repo, ReferenceTransactionPhase::Committed, b"")
-            .expect("process empty transaction");
-        assert_eq!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .expect("operation ref exists")
-                .id(),
-            before
-        );
-    }
-
-    /// Verify that empty hook input is treated as a no-op.
-    #[test]
-    fn hook_parser_accepts_empty_transactions() {
-        assert!(!transaction_changes_captured_refs(b"\n").expect("empty transaction"));
-        assert!(!transaction_changes_captured_refs(b"\r\n").expect("empty transaction"));
-    }
-
-    /// Verify that a committed deletion of the operation ref uninstalls the
-    /// local hook and is not resurrected by a capture.
-    #[test]
-    fn op_ref_deletion_uninstalls_the_local_hook() {
-        let temporary = TemporaryRepository::new();
-        install_local(&temporary.repo).expect("install hook");
-        append(&temporary.repo, "snapshot").expect("append snapshot");
-        let tip = temporary
-            .repo
-            .try_find_reference(OP_REF)
-            .expect("look up operation ref")
-            .expect("operation ref exists")
-            .target()
-            .try_id()
-            .expect("direct operation ref")
-            .to_owned();
-        // Git deletes the ref before invoking the committed-phase hook, and
-        // gix applies the deletion without firing the installed hook, keeping
-        // the simulation hermetic.
-        temporary
-            .repo
-            .edit_reference(GixRefEdit {
-                change: Change::Delete {
-                    expected: PreviousValue::MustExistAndMatch(Target::Object(tip)),
-                    log: RefLog::AndReference,
-                },
-                name: FullName::try_from(OP_REF).expect("valid operation ref name"),
-                deref: false,
-            })
-            .expect("delete operation ref");
-
-        reference_transaction(
-            &temporary.repo,
-            ReferenceTransactionPhase::Committed,
-            format!("{tip} {ZERO_OID} {OP_REF}\n").as_bytes(),
-        )
-        .expect("process deletion transaction");
-
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none(),
-            "a deleted operation log must not be resurrected"
-        );
-        assert!(
-            !temporary
-                .repo
-                .git_dir()
-                .join("hooks/reference-transaction")
-                .exists(),
-            "the committed deletion must remove the local hook"
-        );
-    }
-
-    /// Verify that a deletion seen before the committed phase changes nothing.
-    #[test]
-    fn op_ref_deletion_on_prepared_phase_leaves_the_hook() {
-        let temporary = TemporaryRepository::new();
-        install_local(&temporary.repo).expect("install hook");
-        let tip = "1111111111111111111111111111111111111111";
-
-        reference_transaction(
-            &temporary.repo,
-            ReferenceTransactionPhase::Prepared,
-            format!("{tip} {ZERO_OID} {OP_REF}\n").as_bytes(),
-        )
-        .expect("process prepared deletion transaction");
-
-        assert!(
-            temporary
-                .repo
-                .git_dir()
-                .join("hooks/reference-transaction")
-                .exists(),
-            "only the committed phase uninstalls"
-        );
-        assert!(
-            temporary
-                .repo
-                .try_find_reference(OP_REF)
-                .expect("look up operation ref")
-                .is_none()
-        );
-    }
-
-    /// Verify that the hook parser recognizes only operation-ref deletions.
-    #[test]
-    fn hook_parser_detects_operation_ref_deletions() {
-        let oid = "1111111111111111111111111111111111111111";
-        assert!(
-            transaction_deletes_operation_ref(format!("{oid} {ZERO_OID} {OP_REF}\n").as_bytes())
-                .expect("parse deletion")
-        );
-        assert!(
-            !transaction_deletes_operation_ref(format!("{ZERO_OID} {oid} {OP_REF}\n").as_bytes())
-                .expect("parse creation"),
-            "creating the operation ref is not a deletion"
-        );
-        assert!(
-            !transaction_deletes_operation_ref(
-                format!("{oid} {ZERO_OID} refs/heads/main\n").as_bytes()
-            )
-            .expect("parse branch deletion")
-        );
-        assert!(
-            !transaction_deletes_operation_ref(b"").expect("parse empty input"),
-            "empty input deletes nothing"
-        );
-    }
-}
+#[expect(
+    clippy::assertions_on_result_states,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice,
+    reason = "tests use panics and direct indexing to express failed expectations"
+)]
+#[path = "tests/mod.rs"]
+mod tests;

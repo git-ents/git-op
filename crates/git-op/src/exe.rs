@@ -3,6 +3,7 @@
 use std::io::{self, IsTerminal, Read, Write};
 
 use git_op::ReferenceTransactionPhase;
+use gix::prelude::Write as GixWrite;
 
 use crate::cli::Command;
 
@@ -59,7 +60,10 @@ fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>
 /// invoked with `PWD` in one repository and `GIT_DIR` pointing at another
 /// (as happens during `git clone`) would silently operate on the wrong
 /// repository.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "gix defines and returns this discovery error directly"
+)]
 pub(crate) fn open_repository() -> Result<gix::Repository, gix::discover::Error> {
     gix::discover_with_environment_overrides(".")
 }
@@ -119,18 +123,21 @@ fn snap_command() -> Result<(), Box<dyn std::error::Error>> {
 /// Describe a snap outcome.
 fn snap_outcome_summary(outcome: &git_op::SnapOutcome) -> String {
     match outcome {
-        git_op::SnapOutcome::Recorded(snapped) => snap_summary(snapped),
+        git_op::SnapOutcome::Recorded(snapped) => snap_summary(*snapped),
         git_op::SnapOutcome::Detached => "HEAD is detached; no snapshot recorded".to_owned(),
     }
 }
 
 /// Describe a recorded snap, attributing a snapshot to this invocation only
 /// when this call actually appended it.
-fn snap_summary(snapped: &git_op::SnapResult) -> String {
-    if snapped.appended {
-        format!("Recorded snapshot {}", short(&snapped.operation))
-    } else {
-        format!("Operation log is current ({})", short(&snapped.operation))
+fn snap_summary(snapped: git_op::SnapResult) -> String {
+    match snapped {
+        git_op::SnapResult::Appended(operation) => {
+            format!("Recorded snapshot {}", short(&operation))
+        }
+        git_op::SnapResult::Current(operation) => {
+            format!("Operation log is current ({})", short(&operation))
+        }
     }
 }
 
@@ -286,20 +293,12 @@ fn show_command(specification: Option<&str>) -> Result<(), Box<dyn std::error::E
 
 /// Render a captured ref transition as its before and after targets.
 fn ref_targets(kind: &git_op::RefChangeKind) -> (String, String) {
-    let target = |target: &gix::refs::Target| match target {
-        gix::refs::Target::Object(oid) => short(oid),
-        gix::refs::Target::Symbolic(name) => format!("ref: {name}"),
-    };
     match kind {
-        git_op::RefChangeKind::Created(new) => ("(new)".to_owned(), target(new)),
-        git_op::RefChangeKind::Deleted(old) => (target(old), "(deleted)".to_owned()),
-        git_op::RefChangeKind::Updated { old, new } => (target(old), target(new)),
+        git_op::RefChangeKind::Created(new) => ("(new)".to_owned(), target_summary(new)),
+        git_op::RefChangeKind::Deleted(old) => (target_summary(old), "(deleted)".to_owned()),
+        git_op::RefChangeKind::Updated { old, new } => (target_summary(old), target_summary(new)),
     }
 }
-
-/// The well-known empty-blob object ID, so `show` never writes to the object
-/// database.
-const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 /// Print the unified diff of one metadata file between two snapshot states.
 ///
@@ -315,6 +314,9 @@ fn show_metadata_diff(
     if before == after {
         return Ok(());
     }
+    let empty_blob = repo
+        .write_buf(gix::objs::Kind::Blob, b"")
+        .map_err(|error| error.to_string())?;
     let output = std::process::Command::new("git")
         .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
         .env("GIT_DIR", repo.git_dir())
@@ -322,10 +324,10 @@ fn show_metadata_diff(
             "diff",
             &before
                 .map(|oid| oid.to_string())
-                .unwrap_or(EMPTY_BLOB.to_owned()),
+                .unwrap_or_else(|| empty_blob.to_string()),
             &after
                 .map(|oid| oid.to_string())
-                .unwrap_or(EMPTY_BLOB.to_owned()),
+                .unwrap_or_else(|| empty_blob.to_string()),
             "--",
         ])
         .output()?;
@@ -353,7 +355,7 @@ fn action_header(verb: &str, target: &gix::ObjectId, restored: Option<&gix::Obje
 
 fn action_summary(header: &str, result: &git_op::ActionResult) -> String {
     let mut summary = header.to_owned();
-    if !result.changed {
+    if result.changes.is_empty() {
         summary.push_str("; no updates");
         return summary;
     }
@@ -392,147 +394,5 @@ fn short(oid: &gix::ObjectId) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::{
-        EMPTY_BLOB, action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary,
-    };
-    fn repository() -> (gix::Repository, tempfile::TempDir) {
-        let temp = tempfile::TempDir::new().expect("create temporary directory");
-        let repo = gix::init(temp.path()).expect("initialize repository");
-        (repo, temp)
-    }
-
-    #[test]
-    fn action_summary_lists_ref_updates() {
-        let old = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
-            .expect("parse old object ID");
-        let new = gix::ObjectId::from_hex(b"2222222222222222222222222222222222222222")
-            .expect("parse new object ID");
-        let result = git_op::ActionResult {
-            operation: old,
-            target: new,
-            restored: new,
-            changes: vec![git_op::Changes::Refs(vec![git_op::RefChange {
-                name: "refs/heads/main".to_owned(),
-                kind: git_op::RefChangeKind::Updated {
-                    old: gix::refs::Target::Object(old),
-                    new: gix::refs::Target::Object(new),
-                },
-            }])],
-            changed: true,
-        };
-        assert_eq!(
-            action_summary(
-                &action_header("Restored to operation", &result.target, None),
-                &result
-            ),
-            "Restored to operation 2222222\nrefs/heads/main -> 2222222"
-        );
-        assert_eq!(
-            action_header("Undid operation", &old, Some(&new)),
-            "Undid operation 1111111 (restored 2222222)"
-        );
-    }
-    #[test]
-    fn action_summary_reports_noop() {
-        let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
-            .expect("parse object ID");
-        let result = git_op::ActionResult {
-            operation: oid,
-            target: oid,
-            restored: oid,
-            changes: Vec::new(),
-            changed: false,
-        };
-        assert_eq!(
-            action_summary(
-                &action_header("Restored to operation", &result.target, None),
-                &result
-            ),
-            "Restored to operation 1111111; no updates"
-        );
-    }
-
-    /// Verify that a snap only claims a snapshot for this invocation when
-    /// this call appended it.
-    #[test]
-    fn snap_summary_reports_whether_this_invocation_appended() {
-        let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
-            .expect("parse object ID");
-        let appended = git_op::SnapResult {
-            operation: oid,
-            appended: true,
-        };
-        assert_eq!(snap_summary(&appended), "Recorded snapshot 1111111");
-        let current = git_op::SnapResult {
-            operation: oid,
-            appended: false,
-        };
-        assert_eq!(snap_summary(&current), "Operation log is current (1111111)");
-    }
-
-    /// Verify that a detached HEAD reports an informational no-op.
-    #[test]
-    fn snap_outcome_reports_detached_head() {
-        assert_eq!(
-            snap_outcome_summary(&git_op::SnapOutcome::Detached),
-            "HEAD is detached; no snapshot recorded"
-        );
-        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult {
-            operation: gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
-                .expect("parse object ID"),
-            appended: false,
-        });
-        assert_eq!(
-            snap_outcome_summary(&recorded),
-            "Operation log is current (1111111)"
-        );
-    }
-
-    #[test]
-    fn clean_worktree_is_allowed() {
-        let (repo, _temp) = repository();
-        ensure_clean(&repo).expect("clean worktree should be allowed");
-    }
-
-    #[test]
-    fn dirty_worktree_is_rejected() {
-        let (repo, temp) = repository();
-        fs::write(temp.path().join("untracked"), b"change").expect("write untracked file");
-        let error = ensure_clean(&repo).expect_err("dirty worktree should be rejected");
-        assert_eq!(
-            error.to_string(),
-            "working tree is dirty; commit or restore before changing repository state"
-        );
-    }
-
-    /// Verify that the well-known empty object IDs match what Git computes.
-    #[test]
-    fn well_known_empty_object_ids_match_git() {
-        let (_repo, temp) = repository();
-        let output = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .current_dir(temp.path())
-                .args(args)
-                .output()
-                .expect("run git");
-            assert!(
-                output.status.success(),
-                "git {} failed: {}",
-                args.first().copied().unwrap_or_default(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout)
-                .expect("git output is UTF-8")
-                .trim()
-                .to_owned()
-        };
-        assert_eq!(output(&["hash-object", "-w", "--stdin"]), EMPTY_BLOB);
-        assert_eq!(
-            output(&["mktree"]),
-            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        );
-    }
-}
+#[path = "tests/exe.rs"]
+mod tests;
