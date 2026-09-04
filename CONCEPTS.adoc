@@ -1,0 +1,306 @@
+= Concepts
+
+This is a list of concepts whose boundaries, relationships, and failure behavior deserve explicit invariants. It is intentionally a concept inventory rather than a specification of the invariants themselves.
+
+== Repository identity and discovery
+
+* Repository
+* Common Git directory
+* Worktree directory
+* Main worktree
+* Linked worktree
+* Bare repository
+* Repository format
+* Object format
+* Repository discovery
+* Hook execution environment
+* `GIT_DIR`
+* `GIT_WORK_TREE`
+* Current working directory
+
+== References and `HEAD`
+
+* Reference
+* Direct reference
+* Symbolic reference
+* Object reference
+* Reference target
+* Reference name
+* Captured reference
+* Excluded reference
+* Pseudo-reference
+* `HEAD`
+* Unborn `HEAD`
+* Detached `HEAD`
+* Checked-out branch
+* Branch
+* Tag
+* Remote-tracking reference
+* `refs/op`
+* Reference transaction
+* Reference transaction phase
+* Reference update
+* Reference creation
+* Reference deletion
+* Reference rename
+* Compare-and-swap reference edit
+* Reference race
+
+== Repository state
+
+* Repository state
+* Captured state
+* Current state
+* Target state
+* Initial state
+* Empty state
+* State equality
+* State drift
+* State serialization
+* State deserialization
+* Ref namespace tree
+* Ref tree path
+* Ref tree file/directory conflict
+* Metadata file
+* Git config
+* Repository description
+* Absent metadata
+* Empty metadata
+* Invalid snapshot content
+
+== Git objects and reachability
+
+* Object ID
+* Commit object
+* Tree object
+* Blob object
+* Empty blob
+* Empty tree
+* Missing object
+* Pruned object
+* Unusable object
+* Reachability
+* Object database
+* Packed object
+* Loose object
+* SHA-1 repository
+* SHA-256 repository
+
+== Operation log
+
+* Operation snapshot
+* Operation commit
+* Operation-log tip
+* Operation-log parent
+* Operation metadata
+* Operation message
+* Operation trailer
+* Action
+* Snapshot action
+* Restore action
+* Undo action
+* Redo action
+* Logical repository state
+* Physical operation commit
+* Logical transition
+* Current operation
+* Stale operation reference
+* Malformed operation commit
+* Missing operation trailer
+* Operation-log race
+* Operation-log pruning
+
+== History navigation
+
+* Current logical state
+* Previous logical state
+* Next logical state
+* Undo target
+* Redo target
+* Restore target
+* Undo chain
+* Redo chain
+* Branch point in history
+* New work after undo
+* Restore from the middle of history
+* No-op transition
+* Exhausted undo history
+* Exhausted redo history
+* History truncation
+* History continuity
+
+== Restore planning and application
+
+* Restore request
+* Restore plan
+* Restore precondition
+* Restore validation
+* Restore mutation
+* Restore completion
+* Restore refusal
+* Restore failure
+* Partial application
+* Rollback
+* Rollback failure
+* Expected current state
+* Observed current state
+* Concurrent repository change
+* Atomic ref update
+* Non-atomic filesystem update
+* Apply ordering
+* Mutation boundary
+
+== Worktree and index state
+
+* Worktree state
+* Index state
+* `HEAD` tree
+* Target tree
+* Worktree reset
+* Index reset
+* Tracked path
+* Untracked path
+* Ignored path
+* Staged change
+* Unstaged change
+* Deleted path
+* Renamed path
+* Copied path
+* File/directory conflict
+* Path collision
+* Affected path
+* Unrelated path
+* Dirty worktree
+* Clean worktree
+* Worktree checkout failure
+* Worktree path safety
+* Symlink
+* Submodule
+
+== Collision and data-loss protection
+
+* Overwritten file
+* Discarded local change
+* Untracked-file collision
+* Staged-change collision
+* Unstaged-change collision
+* Target-created path
+* Target-deleted path
+* Target-modified path
+* Target-renamed path
+* Ancestor conflict
+* Descendant conflict
+* Collision set
+* Collision reporting
+* Data-loss boundary
+* Safe no-op
+
+== Hook lifecycle
+
+* Hook installation
+* Hook uninstallation
+* Local hook
+* Global hook
+* Git template
+* Managed hook fragment
+* Foreign hook content
+* Hook merge
+* Hook idempotence
+* Hook replacement
+* Hook preservation
+* Hook executable bit
+* Hook discovery
+* Hook invocation
+* Hook standard input
+* Hook standard output
+* Hook standard error
+* Hook exit status
+* Best-effort snapshot
+* Hook-induced snapshot
+* Automatic uninstall
+* Operation-ref deletion
+
+== Command execution
+
+* Git subprocess
+* Command arguments
+* Command working directory
+* Command environment
+* Standard output
+* Standard error
+* Exit status
+* Machine-readable output
+* Human-readable output
+* Command failure
+* Diagnostic context
+* Broken pipe
+* Pager
+* Terminal detection
+* Process discovery
+* Shell invocation
+* Path encoding
+* Non-UTF-8 path
+
+== CLI and user-visible behavior
+
+* Command
+* Subcommand
+* Option
+* Positional argument
+* Revision specification
+* Operation specification
+* Abbreviated object ID
+* Invalid specification
+* Interactive mode
+* Non-interactive mode
+* Dry run
+* Dry-run plan
+* Dry-run fidelity
+* Confirmation prompt
+* Human-readable error
+* Structured error
+* JSON output
+* Oneline output
+* Reverse output
+* Maximum-count limit
+* Verbose output
+* Output ordering
+* Colorized output
+
+== Concurrency and external mutation
+
+* Concurrent Git process
+* Concurrent hook invocation
+* Concurrent snapshot append
+* Compare-and-swap retry
+* Lost race
+* Ref lock
+* Index lock
+* Worktree lock
+* Repository lock
+* External ref mutation
+* External metadata mutation
+* External worktree mutation
+* Stale plan
+* Retryability
+* Idempotent retry
+
+== Testing and compatibility
+
+* Reference-model state
+* Generated operation sequence
+* Transition-table case
+* Failure injection point
+* Before-state snapshot
+* After-state snapshot
+* Error-state preservation
+* Round-trip serialization
+* Git-version compatibility
+* gix-version compatibility
+* Platform path behavior
+* Filesystem permission behavior
+* Repository fixture
+* Integration test
+* Property test
+* Fuzz input
+* Regression case
