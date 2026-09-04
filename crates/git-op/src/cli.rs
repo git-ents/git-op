@@ -117,16 +117,17 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_takes_an_optional_local_flag() {
-        let cli = Cli::try_parse_from(["git-op", "uninstall"]).expect("parse uninstall");
-        let Command::Uninstall { local } = cli.command else {
-            panic!("expected the uninstall command");
+    fn install_and_uninstall_default_to_global_and_accept_local() {
+        let cli = Cli::try_parse_from(["git-op", "install"]).expect("parse install");
+        let Command::Install { local } = cli.command else {
+            panic!("expected the install command");
         };
         assert!(!local);
+
         let cli = Cli::try_parse_from(["git-op", "uninstall", "--local"])
             .expect("parse uninstall --local");
         let Command::Uninstall { local } = cli.command else {
-            panic!("expected the uninstall --local command");
+            panic!("expected the uninstall command");
         };
         assert!(local);
     }
