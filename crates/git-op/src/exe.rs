@@ -297,6 +297,10 @@ fn ref_targets(kind: &git_op::RefChangeKind) -> (String, String) {
     }
 }
 
+/// The well-known empty-blob object ID, so `show` never writes to the object
+/// database.
+const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
 /// Print the unified diff of one metadata file between two snapshot states.
 ///
 /// A side a snapshot does not capture diffs against the empty blob, so an
@@ -311,7 +315,6 @@ fn show_metadata_diff(
     if before == after {
         return Ok(());
     }
-    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
     let output = std::process::Command::new("git")
         .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
         .env("GIT_DIR", repo.git_dir())
@@ -392,7 +395,9 @@ fn short(oid: &gix::ObjectId) -> String {
 mod tests {
     use std::fs;
 
-    use super::{action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary};
+    use super::{
+        EMPTY_BLOB, action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary,
+    };
     fn repository() -> (gix::Repository, tempfile::TempDir) {
         let temp = tempfile::TempDir::new().expect("create temporary directory");
         let repo = gix::init(temp.path()).expect("initialize repository");
@@ -500,6 +505,34 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "working tree is dirty; commit or restore before changing repository state"
+        );
+    }
+
+    /// Verify that the well-known empty object IDs match what Git computes.
+    #[test]
+    fn well_known_empty_object_ids_match_git() {
+        let (_repo, temp) = repository();
+        let output = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(temp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.first().copied().unwrap_or_default(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output is UTF-8")
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(output(&["hash-object", "-w", "--stdin"]), EMPTY_BLOB);
+        assert_eq!(
+            output(&["mktree"]),
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         );
     }
 }
