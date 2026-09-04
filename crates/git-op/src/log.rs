@@ -635,6 +635,10 @@ fn write_json_escaped(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "tests use panics and direct indexing to express failed expectations"
+)]
 mod tests {
     use super::*;
 

@@ -87,6 +87,11 @@ pub(crate) enum Command {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    clippy::panic,
+    reason = "tests use panics and direct indexing to express failed expectations"
+)]
 mod tests {
     use clap::{CommandFactory, Parser};
 

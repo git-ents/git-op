@@ -59,7 +59,10 @@ fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>
 /// invoked with `PWD` in one repository and `GIT_DIR` pointing at another
 /// (as happens during `git clone`) would silently operate on the wrong
 /// repository.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "gix defines and returns this discovery error directly"
+)]
 pub(crate) fn open_repository() -> Result<gix::Repository, gix::discover::Error> {
     gix::discover_with_environment_overrides(".")
 }

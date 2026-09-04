@@ -405,7 +405,7 @@ fn operation_target(repo: &gix::Repository, name: &RefName) -> Result<Option<Obj
     };
     let parent = parent.to_owned();
     repo.find_commit(parent)
-        .map_err(|_| Error::InvalidOperationRef)?;
+        .map_err(|_error| Error::InvalidOperationRef)?;
     Ok(Some(parent))
 }
 
@@ -455,7 +455,7 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
         }
         let name = raw_name
             .to_str()
-            .map_err(|_| Error::InvalidRef(raw_name.to_string()))?;
+            .map_err(|_error| Error::InvalidRef(raw_name.to_string()))?;
         ref_values.insert(name.to_owned(), ref_contents(&reference));
     }
 
@@ -661,7 +661,7 @@ fn append_internal(
     options: AppendOptions,
 ) -> Result<(ObjectId, bool), Error> {
     let refs = GixRefStore::new(repo);
-    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let name = RefName::new(OP_REF).map_err(|_error| Error::InvalidRef(OP_REF.to_owned()))?;
     let invoked_by = matches!(requested_message, CommitMessage::Generated)
         .then(invocation::detect)
         .flatten();
@@ -1244,7 +1244,7 @@ fn ref_tree_entries(
         let name = entry
             .filename
             .to_str()
-            .map_err(|_| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
+            .map_err(|_error| Error::InvalidSnapshot("non-UTF-8 reference path".to_owned()))?;
         let kind = match entry.mode.kind() {
             kind @ (gix::objs::tree::EntryKind::Tree | gix::objs::tree::EntryKind::Blob) => kind,
             kind => {
@@ -1486,7 +1486,7 @@ fn missing_trailer(commit: ObjectId, trailer: &str) -> Error {
 }
 
 fn current_operation(repo: &gix::Repository) -> Result<Option<ObjectId>, Error> {
-    let name = RefName::new(OP_REF).map_err(|_| Error::InvalidRef(OP_REF.to_owned()))?;
+    let name = RefName::new(OP_REF).map_err(|_error| Error::InvalidRef(OP_REF.to_owned()))?;
     operation_target(repo, &name)
 }
 
@@ -1609,7 +1609,7 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
     .map_err(|error| {
         Error::InvalidSnapshot(format!("Git returned an invalid operation ID: {error}"))
     })?;
-    read(repo, oid).map_err(|_| {
+    read(repo, oid).map_err(|_error| {
         Error::InvalidSnapshot(format!("{specification:?} is not an operation snapshot"))
     })?;
     Ok(oid)
@@ -1644,16 +1644,15 @@ fn verify_object(repo: &gix::Repository, ref_name: &str, oid: ObjectId) -> Resul
     if !ref_name.starts_with("refs/heads/") {
         return Ok(());
     }
-    let commit =
-        object
-            .peel_to_kind(gix::objs::Kind::Commit)
-            .map_err(|_| Error::UnusableObject {
-                ref_name: ref_name.to_owned(),
-                oid,
-            })?;
+    let commit = object
+        .peel_to_kind(gix::objs::Kind::Commit)
+        .map_err(|_error| Error::UnusableObject {
+            ref_name: ref_name.to_owned(),
+            oid,
+        })?;
     commit
         .peel_to_kind(gix::objs::Kind::Tree)
-        .map_err(|_| Error::UnusableObject {
+        .map_err(|_error| Error::UnusableObject {
             ref_name: ref_name.to_owned(),
             oid,
         })?;
@@ -1986,7 +1985,7 @@ fn collect_ref_updates(
     updates: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<(), Error> {
     for entry in tree.decode().map_err(Error::git)?.entries {
-        let name = entry.filename.to_str().map_err(|_| {
+        let name = entry.filename.to_str().map_err(|_error| {
             Error::InvalidSnapshot(format!("non-UTF-8 reference path under {prefix}"))
         })?;
         let path = format!("{prefix}/{name}");
@@ -2027,11 +2026,12 @@ fn apply_ref_updates(
         .map_err(Error::git)?
     {
         let reference = reference.map_err(Error::git)?;
-        let name = reference.name().as_bstr().to_str().map_err(|_| {
+        let name = reference.name().as_bstr().to_str().map_err(|_error| {
             Error::InvalidSnapshot("repository contains a non-UTF-8 ref name".to_owned())
         })?;
         if is_captured_ref(name.as_bytes()) && !captured.contains(name) {
-            let name = FullName::try_from(name).map_err(|_| Error::InvalidRef(name.to_owned()))?;
+            let name =
+                FullName::try_from(name).map_err(|_error| Error::InvalidRef(name.to_owned()))?;
             edits.push(GixRefEdit {
                 change: Change::Delete {
                     expected: PreviousValue::MustExistAndMatch(reference.target().into_owned()),
@@ -2044,7 +2044,7 @@ fn apply_ref_updates(
     }
     for (name, contents) in updates {
         let name =
-            FullName::try_from(name.as_str()).map_err(|_| Error::InvalidRef(name.clone()))?;
+            FullName::try_from(name.as_str()).map_err(|_error| Error::InvalidRef(name.clone()))?;
         let target = parse_ref_contents(&contents)?;
         let expected = repo
             .try_find_reference(name.as_ref())
@@ -2073,14 +2073,14 @@ fn parse_ref_contents(contents: &[u8]) -> Result<Target, Error> {
     let contents = contents.strip_suffix(b"\n").unwrap_or(contents);
     if let Some(target) = contents.strip_prefix(b"ref: ") {
         let target = std::str::from_utf8(target)
-            .map_err(|_| Error::InvalidSnapshot("symbolic ref is not UTF-8".to_owned()))?;
+            .map_err(|_error| Error::InvalidSnapshot("symbolic ref is not UTF-8".to_owned()))?;
         return Ok(Target::Symbolic(FullName::try_from(target).map_err(
-            |_| Error::InvalidSnapshot("invalid symbolic ref target".to_owned()),
+            |_error| Error::InvalidSnapshot("invalid symbolic ref target".to_owned()),
         )?));
     }
     ObjectId::from_hex(contents)
         .map(Target::Object)
-        .map_err(|_| Error::InvalidSnapshot("invalid ref object ID".to_owned()))
+        .map_err(|_error| Error::InvalidSnapshot("invalid ref object ID".to_owned()))
 }
 
 /// Restore or remove one repository metadata file from a snapshot blob.
@@ -2267,6 +2267,13 @@ fn transaction_deletes_operation_ref(input: &[u8]) -> Result<bool, Error> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice,
+    reason = "tests use panics and direct indexing to express failed expectations"
+)]
 mod tests {
     use super::*;
     use std::{
@@ -2316,7 +2323,7 @@ mod tests {
     impl Drop for TemporaryRepository {
         /// Remove the temporary repository after the test completes.
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            drop(fs::remove_dir_all(&self.root));
         }
     }
 

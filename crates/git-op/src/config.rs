@@ -501,7 +501,7 @@ fn rewrite_managed_line(existing: &str) -> Option<String> {
 /// git-op hook, or that is not valid UTF-8 to scan, is refused.
 fn upgrade_hook(hooks: &Path, path: &Path, existing: &[u8]) -> Result<(), Error> {
     let existing =
-        std::str::from_utf8(existing).map_err(|_| Error::HookExists(path.to_path_buf()))?;
+        std::str::from_utf8(existing).map_err(|_error| Error::HookExists(path.to_path_buf()))?;
     let rewritten = rewrite_managed_line(existing).unwrap_or_else(|| splice_hook_line(existing));
     if rewritten == existing {
         return Ok(());
@@ -569,7 +569,7 @@ fn replace_hook(hooks: &Path, path: &Path, body: &str) -> Result<(), Error> {
         .as_nanos();
     let tmp_path = hooks.join(format!(".{HOOK_NAME}.tmp-{}-{unique}", std::process::id()));
     write_tmp_hook(&tmp_path, path, body).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp_path);
+        drop(fs::remove_file(&tmp_path));
     })
 }
 
@@ -599,6 +599,10 @@ fn make_executable(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "tests use panics and direct indexing to express failed expectations"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -638,7 +642,7 @@ mod tests {
     impl Drop for TemporaryHooksDir {
         /// Remove the temporary hooks directory after the test completes.
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            drop(fs::remove_dir_all(&self.path));
         }
     }
 
