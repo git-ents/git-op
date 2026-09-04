@@ -687,13 +687,15 @@ fn append_internal(
         let tree = serialize(repo, &state)?;
         let commit_id = write_commit(
             repo,
-            tree,
-            parent,
-            &message,
-            invoked_by.as_ref(),
-            &author,
-            &committer,
-            signing,
+            CommitTreeRequest {
+                tree,
+                parent,
+                message: &message,
+                invoked_by: invoked_by.as_ref(),
+                author: &author,
+                committer: &committer,
+                signing,
+            },
         )?;
         let edit = match parent {
             Some(expected) => RefEdit::Update {
@@ -725,36 +727,36 @@ fn trailer_text(value: &str) -> String {
 /// `git commit-tree` is used rather than constructing the commit object
 /// directly so Git's configured signing implementation can add a `gpgsig`
 /// header. It does not invoke commit hooks.
-#[allow(clippy::too_many_arguments)]
-fn write_commit(
-    repo: &gix::Repository,
+struct CommitTreeRequest<'a> {
     tree: ObjectId,
     parent: Option<ObjectId>,
-    message: &str,
-    invoked_by: Option<&InvokedBy>,
-    author: &gix::actor::Signature,
-    committer: &gix::actor::Signature,
+    message: &'a str,
+    invoked_by: Option<&'a InvokedBy>,
+    author: &'a gix::actor::Signature,
+    committer: &'a gix::actor::Signature,
     signing: bool,
-) -> Result<ObjectId, Error> {
+}
+
+fn write_commit(repo: &gix::Repository, commit: CommitTreeRequest<'_>) -> Result<ObjectId, Error> {
     let mut command = Command::new("git");
     command
         .current_dir(repo.current_dir())
         .arg("commit-tree")
-        .arg(tree.to_hex().to_string());
-    if let Some(parent) = parent {
+        .arg(commit.tree.to_hex().to_string());
+    if let Some(parent) = commit.parent {
         command.args(["-p", &parent.to_hex().to_string()]);
     }
-    command.arg("-m").arg(message);
-    if let Some(invoked_by) = invoked_by {
+    command.arg("-m").arg(commit.message);
+    if let Some(invoked_by) = commit.invoked_by {
         command
             .arg("-m")
             .arg(format!("Invoked-by: {}", trailer_text(invoked_by.as_str())));
     }
-    if signing {
+    if commit.signing {
         command.arg("-S");
     }
-    let author = format_signature(author)?;
-    let committer = format_signature(committer)?;
+    let author = format_signature(commit.author)?;
+    let committer = format_signature(commit.committer)?;
     let output = command
         .env("GIT_DIR", repo.git_dir())
         .env("GIT_AUTHOR_NAME", author.name)
@@ -2323,15 +2325,18 @@ mod tests {
                 offset: 0,
             },
         };
+        let invoked_by = InvokedBy("git commit".to_owned());
         let commit = write_commit(
             &temporary.repo,
-            tree,
-            None,
-            "op: capture initial repository state",
-            Some(&InvokedBy("git commit".to_owned())),
-            &signature,
-            &signature,
-            false,
+            CommitTreeRequest {
+                tree,
+                parent: None,
+                message: "op: capture initial repository state",
+                invoked_by: Some(&invoked_by),
+                author: &signature,
+                committer: &signature,
+                signing: false,
+            },
         )
         .expect("write operation commit");
         assert_eq!(
@@ -2939,13 +2944,15 @@ mod tests {
         };
         let parent = write_commit(
             &temporary.repo,
-            tree,
-            None,
-            "op: capture initial repository state",
-            None,
-            &signature,
-            &signature,
-            false,
+            CommitTreeRequest {
+                tree,
+                parent: None,
+                message: "op: capture initial repository state",
+                invoked_by: None,
+                author: &signature,
+                committer: &signature,
+                signing: false,
+            },
         )
         .expect("write parent snapshot");
         GixRefStore::new(&temporary.repo)
