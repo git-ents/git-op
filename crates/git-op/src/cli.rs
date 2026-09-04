@@ -24,12 +24,20 @@ pub(crate) enum Command {
         /// The phase supplied by Git: prepared, committed, or aborted.
         phase: String,
     },
-    /// Install the reference-transaction hook globally or in one repository.
+    /// Install the reference-transaction hook in the current repository.
     Install {
-        /// Install only in the current repository instead of Git's global template.
+        /// Install in Git's global template instead of the current repository.
         #[arg(long)]
-        local: bool,
+        global: bool,
     },
+    /// Remove the reference-transaction hook from the current repository.
+    Uninstall {
+        /// Remove it from Git's global template instead of the current repository.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Record the current repository state onto the operation log.
+    Snap,
     /// Show the recorded operation-log snapshots, most recent first.
     Log {
         /// Limit output to the first N snapshots.
@@ -71,13 +79,32 @@ pub(crate) enum Command {
         #[arg(short = 'n', long)]
         dry_run: bool,
     },
+    /// Decode one operation-log entry.
+    Show {
+        /// The operation commit to decode, defaulting to the log tip.
+        oid: Option<String>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, Command};
+
+    /// Verify that `snap` takes no arguments and is listed as a visible command.
+    #[test]
+    fn snap_parses_without_arguments_and_is_listed() {
+        let cli = Cli::try_parse_from(["git-op", "snap"]).expect("parse snap");
+        assert!(matches!(cli.command, Command::Snap));
+        assert!(Cli::try_parse_from(["git-op", "snap", "extra"]).is_err());
+        assert!(
+            Cli::command()
+                .get_subcommands()
+                .any(|command| command.get_name() == "snap" && !command.is_hide_set()),
+            "snap should be a visible subcommand"
+        );
+    }
 
     #[test]
     fn undo_is_zero_argument_and_accepts_dry_run() {
@@ -87,6 +114,22 @@ mod tests {
         };
         assert!(dry_run);
         assert!(Cli::try_parse_from(["git-op", "undo", "abc123"]).is_err());
+    }
+
+    #[test]
+    fn install_and_uninstall_default_to_local_and_accept_global() {
+        let cli = Cli::try_parse_from(["git-op", "install"]).expect("parse install");
+        let Command::Install { global } = cli.command else {
+            panic!("expected the install command");
+        };
+        assert!(!global);
+
+        let cli = Cli::try_parse_from(["git-op", "uninstall", "--global"])
+            .expect("parse uninstall --global");
+        let Command::Uninstall { global } = cli.command else {
+            panic!("expected the uninstall command");
+        };
+        assert!(global);
     }
 
     #[test]
@@ -107,6 +150,20 @@ mod tests {
         };
         assert_eq!(oid.as_deref(), Some("abc123"));
         assert!(dry_run);
+    }
+
+    #[test]
+    fn show_takes_an_optional_operation() {
+        let cli = Cli::try_parse_from(["git-op", "show"]).expect("parse show");
+        let Command::Show { oid } = cli.command else {
+            panic!("expected the show command");
+        };
+        assert_eq!(oid, None);
+        let cli = Cli::try_parse_from(["git-op", "show", "abc123"]).expect("parse show with oid");
+        let Command::Show { oid } = cli.command else {
+            panic!("expected the show command");
+        };
+        assert_eq!(oid.as_deref(), Some("abc123"));
     }
 
     #[test]
