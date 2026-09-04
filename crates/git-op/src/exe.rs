@@ -352,7 +352,7 @@ fn action_header(verb: &str, target: &gix::ObjectId, restored: Option<&gix::Obje
 
 fn action_summary(header: &str, result: &git_op::ActionResult) -> String {
     let mut summary = header.to_owned();
-    if !result.changed {
+    if result.changes.is_empty() {
         summary.push_str("; no updates");
         return summary;
     }
@@ -420,7 +420,6 @@ mod tests {
                     new: gix::refs::Target::Object(new),
                 },
             }])],
-            changed: true,
         };
         assert_eq!(
             action_summary(
@@ -443,7 +442,6 @@ mod tests {
             target: oid,
             restored: oid,
             changes: Vec::new(),
-            changed: false,
         };
         assert_eq!(
             action_summary(

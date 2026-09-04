@@ -1315,9 +1315,9 @@ pub struct ActionResult {
     /// The snapshot that was applied.
     pub restored: ObjectId,
     /// The captured state components changed while applying the snapshot.
+    /// An empty list means the selected state was already current and no log
+    /// entry was appended.
     pub changes: Vec<Changes>,
-    /// Whether the action changed the repository and appended a log entry.
-    pub changed: bool,
 }
 
 /// A state transition that can be displayed without applying it.
@@ -1460,7 +1460,6 @@ fn apply_action_with_trailers(
             target: plan.target,
             restored: plan.restored,
             changes,
-            changed: false,
         });
     }
     ensure_no_local_collisions(repo, &state)?;
@@ -1479,7 +1478,6 @@ fn apply_action_with_trailers(
         target: plan.target,
         restored: plan.restored,
         changes,
-        changed: true,
     })
 }
 
@@ -2675,7 +2673,7 @@ mod tests {
         let temporary = TemporaryRepository::new();
         let current = append(&temporary.repo, "current").expect("append current");
         let result = restore_action(&temporary.repo, current).expect("restore current");
-        assert!(!result.changed);
+        assert!(result.changes.is_empty());
         assert_eq!(result.operation, current);
     }
 
@@ -2700,7 +2698,7 @@ mod tests {
         );
 
         let result = restore_action(&temporary.repo, snapshot).expect("restore snapshot");
-        assert!(!result.changed);
+        assert!(result.changes.is_empty());
         assert_eq!(result.operation, snapshot);
         assert_eq!(temporary.repo.head_id().expect("read HEAD"), head);
         assert_eq!(
