@@ -10,8 +10,8 @@ use crate::cli::Command;
 pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
-        Command::Install { global } => install(global),
-        Command::Uninstall { global } => uninstall(global),
+        Command::Install { global } => install(!global),
+        Command::Uninstall { global } => uninstall(!global),
         Command::Snap => snap_command(),
         Command::Log {
             max_count,
