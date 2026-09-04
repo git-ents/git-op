@@ -1511,7 +1511,10 @@ fn operation_metadata(
         let Ok(action) = Action::try_from(action) else {
             continue;
         };
-        if let Some(target) = parse_operation_id(&value[1..])? {
+        let Some(value) = value.strip_prefix(b":") else {
+            continue;
+        };
+        if let Some(target) = parse_operation_id(value)? {
             actions.push((action, target));
         }
     }
@@ -1695,7 +1698,7 @@ fn set_head(repo: &gix::Repository, head: Target) -> Result<(), Error> {
     let Target::Symbolic(branch) = head else {
         return Ok(());
     };
-    let head = FullName::try_from("HEAD").expect("HEAD is a valid full ref name");
+    let head = FullName::try_from("HEAD").map_err(Error::git)?;
     repo.edit_reference(GixRefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1848,8 +1851,8 @@ fn ensure_no_local_collisions(
 fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     let mut current = path;
     std::iter::from_fn(move || {
-        let index = current.rfind('/')?;
-        current = &current[..index];
+        let (parent, _) = current.rsplit_once('/')?;
+        current = parent;
         Some(current)
     })
 }
@@ -1941,19 +1944,29 @@ fn status_paths(workdir: &Path) -> Result<WorktreeStatus, Error> {
         .split(|&byte| byte == 0)
         .filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
-        let (statuses, path) = record.split_at(2);
-        let path = String::from_utf8_lossy(&path[1..]).into_owned();
-        if statuses[0] == b'?' && statuses[1] == b'?' {
+        let Some((&index_status, record)) = record.split_first() else {
+            return Err(Error::message("git status returned an empty record"));
+        };
+        let Some((&worktree_status, path)) = record.split_first() else {
+            return Err(Error::message("git status returned a truncated record"));
+        };
+        let Some(path) = path.strip_prefix(b" ") else {
+            return Err(Error::message("git status returned a malformed record"));
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        if (index_status, worktree_status) == (b'?', b'?') {
             status.untracked.insert(path);
             continue;
         }
-        if statuses[0] != b' ' {
+        if index_status != b' ' {
             status.staged.insert(path.clone());
         }
-        if statuses[1] != b' ' && statuses[1] != b'D' {
+        if worktree_status != b' ' && worktree_status != b'D' {
             status.worktree_modified.insert(path.clone());
         }
-        if statuses.contains(&b'R') || statuses.contains(&b'C') {
+        if [index_status, worktree_status].contains(&b'R')
+            || [index_status, worktree_status].contains(&b'C')
+        {
             // Rename records carry the original path as a second field.
             if let Some(original) = records.next() {
                 status
@@ -2223,19 +2236,16 @@ fn transaction_updates(input: &[u8]) -> Result<Vec<TransactionUpdate<'_>>, Error
         if line.is_empty() {
             continue;
         }
-        let fields: Vec<_> = line
+        let mut fields = line
             .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect();
-        if fields.len() != 3 {
+            .filter(|field| !field.is_empty());
+        let parsed = (fields.next(), fields.next(), fields.next(), fields.next());
+        let (Some(_old), Some(new), Some(name), None) = parsed else {
             return Err(Error::InvalidHookInput(
                 String::from_utf8_lossy(line).into_owned(),
             ));
-        }
-        updates.push(TransactionUpdate {
-            new: fields[1],
-            name: fields[2],
-        });
+        };
+        updates.push(TransactionUpdate { new, name });
     }
     Ok(updates)
 }

@@ -158,7 +158,7 @@ impl Entry {
                 message
                     .windows(2)
                     .rposition(|window| window == b"\n\n")
-                    .map(|separator| &message[..separator])
+                    .and_then(|separator| message.get(..separator))
             })
             .unwrap_or(message)
     }
@@ -167,7 +167,7 @@ impl Entry {
     fn invoked_by(&self) -> Option<&[u8]> {
         let message = self.message.strip_suffix(b"\n").unwrap_or(&self.message);
         let separator = message.windows(2).rposition(|window| window == b"\n\n")?;
-        let trailer = &message[separator + 2..];
+        let trailer = message.get(separator + 2..)?;
         let value = trailer.strip_prefix(b"Invoked-by: ")?;
         (!value.is_empty() && !value.contains(&b'\n')).then_some(value)
     }
@@ -485,7 +485,8 @@ fn render_ref_lines(
     let shown = if verbose {
         refs
     } else {
-        &refs[..refs.len().min(MAX_REF_LINES)]
+        refs.get(..refs.len().min(MAX_REF_LINES))
+            .unwrap_or_default()
     };
     let width = |value: &str| value.chars().count();
     let name_width = shown
