@@ -317,16 +317,17 @@ fn extract_entries(
         let commit = repo.find_commit(id)?;
         let time = commit.committer()?.time()?;
         let changed = match git_op::changes(repo, id)? {
-            Some(changes) => Some(Changed {
-                refs: match changes.iter().find_map(|change| match change {
-                    git_op::Changes::Refs(_) => Some(ref_lines(repo, id)),
-                    _ => None,
-                }) {
-                    Some(refs) => refs?,
-                    None => Vec::new(),
-                },
-                files: git_op::Changes::file_names(&changes),
-            }),
+            Some(changes) => {
+                let files = git_op::Changes::file_names(&changes);
+                let refs = changes
+                    .into_iter()
+                    .find_map(|change| match change {
+                        git_op::Changes::Refs(refs) => Some(ref_lines(repo, refs)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(Changed { refs, files })
+            }
             None => None,
         };
         current = commit.parent_ids().next().map(|parent| parent.detach());
@@ -351,13 +352,9 @@ fn operation_action(message: &[u8]) -> Option<git_op::Action> {
     })
 }
 
-/// Resolve the refs one snapshot changed into renderable lines.
-fn ref_lines(
-    repo: &gix::Repository,
-    commit: gix::ObjectId,
-) -> Result<Vec<RefLine>, Box<dyn std::error::Error>> {
-    Ok(git_op::ref_changes(repo, commit)?
-        .unwrap_or_default()
+/// Resolve changed refs into renderable lines.
+fn ref_lines(repo: &gix::Repository, changes: Vec<git_op::RefChange>) -> Vec<RefLine> {
+    changes
         .into_iter()
         .map(|change| RefLine {
             name: change.name,
@@ -374,7 +371,7 @@ fn ref_lines(
                 },
             },
         })
-        .collect())
+        .collect()
 }
 
 /// Treat a broken pipe (for example `git op log | head`) as a normal exit.
