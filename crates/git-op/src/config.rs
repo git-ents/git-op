@@ -57,16 +57,10 @@ pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
 
 /// Install the hook in Git's configured global template directory.
 ///
-/// When `init.templateDir` is already configured, the hook is installed there
-/// and nothing else is touched: the directory belongs to its configuration,
-/// so git-op neither adds nor later removes files it did not write.
-/// Otherwise git-op claims a default template directory by writing
-/// `init.templateDir` into its own global config file and referencing that
-/// file from an `[include]` block appended to the global configuration;
-/// existing settings are never rewritten. A claimed directory gains any
-/// stock template files it is missing, so repositories initialized from it
-/// keep the files a default `git init` provides. The global configuration
-/// and template directory are process-wide, so prefer
+/// An already-configured directory gains only the hook; otherwise git-op
+/// claims a default directory, seeding it with Git's stock templates, via
+/// an `[include]`d config file that never rewrites existing settings. The
+/// global configuration and template directory are process-wide, so prefer
 /// [`install_local`](crate::install_local) when isolation matters.
 pub fn install_global() -> Result<(), Error> {
     match git_config_global_template()? {
@@ -226,23 +220,14 @@ pub fn uninstall_local(repo: &gix::Repository) -> Result<(), Error> {
 /// Remove the hook from Git's global template directory and every template
 /// directory, config file, and `[include]` entry git-op installed.
 ///
-/// A template directory the user configured keeps everything except
-/// git-op's own hook, even when its path matches the default one git-op
-/// would claim, so the user's `init.templateDir` setting never dangles. The
-/// default template directory git-op claimed is removed only when nothing
-/// outside git-op's and Git's stock files is present. The global
-/// configuration loses only the include entry referencing git-op's config
-/// file. The global configuration and template directory are process-wide,
-/// so prefer [`uninstall_local`](crate::uninstall_local) when isolation
-/// matters.
+/// Only directories git-op claimed are deleted; a user-configured one keeps
+/// everything except git-op's own hook. The global configuration and
+/// template directory are process-wide, so prefer
+/// [`uninstall_local`](crate::uninstall_local) when isolation matters.
 pub fn uninstall_global() -> Result<(), Error> {
     if let Some(template) = git_config_global_template()? {
         uninstall_hook(&template.join("hooks"))?;
     }
-    // Ownership is tracked by git-op's own config file, so a directory the
-    // user configured is never mistaken for a claimed one. Without a config
-    // home nothing can have been claimed, so its absence stops here rather
-    // than failing the whole uninstall.
     if let Some(config_home) = config_home_optional() {
         if let Some(claimed) = claimed_template(&config_home)? {
             uninstall_hook(&claimed.join("hooks"))?;

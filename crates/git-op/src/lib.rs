@@ -3534,7 +3534,6 @@ mod tests {
     fn op_ref_deletion_on_prepared_phase_leaves_the_hook() {
         let temporary = TemporaryRepository::new();
         install_local(&temporary.repo).expect("install hook");
-        // A deletion Git would report carries a real old value.
         let tip = "1111111111111111111111111111111111111111";
 
         reference_transaction(

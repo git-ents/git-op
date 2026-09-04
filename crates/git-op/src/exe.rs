@@ -311,8 +311,6 @@ fn show_metadata_diff(
     if before == after {
         return Ok(());
     }
-    // The well-known empty blob keeps `show` read-only: writing one into the
-    // object database would make an inspection command mutate the repository.
     const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
     let output = std::process::Command::new("git")
         .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
@@ -392,29 +390,13 @@ fn short(oid: &gix::ObjectId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
 
     use super::{action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary};
-    fn repository() -> (gix::Repository, std::path::PathBuf) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // Nanoseconds alone can collide between tests that start in the same
-        // clock tick, and sharing a directory would flake the tests.
-        static NEXT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-        let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after the Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "git-op-exe-{}-{unique}-{sequence}",
-            std::process::id()
-        ));
-        let repo = gix::init(&path).expect("initialize repository");
-        (repo, path)
+    fn repository() -> (gix::Repository, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("create temporary directory");
+        let repo = gix::init(temp.path()).expect("initialize repository");
+        (repo, temp)
     }
 
     #[test]
@@ -506,20 +488,18 @@ mod tests {
 
     #[test]
     fn clean_worktree_is_allowed() {
-        let (repo, path) = repository();
+        let (repo, _temp) = repository();
         ensure_clean(&repo).expect("clean worktree should be allowed");
-        fs::remove_dir_all(path).expect("remove temporary repository");
     }
 
     #[test]
     fn dirty_worktree_is_rejected() {
-        let (repo, path) = repository();
-        fs::write(path.join("untracked"), b"change").expect("write untracked file");
+        let (repo, temp) = repository();
+        fs::write(temp.path().join("untracked"), b"change").expect("write untracked file");
         let error = ensure_clean(&repo).expect_err("dirty worktree should be rejected");
         assert_eq!(
             error.to_string(),
             "working tree is dirty; commit or restore before changing repository state"
         );
-        fs::remove_dir_all(path).expect("remove temporary repository");
     }
 }

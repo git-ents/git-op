@@ -74,15 +74,12 @@ fn global_is_opt_in() {
     assert!(!home.path().join(".config/git/templates").exists());
 }
 
-/// A template directory the user configured belongs to them: git-op installs
-/// its hook there without adding stock files, and uninstall removes only the
-/// hook, never the directory — even when its path matches the default one
-/// git-op would claim.
+/// A template directory the user configured is never seeded or deleted, even
+/// when its path matches the default one git-op would claim.
 #[test]
 fn user_configured_template_directory_is_never_seeded_or_deleted() {
     let root = TempDir::new().expect("create working directory");
     let home = TempDir::new().expect("create home");
-    // The user configures exactly the path git-op would claim by default.
     let templates = home.path().join(".config/git/templates");
     std::fs::create_dir_all(templates.join("hooks")).expect("create templates");
     std::fs::write(templates.join("custom"), b"custom\n").expect("write custom file");
