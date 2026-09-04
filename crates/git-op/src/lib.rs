@@ -140,7 +140,7 @@ pub enum Error {
     /// A reference-transaction hook received malformed input.
     #[error("invalid reference-transaction input: {0}")]
     InvalidHookInput(String),
-    /// Installing the hook would overwrite a hook not installed by this crate.
+    /// The existing hook cannot be merged: unreadable, or replaced concurrently.
     #[error("refusing to overwrite existing hook {0}")]
     HookExists(PathBuf),
     /// The operation log has no earlier snapshot to restore.

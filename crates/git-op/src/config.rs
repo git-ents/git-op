@@ -29,8 +29,9 @@ const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 /// Install the `reference-transaction` hook in this repository.
 ///
 /// The git-op block is rewritten in place, whether written by an older
-/// version of git-op or merged into a hook of your own. A hook that does not
-/// invoke git-op is never overwritten.
+/// version of git-op or already merged into a hook of your own. A hook that
+/// does not invoke git-op gains the git-op line after its shebang, so your
+/// own commands keep running.
 ///
 /// # Examples
 ///
@@ -501,12 +502,31 @@ fn rewrite_managed_line(existing: &str) -> Option<String> {
 fn upgrade_hook(hooks: &Path, path: &Path, existing: &[u8]) -> Result<(), Error> {
     let existing =
         std::str::from_utf8(existing).map_err(|_| Error::HookExists(path.to_path_buf()))?;
-    let rewritten =
-        rewrite_managed_line(existing).ok_or_else(|| Error::HookExists(path.to_path_buf()))?;
+    let rewritten = rewrite_managed_line(existing).unwrap_or_else(|| splice_hook_line(existing));
     if rewritten == existing {
         return Ok(());
     }
     replace_hook(hooks, path, &rewritten)
+}
+
+/// Insert `HOOK_LINE` into a hook that does not invoke git-op yet.
+///
+/// The git-op line lands right after the shebang, or at the start when there
+/// is none, so a hook of your own keeps running after it.
+fn splice_hook_line(existing: &str) -> String {
+    let mut spliced = String::with_capacity(existing.len() + HOOK_LINE.len());
+    let mut lines = existing.split_inclusive('\n');
+    let first = lines.next().unwrap_or_default();
+    let shebang = first.starts_with("#!");
+    if shebang {
+        spliced.push_str(first);
+    }
+    spliced.push_str(HOOK_LINE);
+    if !shebang {
+        spliced.push_str(first);
+    }
+    spliced.push_str(&lines.collect::<String>());
+    spliced
 }
 
 /// Install the hook without replacing an unrelated existing hook.
@@ -691,16 +711,33 @@ mod tests {
         assert_eq!(body, HOOK_BODY.as_bytes());
     }
 
-    /// Verify that a genuinely foreign hook is refused and left untouched.
+    /// Verify that a hook of your own gains the git-op line and keeps its
+    /// own commands.
     #[test]
-    fn install_over_foreign_hook_is_refused() {
+    fn install_over_foreign_hook_splices_the_git_op_line() {
         let hooks = TemporaryHooksDir::new();
         let foreign = "#!/bin/sh\necho something-else\n";
         fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
-        let error = install_hook(&hooks.path).expect_err("foreign hook must be refused");
-        assert!(matches!(error, Error::HookExists(_)));
-        let body = fs::read(hooks.hook_path()).expect("read hook after refused install");
-        assert_eq!(body, foreign.as_bytes());
+        install_hook(&hooks.path).expect("install hook");
+        let body = fs::read_to_string(hooks.hook_path()).expect("read hook after install");
+        let expected = format!("#!/bin/sh\n{HOOK_LINE}echo something-else\n");
+        assert_eq!(body, expected);
+        install_hook(&hooks.path).expect("reinstall hook");
+        let body = fs::read_to_string(hooks.hook_path()).expect("read hook after reinstall");
+        assert_eq!(
+            body, expected,
+            "reinstalling must not duplicate the git-op line"
+        );
+    }
+
+    /// Verify that a hook without a shebang is spliced at the start.
+    #[test]
+    fn install_over_shebangless_hook_splices_at_the_start() {
+        let hooks = TemporaryHooksDir::new();
+        fs::write(hooks.hook_path(), "echo something-else\n").expect("write foreign hook");
+        install_hook(&hooks.path).expect("install hook");
+        let body = fs::read_to_string(hooks.hook_path()).expect("read hook after install");
+        assert_eq!(body, format!("{HOOK_LINE}echo something-else\n"));
     }
 
     /// Verify that a missing git-op binary never blocks ref updates: the hook
