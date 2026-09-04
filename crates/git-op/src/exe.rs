@@ -286,14 +286,10 @@ fn show_command(specification: Option<&str>) -> Result<(), Box<dyn std::error::E
 
 /// Render a captured ref transition as its before and after targets.
 fn ref_targets(kind: &git_op::RefChangeKind) -> (String, String) {
-    let target = |target: &gix::refs::Target| match target {
-        gix::refs::Target::Object(oid) => short(oid),
-        gix::refs::Target::Symbolic(name) => format!("ref: {name}"),
-    };
     match kind {
-        git_op::RefChangeKind::Created(new) => ("(new)".to_owned(), target(new)),
-        git_op::RefChangeKind::Deleted(old) => (target(old), "(deleted)".to_owned()),
-        git_op::RefChangeKind::Updated { old, new } => (target(old), target(new)),
+        git_op::RefChangeKind::Created(new) => ("(new)".to_owned(), target_summary(new)),
+        git_op::RefChangeKind::Deleted(old) => (target_summary(old), "(deleted)".to_owned()),
+        git_op::RefChangeKind::Updated { old, new } => (target_summary(old), target_summary(new)),
     }
 }
 
