@@ -24,17 +24,17 @@ pub(crate) enum Command {
         /// The phase supplied by Git: prepared, committed, or aborted.
         phase: String,
     },
-    /// Install the reference-transaction hook globally or in one repository.
+    /// Install the reference-transaction hook in the current repository.
     Install {
-        /// Install only in the current repository instead of Git's global template.
+        /// Install in Git's global template instead of the current repository.
         #[arg(long)]
-        local: bool,
+        global: bool,
     },
-    /// Remove the reference-transaction hook globally or from one repository.
+    /// Remove the reference-transaction hook from the current repository.
     Uninstall {
-        /// Uninstall only from the current repository instead of Git's global template.
+        /// Remove it from Git's global template instead of the current repository.
         #[arg(long)]
-        local: bool,
+        global: bool,
     },
     /// Record the current repository state onto the operation log.
     Snap,
@@ -117,19 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn install_and_uninstall_default_to_global_and_accept_local() {
+    fn install_and_uninstall_default_to_local_and_accept_global() {
         let cli = Cli::try_parse_from(["git-op", "install"]).expect("parse install");
-        let Command::Install { local } = cli.command else {
+        let Command::Install { global } = cli.command else {
             panic!("expected the install command");
         };
-        assert!(!local);
+        assert!(!global);
 
-        let cli = Cli::try_parse_from(["git-op", "uninstall", "--local"])
-            .expect("parse uninstall --local");
-        let Command::Uninstall { local } = cli.command else {
+        let cli = Cli::try_parse_from(["git-op", "uninstall", "--global"])
+            .expect("parse uninstall --global");
+        let Command::Uninstall { global } = cli.command else {
             panic!("expected the uninstall command");
         };
-        assert!(local);
+        assert!(global);
     }
 
     #[test]
