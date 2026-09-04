@@ -3,6 +3,7 @@
 use std::io::{self, IsTerminal, Read, Write};
 
 use git_op::ReferenceTransactionPhase;
+use gix::prelude::Write as GixWrite;
 
 use crate::cli::Command;
 
@@ -299,10 +300,6 @@ fn ref_targets(kind: &git_op::RefChangeKind) -> (String, String) {
     }
 }
 
-/// The well-known empty-blob object ID, so `show` never writes to the object
-/// database.
-const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
-
 /// Print the unified diff of one metadata file between two snapshot states.
 ///
 /// A side a snapshot does not capture diffs against the empty blob, so an
@@ -317,6 +314,9 @@ fn show_metadata_diff(
     if before == after {
         return Ok(());
     }
+    let empty_blob = repo
+        .write_buf(gix::objs::Kind::Blob, b"")
+        .map_err(|error| error.to_string())?;
     let output = std::process::Command::new("git")
         .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
         .env("GIT_DIR", repo.git_dir())
@@ -324,10 +324,10 @@ fn show_metadata_diff(
             "diff",
             &before
                 .map(|oid| oid.to_string())
-                .unwrap_or(EMPTY_BLOB.to_owned()),
+                .unwrap_or_else(|| empty_blob.to_string()),
             &after
                 .map(|oid| oid.to_string())
-                .unwrap_or(EMPTY_BLOB.to_owned()),
+                .unwrap_or_else(|| empty_blob.to_string()),
             "--",
         ])
         .output()?;

@@ -1,8 +1,6 @@
 use std::fs;
 
-use super::{
-    EMPTY_BLOB, action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary,
-};
+use super::{action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary};
 fn repository() -> (gix::Repository, tempfile::TempDir) {
     let temp = tempfile::TempDir::new().expect("create temporary directory");
     let repo = gix::init(temp.path()).expect("initialize repository");
@@ -125,7 +123,10 @@ fn well_known_empty_object_ids_match_git() {
             .trim()
             .to_owned()
     };
-    assert_eq!(output(&["hash-object", "-w", "--stdin"]), EMPTY_BLOB);
+    assert_eq!(
+        output(&["hash-object", "--stdin"]),
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    );
     assert_eq!(
         output(&["mktree"]),
         "4b825dc642cb6eb9a060e54bf8d69288fbee4904"

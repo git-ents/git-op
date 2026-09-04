@@ -315,6 +315,19 @@ fn restore_refuses_staged_changes_on_affected_paths() {
     );
 }
 #[test]
+fn undo_refuses_to_remove_checked_out_branch() {
+    let temporary = TemporaryRepository::new();
+    git(&temporary, &["commit", "--allow-empty", "-m", "base"]);
+    append(&temporary.repo, "initial").expect("append initial");
+    git(&temporary, &["checkout", "-b", "topic"]);
+    append(&temporary.repo, "topic").expect("append topic");
+    let error = undo_action(&temporary.repo).expect_err("checked-out branch must survive");
+    assert!(matches!(error, Error::CheckedOutBranch { .. }));
+    assert!(temporary.repo.head_name().expect("read HEAD").is_some());
+    assert!(temporary.repo.find_reference("refs/heads/topic").is_ok());
+}
+
+#[test]
 fn undo_and_redo_follow_the_logical_transition_table() {
     let temporary = TemporaryRepository::new();
     git(&temporary, &["commit", "--allow-empty", "-m", "base"]);

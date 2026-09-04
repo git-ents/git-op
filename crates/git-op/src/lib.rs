@@ -171,6 +171,12 @@ pub enum Error {
         /// The object ID that cannot back a checkout.
         oid: ObjectId,
     },
+    /// The snapshot would remove a branch checked out in a worktree.
+    #[error("cannot restore: snapshot does not contain checked-out branch {branch}")]
+    CheckedOutBranch {
+        /// The branch that would become unborn if removed.
+        branch: String,
+    },
     /// Restoring would overwrite untracked files or discard uncommitted
     /// changes, so the blocked paths are reported instead.
     #[error("cannot restore: {}", collision_list(.collisions))]
@@ -448,9 +454,18 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
         .all()
         .map_err(Error::git)?
     {
-        let reference = reference.map_err(Error::git)?;
+        let reference = match reference {
+            Ok(reference) => reference,
+            Err(error) if error.to_string().contains("refs/heads/.invalid") => continue,
+            Err(error) => return Err(Error::git(error)),
+        };
         let raw_name = reference.name().as_bstr();
         if !is_captured_ref(raw_name.as_bytes()) {
+            continue;
+        }
+        if matches!(reference.target(), gix::refs::TargetRef::Symbolic(target)
+            if target.as_bstr().as_bytes().ends_with(b"/.invalid"))
+        {
             continue;
         }
         let name = raw_name
@@ -1462,6 +1477,7 @@ fn apply_action_with_trailers(
             changes,
         });
     }
+    refuse_checked_out_branch_removal(repo, &state)?;
     ensure_no_local_collisions(repo, &state)?;
     apply_state(repo, &state)?;
     let primary_target = primary_target.unwrap_or(plan.target);
@@ -1536,21 +1552,24 @@ fn next_redo_target(
     redo: ObjectId,
     undone: ObjectId,
 ) -> Result<Option<ObjectId>, Error> {
-    let parent = parent_snapshot(repo, redo)?;
-    let Some(parent) = parent else {
-        return Ok(None);
-    };
-    let metadata = operation_metadata(repo, parent)?;
-    if !metadata.actions.contains(&(Action::Undo, undone)) {
-        return Ok(None);
+    // Redo operations form a chain above the original undo operations. Walk
+    // through that chain until finding the undo that produced `undone`; its
+    // parent identifies the next older state to reapply.
+    let mut operation = parent_snapshot(repo, redo)?;
+    while let Some(commit) = operation {
+        let metadata = operation_metadata(repo, commit)?;
+        if metadata.actions.contains(&(Action::Undo, undone)) {
+            let Some(previous_undo) = parent_snapshot(repo, commit)? else {
+                return Ok(None);
+            };
+            return Ok(operation_metadata(repo, previous_undo)?
+                .actions
+                .iter()
+                .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)));
+        }
+        operation = parent_snapshot(repo, commit)?;
     }
-    let Some(previous_undo) = parent_snapshot(repo, parent)? else {
-        return Ok(None);
-    };
-    Ok(operation_metadata(repo, previous_undo)?
-        .actions
-        .iter()
-        .find_map(|(action, target)| (*action == Action::Undo).then_some(*target)))
+    Ok(None)
 }
 
 /// The first parent of an operation snapshot, or `None` for the initial one.
@@ -1787,6 +1806,39 @@ fn snapshot_worktree_tree(
         }
         Err(_) => Ok(None),
     }
+}
+
+/// Refuse to remove the branch currently checked out by this worktree.
+fn refuse_checked_out_branch_removal(
+    repo: &gix::Repository,
+    state: &RepositoryState,
+) -> Result<(), Error> {
+    let output = Command::new("git")
+        .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
+        .env("GIT_DIR", repo.git_dir())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(Error::git)?;
+    if !output.status.success() {
+        return Err(Error::message(format!(
+            "git worktree list failed with {}",
+            output.status
+        )));
+    }
+    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let mut updates = Vec::new();
+    collect_ref_updates(repo, &refs, "refs", &mut updates)?;
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Some(branch) = line.strip_prefix(b"branch ") else {
+            continue;
+        };
+        if updates.iter().all(|(name, _)| name.as_bytes() != branch) {
+            return Err(Error::CheckedOutBranch {
+                branch: String::from_utf8_lossy(branch).into_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuse to apply `state` when the reset would overwrite untracked files or
