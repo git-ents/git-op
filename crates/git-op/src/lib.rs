@@ -606,15 +606,22 @@ pub fn append_with_options(
     append_internal(repo, CommitMessage::Explicit(message), options).map(|(operation, _)| operation)
 }
 
-/// The outcome of [`snap`]: the operation-log tip and who put it there.
+/// The result of recording repository state on the operation log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapResult {
-    /// The operation-log commit that reflects the repository state after the
-    /// call: the newly appended snapshot, or the existing tip for a no-op.
-    pub operation: ObjectId,
-    /// Whether this call appended the snapshot, as opposed to finding the
-    /// log already current.
-    pub appended: bool,
+pub enum SnapResult {
+    /// This call appended the snapshot.
+    Appended(ObjectId),
+    /// The existing operation-log tip already reflected the repository state.
+    Current(ObjectId),
+}
+
+impl SnapResult {
+    /// The operation-log commit reflecting the repository state.
+    pub const fn operation(self) -> ObjectId {
+        match self {
+            Self::Appended(operation) | Self::Current(operation) => operation,
+        }
+    }
 }
 
 /// The outcome of a [`snap`] request.
@@ -640,10 +647,12 @@ pub fn snap(repo: &gix::Repository) -> Result<SnapOutcome, Error> {
     }
     let (operation, appended) =
         append_internal(repo, CommitMessage::Generated, AppendOptions::default())?;
-    Ok(SnapOutcome::Recorded(SnapResult {
-        operation,
-        appended,
-    }))
+    let result = if appended {
+        SnapResult::Appended(operation)
+    } else {
+        SnapResult::Current(operation)
+    };
+    Ok(SnapOutcome::Recorded(result))
 }
 
 fn append_internal(
@@ -2966,8 +2975,7 @@ mod tests {
         let SnapOutcome::Recorded(snapped) = snapped else {
             panic!("snap on a branch records or finds the current state");
         };
-        assert!(!snapped.appended);
-        assert_eq!(snapped.operation, parent);
+        assert_eq!(snapped, SnapResult::Current(parent));
     }
 
     /// Verify that generated messages identify changed snapshot components.
@@ -3146,14 +3154,15 @@ mod tests {
         else {
             panic!("first snap on a branch records the initial snapshot");
         };
-        assert!(initial.appended, "first snap appends the initial snapshot");
+        let SnapResult::Appended(initial) = initial else {
+            panic!("first snap should append");
+        };
         let SnapOutcome::Recorded(snapped) =
             snap(&temporary.repo).expect("snap up-to-date repository")
         else {
             panic!("snap on a branch records or finds the current state");
         };
-        assert!(!snapped.appended, "second snap finds the log current");
-        assert_eq!(snapped.operation, initial.operation);
+        assert_eq!(snapped, SnapResult::Current(initial));
         assert_eq!(
             temporary
                 .repo
@@ -3161,7 +3170,7 @@ mod tests {
                 .expect("read operation ref")
                 .target()
                 .try_id(),
-            Some(initial.operation.as_ref())
+            Some(initial.as_ref())
         );
     }
 
@@ -3175,14 +3184,14 @@ mod tests {
         else {
             panic!("snap on a branch records the initial snapshot");
         };
-        let initial = initial.operation;
+        let initial = initial.operation();
         fs::write(
             temporary.repo.common_dir().join("description"),
             b"drifted description\n",
         )
         .expect("write description");
         let snapped = match snap(&temporary.repo).expect("snap drifted repository") {
-            SnapOutcome::Recorded(snapped) => snapped.operation,
+            SnapOutcome::Recorded(snapped) => snapped.operation(),
             SnapOutcome::Detached => panic!("snap on a branch records the drifted state"),
         };
         assert_ne!(snapped, initial);

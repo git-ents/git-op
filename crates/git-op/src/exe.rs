@@ -119,18 +119,21 @@ fn snap_command() -> Result<(), Box<dyn std::error::Error>> {
 /// Describe a snap outcome.
 fn snap_outcome_summary(outcome: &git_op::SnapOutcome) -> String {
     match outcome {
-        git_op::SnapOutcome::Recorded(snapped) => snap_summary(snapped),
+        git_op::SnapOutcome::Recorded(snapped) => snap_summary(*snapped),
         git_op::SnapOutcome::Detached => "HEAD is detached; no snapshot recorded".to_owned(),
     }
 }
 
 /// Describe a recorded snap, attributing a snapshot to this invocation only
 /// when this call actually appended it.
-fn snap_summary(snapped: &git_op::SnapResult) -> String {
-    if snapped.appended {
-        format!("Recorded snapshot {}", short(&snapped.operation))
-    } else {
-        format!("Operation log is current ({})", short(&snapped.operation))
+fn snap_summary(snapped: git_op::SnapResult) -> String {
+    match snapped {
+        git_op::SnapResult::Appended(operation) => {
+            format!("Recorded snapshot {}", short(&operation))
+        }
+        git_op::SnapResult::Current(operation) => {
+            format!("Operation log is current ({})", short(&operation))
+        }
     }
 }
 
@@ -457,16 +460,10 @@ mod tests {
     fn snap_summary_reports_whether_this_invocation_appended() {
         let oid = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
             .expect("parse object ID");
-        let appended = git_op::SnapResult {
-            operation: oid,
-            appended: true,
-        };
-        assert_eq!(snap_summary(&appended), "Recorded snapshot 1111111");
-        let current = git_op::SnapResult {
-            operation: oid,
-            appended: false,
-        };
-        assert_eq!(snap_summary(&current), "Operation log is current (1111111)");
+        let appended = git_op::SnapResult::Appended(oid);
+        assert_eq!(snap_summary(appended), "Recorded snapshot 1111111");
+        let current = git_op::SnapResult::Current(oid);
+        assert_eq!(snap_summary(current), "Operation log is current (1111111)");
     }
 
     /// Verify that a detached HEAD reports an informational no-op.
@@ -476,11 +473,10 @@ mod tests {
             snap_outcome_summary(&git_op::SnapOutcome::Detached),
             "HEAD is detached; no snapshot recorded"
         );
-        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult {
-            operation: gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+        let recorded = git_op::SnapOutcome::Recorded(git_op::SnapResult::Current(
+            gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
                 .expect("parse object ID"),
-            appended: false,
-        });
+        ));
         assert_eq!(
             snap_outcome_summary(&recorded),
             "Operation log is current (1111111)"
