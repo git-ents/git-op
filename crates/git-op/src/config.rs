@@ -35,10 +35,7 @@ exec <"$tmp"
 
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
-/// The git-op block is rewritten in place, whether written by an older
-/// version of git-op or already merged into a hook of your own. A hook that
-/// does not invoke git-op gains the git-op line after its shebang, so your
-/// own commands keep running.
+/// Existing hooks are never replaced; merge hook commands manually when needed.
 ///
 /// # Examples
 ///
@@ -465,15 +462,11 @@ fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
 }
 
 fn install_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    install_hook_file(hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_BODY, |line| {
-        line.contains("OP_REF is local-only at this time")
-    })
+    install_standalone_hook(hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_BODY)
 }
 
 fn uninstall_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    uninstall_hook_file(hooks, PRE_PUSH_HOOK_NAME, |line| {
-        line.contains("OP_REF is local-only at this time")
-    })
+    uninstall_standalone_hook(hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_BODY)
 }
 
 fn install_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), Error> {
@@ -492,139 +485,14 @@ fn install_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), E
     make_executable(&path)
 }
 
-fn install_hook_file(
-    hooks: &Path,
-    name: &str,
-    body: &str,
-    is_managed: impl Fn(&str) -> bool,
-) -> Result<(), Error> {
-    fs::create_dir_all(hooks).map_err(Error::git)?;
+fn uninstall_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), Error> {
     let path = hooks.join(name);
     match fs::read(&path) {
-        Ok(existing) => return upgrade_hook_file(hooks, &path, &existing, body, is_managed),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Error::git(error)),
+        Ok(existing) if existing == body.as_bytes() => fs::remove_file(path).map_err(Error::git),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::git(error)),
     }
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::HookExists(path));
-        }
-        Err(error) => return Err(Error::git(error)),
-    };
-    file.write_all(body.as_bytes()).map_err(Error::git)?;
-    file.sync_all().map_err(Error::git)?;
-    drop(file);
-    make_executable(&path)
-}
-
-fn uninstall_hook_file(
-    hooks: &Path,
-    name: &str,
-    is_managed: impl Fn(&str) -> bool,
-) -> Result<(), Error> {
-    let path = hooks.join(name);
-    let existing = match fs::read_to_string(&path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return Err(Error::message(format!(
-                "refusing to uninstall hook {}: not valid UTF-8",
-                path.display()
-            )));
-        }
-        Err(error) => return Err(Error::git(error)),
-    };
-    let stripped = existing
-        .split_inclusive('\n')
-        .filter(|line| !is_managed(line.trim_end_matches(['\n', '\r'])))
-        .collect::<String>();
-    if stripped == existing {
-        return Ok(());
-    }
-    if stripped
-        .lines()
-        .all(|line| line.trim().is_empty() || line.starts_with("#!"))
-    {
-        return fs::remove_file(path).map_err(Error::git);
-    }
-    replace_hook_file(hooks, &path, &stripped)
-}
-
-fn upgrade_hook_file(
-    hooks: &Path,
-    path: &Path,
-    existing: &[u8],
-    body: &str,
-    is_managed: impl Fn(&str) -> bool,
-) -> Result<(), Error> {
-    let existing =
-        std::str::from_utf8(existing).map_err(|_error| Error::HookExists(path.to_path_buf()))?;
-    let rewritten = rewrite_hook_line(existing, body, is_managed);
-    if rewritten == existing {
-        return Ok(());
-    }
-    replace_hook_file(hooks, path, &rewritten)
-}
-
-fn rewrite_hook_line(existing: &str, body: &str, is_managed: impl Fn(&str) -> bool) -> String {
-    let managed = body.strip_prefix("#!/bin/sh\n").unwrap_or(body);
-    let mut rewritten = String::with_capacity(existing.len() + managed.len());
-    let mut spliced = false;
-    for current in existing.split_inclusive('\n') {
-        if is_managed(current.trim_end_matches(['\n', '\r'])) {
-            if !spliced {
-                rewritten.push_str(managed);
-                spliced = true;
-            }
-        } else {
-            rewritten.push_str(current);
-        }
-    }
-    if spliced {
-        return rewritten;
-    }
-    let mut spliced = String::with_capacity(existing.len() + managed.len());
-    let mut lines = existing.split_inclusive('\n');
-    let first = lines.next().unwrap_or_default();
-    if first.starts_with("#!") {
-        spliced.push_str(first);
-    }
-    spliced.push_str(managed);
-    if !first.starts_with("#!") {
-        spliced.push_str(first);
-    }
-    spliced.push_str(&lines.collect::<String>());
-    spliced
-}
-
-/// Atomically replace `path` with `body`.
-///
-/// The body is written to a uniquely-named temporary file in `hooks` first,
-/// then renamed over `path`, so the live hook is never truncated in place.
-fn replace_hook_file(hooks: &Path, path: &Path, body: &str) -> Result<(), Error> {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| Error::message(error.to_string()))?
-        .as_nanos();
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("hook");
-    let tmp_path = hooks.join(format!(".{name}.tmp-{}-{unique}", std::process::id()));
-    write_tmp_hook(&tmp_path, path, body).inspect_err(|_| {
-        drop(fs::remove_file(&tmp_path));
-    })
-}
-
-/// Write `body` to `tmp_path` and rename it over `path`.
-fn write_tmp_hook(tmp_path: &Path, path: &Path, body: &str) -> Result<(), Error> {
-    let mut file = fs::File::create_new(tmp_path).map_err(Error::git)?;
-    file.write_all(body.as_bytes()).map_err(Error::git)?;
-    file.sync_all().map_err(Error::git)?;
-    drop(file);
-    make_executable(tmp_path)?;
-    fs::rename(tmp_path, path).map_err(Error::git)
 }
 
 /// Ensure the hook has executable permissions on supported platforms.
