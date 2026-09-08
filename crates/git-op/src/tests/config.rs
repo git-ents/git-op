@@ -55,7 +55,7 @@ fn is_executable(path: &Path) -> bool {
 #[test]
 fn fresh_install_writes_executable_hook() {
     let hooks = TemporaryHooksDir::new();
-    install_hook(&hooks.path).expect("install hook");
+    install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY).expect("install hook");
     let body = fs::read(hooks.hook_path()).expect("read installed hook");
     assert_eq!(body, HOOK_BODY.as_bytes());
     #[cfg(unix)]
@@ -68,12 +68,59 @@ fn install_over_existing_hook_returns_hook_exists() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.hook_path(), existing).expect("write existing hook");
-    let error = install_hook(&hooks.path).expect_err("existing hook must be rejected");
+    let error = install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY)
+        .expect_err("existing hook must be rejected");
     assert!(matches!(error, Error::HookExists(path) if path == hooks.hook_path()));
     assert_eq!(
         fs::read_to_string(hooks.hook_path()).expect("read existing hook"),
         existing
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_push_rejects_operation_ref_and_allows_other_refs() {
+    let hooks = TemporaryHooksDir::new();
+    install_pre_push_hook(&hooks.path).expect("install pre-push hook");
+
+    let run = |input: &str| {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(hooks.path.join(PRE_PUSH_HOOK_NAME))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("spawn pre-push hook");
+        child
+            .stdin
+            .take()
+            .expect("open pre-push stdin")
+            .write_all(input.as_bytes())
+            .expect("write pre-push input");
+        child.wait_with_output().expect("wait for pre-push hook")
+    };
+    let rejected = run(
+        "refs/op 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n",
+    );
+    let rejected_remote = run(
+        "refs/heads/main 1111111111111111111111111111111111111111 refs/op 2222222222222222222222222222222222222222\n",
+    );
+    assert!(!rejected.status.success());
+    assert!(!rejected_remote.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&rejected.stderr).trim(),
+        "OP_REF is local-only at this time"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rejected_remote.stderr).trim(),
+        "OP_REF is local-only at this time"
+    );
+
+    let allowed = run(
+        "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n",
+    );
+    assert!(allowed.status.success());
+    assert!(allowed.stderr.is_empty());
 }
 
 /// Verify that a missing git-op binary never blocks ref updates: the hook
@@ -82,7 +129,7 @@ fn install_over_existing_hook_returns_hook_exists() {
 #[test]
 fn missing_binary_exits_zero_and_warns_only_on_committed_phase() {
     let hooks = TemporaryHooksDir::new();
-    install_hook(&hooks.path).expect("install hook");
+    install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY).expect("install hook");
     let run = |phase: &str| {
         let output = Command::new("/bin/sh")
             .arg(hooks.hook_path())
