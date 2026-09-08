@@ -1,10 +1,10 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 static NEXT_TEMP_HOOKS_DIR: AtomicUsize = AtomicUsize::new(0);
-
-/// Historical hook body shipped before [`HOOK_LINE`] existed.
-const HISTORICAL_HOOK_BODY: &str = "#!/bin/sh\nexec git op reference-transaction \"$@\"\n";
 
 /// Own a temporary hooks directory and remove it when the test finishes.
 struct TemporaryHooksDir {
@@ -51,33 +51,6 @@ fn is_executable(path: &Path) -> bool {
         != 0
 }
 
-/// Verify that a hook this version writes is still recognized, and left
-/// unchanged, by the next upgrade.
-#[test]
-fn hook_body_is_recognized_unchanged() {
-    assert_eq!(rewrite_managed_line(HOOK_BODY).as_deref(), Some(HOOK_BODY));
-}
-
-#[test]
-fn rewrite_removes_every_git_op_line() {
-    let existing = concat!(
-        "#!/bin/sh\n",
-        "echo before\n",
-        "git-op old-hook-line\n",
-        "# git-op in a comment\n",
-        "git op reference-transaction \"$@\"\n",
-        "echo after\n",
-    );
-    let expected = format!(
-        "#!/bin/sh\n{}{}{}{}",
-        "echo before\n", HOOK_LINE, "# git-op in a comment\n", "echo after\n",
-    );
-    assert_eq!(
-        rewrite_managed_line(existing).as_deref(),
-        Some(expected.as_str())
-    );
-}
-
 /// Verify that a fresh install writes an executable hook with the current body.
 #[test]
 fn fresh_install_writes_executable_hook() {
@@ -89,53 +62,18 @@ fn fresh_install_writes_executable_hook() {
     assert!(is_executable(&hooks.hook_path()));
 }
 
-/// Verify that installing over the current body is idempotent.
+/// Verify that installing over an existing hook refuses to replace it.
 #[test]
-fn install_over_current_body_is_idempotent() {
+fn install_over_existing_hook_returns_hook_exists() {
     let hooks = TemporaryHooksDir::new();
-    install_hook(&hooks.path).expect("install hook");
-    install_hook(&hooks.path).expect("reinstall hook");
-    let body = fs::read(hooks.hook_path()).expect("read installed hook");
-    assert_eq!(body, HOOK_BODY.as_bytes());
-}
-
-/// Verify that a hook written by an older git-op version is upgraded in place.
-#[test]
-fn install_over_historical_body_upgrades_in_place() {
-    let hooks = TemporaryHooksDir::new();
-    fs::write(hooks.hook_path(), HISTORICAL_HOOK_BODY).expect("write historical hook");
-    install_hook(&hooks.path).expect("install hook");
-    let body = fs::read(hooks.hook_path()).expect("read installed hook");
-    assert_eq!(body, HOOK_BODY.as_bytes());
-}
-
-/// Verify that a hook of your own gains the git-op line and keeps its
-/// own commands.
-#[test]
-fn install_over_foreign_hook_splices_the_git_op_line() {
-    let hooks = TemporaryHooksDir::new();
-    let foreign = "#!/bin/sh\necho something-else\n";
-    fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
-    install_hook(&hooks.path).expect("install hook");
-    let body = fs::read_to_string(hooks.hook_path()).expect("read hook after install");
-    let expected = format!("#!/bin/sh\n{HOOK_LINE}echo something-else\n");
-    assert_eq!(body, expected);
-    install_hook(&hooks.path).expect("reinstall hook");
-    let body = fs::read_to_string(hooks.hook_path()).expect("read hook after reinstall");
+    let existing = "#!/bin/sh\necho something-else\n";
+    fs::write(hooks.hook_path(), existing).expect("write existing hook");
+    let error = install_hook(&hooks.path).expect_err("existing hook must be rejected");
+    assert!(matches!(error, Error::HookExists(path) if path == hooks.hook_path()));
     assert_eq!(
-        body, expected,
-        "reinstalling must not duplicate the git-op line"
+        fs::read_to_string(hooks.hook_path()).expect("read existing hook"),
+        existing
     );
-}
-
-/// Verify that a hook without a shebang is spliced at the start.
-#[test]
-fn install_over_shebangless_hook_splices_at_the_start() {
-    let hooks = TemporaryHooksDir::new();
-    fs::write(hooks.hook_path(), "echo something-else\n").expect("write foreign hook");
-    install_hook(&hooks.path).expect("install hook");
-    let body = fs::read_to_string(hooks.hook_path()).expect("read hook after install");
-    assert_eq!(body, format!("{HOOK_LINE}echo something-else\n"));
 }
 
 /// Verify that a missing git-op binary never blocks ref updates: the hook
