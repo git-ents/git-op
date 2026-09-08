@@ -475,7 +475,11 @@ fn install_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), E
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::HookExists(path));
+            return match fs::read(&path) {
+                Ok(existing) if existing == body.as_bytes() => Ok(()),
+                Ok(_) => Err(Error::HookExists(path)),
+                Err(error) => Err(Error::git(error)),
+            };
         }
         Err(error) => return Err(Error::git(error)),
     };
