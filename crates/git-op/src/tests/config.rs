@@ -29,7 +29,7 @@ impl TemporaryHooksDir {
     }
 
     fn hook_path(&self) -> PathBuf {
-        self.path.join(HOOK_NAME)
+        self.path.join(REFERENCE_TRANSACTION_HOOK_NAME)
     }
 }
 
@@ -55,7 +55,8 @@ fn is_executable(path: &Path) -> bool {
 #[test]
 fn fresh_install_writes_executable_hook() {
     let hooks = TemporaryHooksDir::new();
-    install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY).expect("install hook");
+    install_standalone_hook(&hooks.path, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)
+        .expect("install hook");
     let body = fs::read(hooks.hook_path()).expect("read installed hook");
     assert_eq!(body, HOOK_BODY.as_bytes());
     #[cfg(unix)]
@@ -68,7 +69,7 @@ fn install_over_existing_hook_returns_hook_exists() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.hook_path(), existing).expect("write existing hook");
-    let error = install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY)
+    let error = install_standalone_hook(&hooks.path, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)
         .expect_err("existing hook must be rejected");
     assert!(matches!(error, Error::HookExists(path) if path == hooks.hook_path()));
     assert_eq!(
@@ -129,7 +130,8 @@ fn pre_push_rejects_operation_ref_and_allows_other_refs() {
 #[test]
 fn missing_binary_exits_zero_and_warns_only_on_committed_phase() {
     let hooks = TemporaryHooksDir::new();
-    install_standalone_hook(&hooks.path, HOOK_NAME, HOOK_BODY).expect("install hook");
+    install_standalone_hook(&hooks.path, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)
+        .expect("install hook");
     let run = |phase: &str| {
         let output = Command::new("/bin/sh")
             .arg(hooks.hook_path())
