@@ -1,16 +1,19 @@
 //! Git configuration, paths, and hook installation.
 
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::Error;
 
 const REFERENCE_TRANSACTION_HOOK_NAME: &str = "reference-transaction";
 const PRE_PUSH_HOOK_NAME: &str = "pre-push";
+
+static NEXT_TEMP_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Hook block written by fresh installs and hook upgrades.
 ///
@@ -23,15 +26,27 @@ macro_rules! hook_line {
     };
 }
 
+const HOOK_LINE: &str = hook_line!();
+
 const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 
+/// The pre-push hook body: a POSIX script, which Git for Windows runs via its bundled `sh`.
 const PRE_PUSH_BODY: &str = r##"#!/bin/sh
-while read -r local_ref local_oid remote_ref remote_oid; do if [ "$local_ref" = "refs/op" ] || [ "$remote_ref" = "refs/op" ]; then printf '%s\n' 'OP_REF is local-only at this time' >&2; exit 1; fi; done
+while read -r local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_ref" = "refs/op" ] || [ "$remote_ref" = "refs/op" ]; then
+        printf '%s\n' 'Pushing refs/op is not supported: operation references must remain local' >&2
+        exit 1
+    fi
+done
 "##;
 
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
-/// Existing hooks are never replaced; merge hook commands manually when needed.
+/// An existing `reference-transaction` hook carrying git-op lines — written by
+/// this version or an earlier one, standalone or merged with your own
+/// commands — is upgraded in place, keeping your commands; a hook invoking no
+/// git-op command is refused with [`Error::HookExists`], to be merged by hand.
+/// The `pre-push` hook is installed only when absent.
 ///
 /// # Examples
 ///
@@ -54,7 +69,8 @@ while read -r local_ref local_oid remote_ref remote_oid; do if [ "$local_ref" = 
 /// ```
 pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
     let hooks = git_path(repo, "hooks")?;
-    install_standalone_hook(&hooks, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)?;
+    validate_pre_push_hook(&hooks)?;
+    install_reference_transaction_hook(&hooks)?;
     install_pre_push_hook(&hooks)
 }
 
@@ -71,6 +87,7 @@ pub fn install_global() -> Result<(), Error> {
         None => {
             let config_home = config_home()?;
             let template = default_template_dir(&config_home);
+            validate_pre_push_hook(&template.join("hooks"))?;
             let op_config = config_home.join("git").join(OP_CONFIG_NAME);
             write_op_config(&op_config, &template)?;
             ensure_include(&["--global"], &op_config)?;
@@ -209,13 +226,11 @@ fn config_home_optional() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
 }
 
-/// Remove the `reference-transaction` hook from this repository.
+/// Remove the `reference-transaction` and `pre-push` hooks from this repository.
 ///
-/// A hook whose non-comment lines are all git-op's own is removed entirely.
-/// A hook that mixes git-op lines with other commands keeps the other
-/// commands and loses ours, and a hook that invokes no git-op hook is left
-/// untouched, so uninstalling is safe to repeat and never deletes a hook
-/// git-op did not write.
+/// Every line git-op owns, from this version or an earlier one, is removed;
+/// the file is deleted only when nothing of yours remains, so uninstalling
+/// is safe to repeat and never touches a hook git-op did not write.
 pub fn uninstall_local(repo: &gix::Repository) -> Result<(), Error> {
     uninstall_hooks(git_path(repo, "hooks")?)
 }
@@ -261,23 +276,46 @@ fn claimed_template(config_home: &Path) -> Result<Option<PathBuf>, Error> {
     )))
 }
 
-/// Remove git-op's hook from `hooks`, leaving anything else untouched.
 /// Remove both hooks from one hooks directory.
 fn uninstall_hooks(hooks: PathBuf) -> Result<(), Error> {
-    uninstall_hook(&hooks)?;
+    uninstall_reference_transaction_hook(&hooks)?;
     uninstall_pre_push_hook(&hooks)
 }
 
-fn uninstall_hook(hooks: &Path) -> Result<(), Error> {
-    let path = hooks.join(REFERENCE_TRANSACTION_HOOK_NAME);
+fn validate_pre_push_hook(hooks: &Path) -> Result<(), Error> {
+    let path = hooks.join(PRE_PUSH_HOOK_NAME);
     match fs::read(&path) {
-        Ok(existing) if existing == HOOK_BODY.as_bytes() => {
-            fs::remove_file(path).map_err(Error::git)
-        }
-        Ok(_) => Ok(()),
+        Ok(existing) if existing == PRE_PUSH_BODY.as_bytes() => Ok(()),
+        Ok(_) => Err(Error::HookExists(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(Error::git(error)),
     }
+}
+
+/// Delete the hook when only a shebang remains after stripping git-op's
+/// lines; otherwise rewrite it with the other commands kept.
+fn uninstall_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
+    let path = hooks.join(REFERENCE_TRANSACTION_HOOK_NAME);
+    let existing = match fs::read(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::git(error)),
+    };
+    let Ok(existing) = std::str::from_utf8(&existing) else {
+        // Unscannable content cannot be identified as git-op's; leave it as found.
+        return Ok(());
+    };
+    let stripped = strip_managed_lines(existing);
+    if stripped == existing {
+        return Ok(());
+    }
+    if stripped
+        .lines()
+        .all(|line| line.trim().is_empty() || line.starts_with("#!"))
+    {
+        return fs::remove_file(path).map_err(Error::git);
+    }
+    replace_hook(hooks, &path, &stripped, existing.as_bytes())
 }
 
 /// Remove the claimed template directory when git-op's install created it.
@@ -286,10 +324,9 @@ fn uninstall_hook(hooks: &Path) -> Result<(), Error> {
 /// git-op's and Git's stock set is present; anything else means the
 /// directory holds content git-op did not put there.
 fn remove_unmodified_template(template: &Path) -> Result<(), Error> {
-    if template
-        .join("hooks")
-        .join(REFERENCE_TRANSACTION_HOOK_NAME)
-        .exists()
+    let hook = template.join("hooks");
+    if hook.join(REFERENCE_TRANSACTION_HOOK_NAME).exists()
+        || hook.join(PRE_PUSH_HOOK_NAME).exists()
         || !template_is_unmodified(template)
     {
         return Ok(());
@@ -458,8 +495,9 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 }
 
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
-    install_standalone_hook(&hooks, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)?;
-    install_pre_push_hook(&hooks)
+    validate_pre_push_hook(&hooks)?;
+    install_reference_transaction_hook(&hooks)?;
+    install_standalone_hook(&hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_BODY)
 }
 
 fn install_pre_push_hook(hooks: &Path) -> Result<(), Error> {
@@ -470,24 +508,202 @@ fn uninstall_pre_push_hook(hooks: &Path) -> Result<(), Error> {
     uninstall_standalone_hook(hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_BODY)
 }
 
-fn install_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), Error> {
+/// Install or upgrade the `reference-transaction` hook in `hooks`.
+///
+/// Fresh installs publish a fully written temporary file; upgrades rename a
+/// temporary file into place, so a crash cannot leave a truncated hook for Git.
+fn install_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
     fs::create_dir_all(hooks).map_err(Error::git)?;
-    let path = hooks.join(name);
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return match fs::read(&path) {
-                Ok(existing) if existing == body.as_bytes() => Ok(()),
-                Ok(_) => Err(Error::HookExists(path)),
-                Err(error) => Err(Error::git(error)),
-            };
-        }
+    let path = hooks.join(REFERENCE_TRANSACTION_HOOK_NAME);
+    match fs::read(&path) {
+        Ok(existing) => return upgrade_hook(hooks, &path, &existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(Error::git(error)),
+    }
+    match write_new_hook(hooks, &path, HOOK_BODY) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(&path).map_err(Error::git)?;
+            upgrade_hook(hooks, &path, &existing)
+        }
+        Err(error) => Err(Error::git(error)),
+    }
+}
+
+fn write_new_hook(hooks: &Path, path: &Path, body: &str) -> std::io::Result<()> {
+    let sequence = NEXT_TEMP_HOOK.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = hooks.join(format!(
+        ".{REFERENCE_TRANSACTION_HOOK_NAME}.tmp-{}-{sequence}",
+        std::process::id(),
+    ));
+    let result = (|| {
+        let mut file = fs::File::create_new(&tmp_path)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        make_executable_io(&tmp_path)?;
+        fs::hard_link(&tmp_path, path)?;
+        fs::remove_file(&tmp_path)
+    })();
+    if result.is_err() {
+        drop(fs::remove_file(&tmp_path));
+    }
+    result
+}
+
+fn make_executable_io(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+/// Rewrite a git-op-owned hook to exactly one current [`HOOK_LINE`], leaving
+/// it untouched when already current, or refuse one that invokes no git-op
+/// command with [`Error::HookExists`].
+fn upgrade_hook(hooks: &Path, path: &Path, existing: &[u8]) -> Result<(), Error> {
+    let Ok(existing) = std::str::from_utf8(existing) else {
+        return Err(Error::HookExists(path.to_path_buf()));
     };
+    match rewrite_managed_lines(existing) {
+        Some(rewritten) if rewritten == existing => make_executable(path),
+        Some(rewritten) => replace_hook(hooks, path, &rewritten, existing.as_bytes()),
+        None => Err(Error::HookExists(path.to_path_buf())),
+    }
+}
+
+/// Replace the first git-op-owned line with the current [`HOOK_LINE`], drop
+/// any further ones, and keep every other line, terminator included, byte
+/// for byte, or `None` when no owned line exists.
+fn rewrite_managed_lines(existing: &str) -> Option<String> {
+    let mut rewritten = String::with_capacity(existing.len() + HOOK_LINE.len());
+    let mut replaced = false;
+    for line in existing.split_inclusive('\n') {
+        if is_git_op_line(line.trim_end_matches(['\n', '\r'])) {
+            if !replaced {
+                rewritten.push_str(HOOK_LINE);
+                replaced = true;
+            }
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    replaced.then_some(rewritten)
+}
+
+/// Whether `line` invokes a git-op hook command in any spelling git-op has
+/// shipped, so hooks from earlier versions upgrade and uninstall in place.
+fn is_git_op_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.starts_with('#')
+        && shell_segments(line)
+            .iter()
+            .any(|segment| is_git_op_command(segment))
+}
+
+fn shell_segments(line: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut segment = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            escaped = false;
+            segment.push(character);
+        } else if character == '\\' {
+            escaped = true;
+            segment.push(character);
+        } else if quote == Some(character) {
+            quote = None;
+            segment.push(character);
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+            segment.push(character);
+        } else if quote.is_none() && matches!(character, ';' | '|' | '&' | '{' | '}') {
+            segments.push(std::mem::take(&mut segment));
+        } else {
+            segment.push(character);
+        }
+    }
+    segments.push(segment);
+    segments
+}
+
+fn is_git_op_command(segment: &str) -> bool {
+    let command = segment.trim();
+    let command = ["exec ", "then ", "do ", "if "]
+        .into_iter()
+        .find_map(|prefix| command.strip_prefix(prefix))
+        .unwrap_or(command);
+    [
+        "git-op reference-transaction",
+        "op reference-transaction",
+        "git op reference-transaction",
+        "git op \"$hook\"",
+    ]
+    .into_iter()
+    .any(|prefix| {
+        command == prefix
+            || command
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with([' ', '\t']))
+    })
+}
+
+/// Remove every git-op-owned line, preserving all other lines byte for byte.
+fn strip_managed_lines(existing: &str) -> String {
+    existing
+        .split_inclusive('\n')
+        .filter(|line| !is_git_op_line(line.trim_end_matches(['\n', '\r'])))
+        .collect()
+}
+
+/// Atomically replace `path` with `body` via a temporary file, so the live
+/// hook is never truncated in place.
+fn replace_hook(hooks: &Path, path: &Path, body: &str, expected: &[u8]) -> Result<(), Error> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::message(error.to_string()))?
+        .as_nanos();
+    let tmp_path = hooks.join(format!(
+        ".{REFERENCE_TRANSACTION_HOOK_NAME}.tmp-{}-{unique}",
+        std::process::id()
+    ));
+    let current = fs::read(path).map_err(Error::git)?;
+    if current != expected {
+        return Err(Error::HookExists(path.to_path_buf()));
+    }
+    write_tmp_hook(&tmp_path, path, body).inspect_err(|_error| {
+        drop(fs::remove_file(&tmp_path));
+    })
+}
+
+/// Write `body` to `tmp_path` and rename it over `path`.
+fn write_tmp_hook(tmp_path: &Path, path: &Path, body: &str) -> Result<(), Error> {
+    let mut file = fs::File::create_new(tmp_path).map_err(Error::git)?;
     file.write_all(body.as_bytes()).map_err(Error::git)?;
     file.sync_all().map_err(Error::git)?;
     drop(file);
-    make_executable(&path)
+    make_executable(tmp_path)?;
+    fs::rename(tmp_path, path).map_err(Error::git)
+}
+
+fn install_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), Error> {
+    fs::create_dir_all(hooks).map_err(Error::git)?;
+    let path = hooks.join(name);
+    match write_new_hook(hooks, &path, body) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => match fs::read(&path) {
+            Ok(existing) if existing == body.as_bytes() => make_executable(&path),
+            Ok(_) => Err(Error::HookExists(path)),
+            Err(error) => Err(Error::git(error)),
+        },
+        Err(error) => Err(Error::git(error)),
+    }
 }
 
 fn uninstall_standalone_hook(hooks: &Path, name: &str, body: &str) -> Result<(), Error> {
