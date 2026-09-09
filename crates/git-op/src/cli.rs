@@ -24,13 +24,13 @@ pub(crate) enum Command {
         /// The phase supplied by Git: prepared, committed, or aborted.
         phase: String,
     },
-    /// Install the reference-transaction hook in the current repository.
+    /// Install git-op's repository hooks in the current repository.
     Install {
         /// Install in Git's global template instead of the current repository.
         #[arg(long)]
         global: bool,
     },
-    /// Remove the reference-transaction hook from the current repository.
+    /// Remove git-op's repository hooks from the current repository.
     Uninstall {
         /// Remove it from Git's global template instead of the current repository.
         #[arg(long)]
