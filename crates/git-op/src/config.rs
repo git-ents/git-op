@@ -9,7 +9,7 @@ use std::{
 
 use crate::Error;
 
-const HOOK_NAME: &str = "reference-transaction";
+const REFERENCE_TRANSACTION_HOOK_NAME: &str = "reference-transaction";
 const PRE_PUSH_HOOK_NAME: &str = "pre-push";
 
 /// Hook block written by fresh installs and hook upgrades.
@@ -26,11 +26,7 @@ macro_rules! hook_line {
 const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 
 const PRE_PUSH_BODY: &str = r##"#!/bin/sh
-tmp=$(mktemp "${TMPDIR:-/tmp}/git-op-pre-push.XXXXXX") || exit 1
-trap 'rm -f "$tmp"' 0 1 2 3 15
-cat >"$tmp" || exit 1
-while read -r local_ref local_oid remote_ref remote_oid; do if [ "$local_ref" = "refs/op" ] || [ "$remote_ref" = "refs/op" ]; then printf '%s\n' 'OP_REF is local-only at this time' >&2; exit 1; fi; done <"$tmp"
-exec <"$tmp"
+while read -r local_ref local_oid remote_ref remote_oid; do if [ "$local_ref" = "refs/op" ] || [ "$remote_ref" = "refs/op" ]; then printf '%s\n' 'OP_REF is local-only at this time' >&2; exit 1; fi; done
 "##;
 
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
@@ -58,7 +54,7 @@ exec <"$tmp"
 /// ```
 pub fn install_local(repo: &gix::Repository) -> Result<(), Error> {
     let hooks = git_path(repo, "hooks")?;
-    install_standalone_hook(&hooks, HOOK_NAME, HOOK_BODY)?;
+    install_standalone_hook(&hooks, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)?;
     install_pre_push_hook(&hooks)
 }
 
@@ -273,7 +269,7 @@ fn uninstall_hooks(hooks: PathBuf) -> Result<(), Error> {
 }
 
 fn uninstall_hook(hooks: &Path) -> Result<(), Error> {
-    let path = hooks.join(HOOK_NAME);
+    let path = hooks.join(REFERENCE_TRANSACTION_HOOK_NAME);
     match fs::read(&path) {
         Ok(existing) if existing == HOOK_BODY.as_bytes() => {
             fs::remove_file(path).map_err(Error::git)
@@ -290,7 +286,12 @@ fn uninstall_hook(hooks: &Path) -> Result<(), Error> {
 /// git-op's and Git's stock set is present; anything else means the
 /// directory holds content git-op did not put there.
 fn remove_unmodified_template(template: &Path) -> Result<(), Error> {
-    if template.join("hooks").join(HOOK_NAME).exists() || !template_is_unmodified(template) {
+    if template
+        .join("hooks")
+        .join(REFERENCE_TRANSACTION_HOOK_NAME)
+        .exists()
+        || !template_is_unmodified(template)
+    {
         return Ok(());
     }
     match fs::remove_dir_all(template) {
@@ -326,7 +327,7 @@ fn template_is_unmodified(template: &Path) -> bool {
                 }
             } else if relative != "description"
                 && relative != "info/exclude"
-                && relative != format!("hooks/{HOOK_NAME}")
+                && relative != format!("hooks/{REFERENCE_TRANSACTION_HOOK_NAME}")
                 && relative != format!("hooks/{PRE_PUSH_HOOK_NAME}")
                 && !(relative.starts_with("hooks/") && name.ends_with(".sample"))
             {
@@ -457,7 +458,7 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 }
 
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
-    install_standalone_hook(&hooks, HOOK_NAME, HOOK_BODY)?;
+    install_standalone_hook(&hooks, REFERENCE_TRANSACTION_HOOK_NAME, HOOK_BODY)?;
     install_pre_push_hook(&hooks)
 }
 
