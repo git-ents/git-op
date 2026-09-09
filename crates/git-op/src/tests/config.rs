@@ -1,4 +1,5 @@
 use super::*;
+use crate::OP_REF;
 use std::{
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -197,21 +198,25 @@ fn pre_push_rejects_operation_ref_and_allows_other_refs() {
             .expect("write pre-push input");
         child.wait_with_output().expect("wait for pre-push hook")
     };
-    let rejected = run(
-        "refs/op 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n",
-    );
-    let rejected_remote = run(
-        "refs/heads/main 1111111111111111111111111111111111111111 refs/op 2222222222222222222222222222222222222222\n",
-    );
+    let rejected = run(&format!(
+        "{OP_REF} 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n",
+    ));
+    let rejected_remote = run(&format!(
+        "refs/heads/main 1111111111111111111111111111111111111111 {OP_REF} 2222222222222222222222222222222222222222\n",
+    ));
     assert!(!rejected.status.success());
     assert!(!rejected_remote.status.success());
     assert_eq!(
         String::from_utf8_lossy(&rejected.stderr).trim(),
-        "git-op: Pushing refs/op is not supported: operation references must remain local"
+        &format!(
+            "git-op: Pushing {OP_REF} is not supported: operation references must remain local"
+        )
     );
     assert_eq!(
         String::from_utf8_lossy(&rejected_remote.stderr).trim(),
-        "git-op: Pushing refs/op is not supported: operation references must remain local"
+        &format!(
+            "git-op: Pushing {OP_REF} is not supported: operation references must remain local"
+        )
     );
 
     let allowed = run(
