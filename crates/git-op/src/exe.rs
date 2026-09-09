@@ -2,7 +2,7 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 
-use git_op::ReferenceTransactionPhase;
+use git_op::{OP_REF, ReferenceTransactionPhase};
 use gix::prelude::Write as GixWrite;
 
 use crate::cli::Command;
@@ -94,10 +94,11 @@ fn pre_push(_remote_name: &str, _remote_url: &str) -> Result<(), Box<dyn std::er
         let local = fields.next().filter(|field| !field.is_empty());
         let _local_oid = fields.next().filter(|field| !field.is_empty());
         let remote = fields.next().filter(|field| !field.is_empty());
-        if local == Some(b"refs/op") || remote == Some(b"refs/op") {
-            return Err(
-                "Pushing refs/op is not supported: operation references must remain local".into(),
-            );
+        if local == Some(OP_REF.as_bytes()) || remote == Some(OP_REF.as_bytes()) {
+            return Err(format!(
+                "Pushing {OP_REF} is not supported: operation references must remain local"
+            )
+            .into());
         }
     }
     Ok(())
