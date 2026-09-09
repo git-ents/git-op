@@ -63,6 +63,10 @@ fn is_executable(path: &Path) -> bool {
 #[test]
 fn hook_body_is_recognized_unchanged() {
     assert_eq!(rewrite_managed_lines(HOOK_BODY).as_deref(), Some(HOOK_BODY));
+    assert_eq!(
+        rewrite_owned_lines(PRE_PUSH_BODY, PRE_PUSH_LINE, is_pre_push_line).as_deref(),
+        Some(PRE_PUSH_BODY)
+    );
 }
 
 #[test]
@@ -179,6 +183,8 @@ fn pre_push_rejects_operation_ref_and_allows_other_refs() {
         let mut command = Command::new("/bin/sh");
         command
             .arg(hooks.path.join(PRE_PUSH_HOOK_NAME))
+            .arg("origin")
+            .arg("url")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
@@ -201,11 +207,11 @@ fn pre_push_rejects_operation_ref_and_allows_other_refs() {
     assert!(!rejected_remote.status.success());
     assert_eq!(
         String::from_utf8_lossy(&rejected.stderr).trim(),
-        "Pushing refs/op is not supported: operation references must remain local"
+        "git-op: Pushing refs/op is not supported: operation references must remain local"
     );
     assert_eq!(
         String::from_utf8_lossy(&rejected_remote.stderr).trim(),
-        "Pushing refs/op is not supported: operation references must remain local"
+        "git-op: Pushing refs/op is not supported: operation references must remain local"
     );
 
     let allowed = run(
@@ -223,11 +229,16 @@ fn pre_push_install_is_fresh_then_idempotent() {
     let body = fs::read(hooks.pre_push_path()).expect("read installed hook");
     assert_eq!(body, PRE_PUSH_BODY.as_bytes());
     #[cfg(unix)]
-    assert!(is_executable(&hooks.pre_push_path()));
-
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(hooks.pre_push_path(), fs::Permissions::from_mode(0o644))
+            .expect("remove execute permissions");
+    }
     install_pre_push_hook(&hooks.path).expect("reinstall pre-push hook");
     let body = fs::read(hooks.pre_push_path()).expect("read reinstalled hook");
     assert_eq!(body, PRE_PUSH_BODY.as_bytes());
+    #[cfg(unix)]
+    assert!(is_executable(&hooks.pre_push_path()));
 }
 
 /// Verify that a pre-push conflict leaves the reference hook untouched.
@@ -238,10 +249,22 @@ fn pre_push_conflict_prevents_partial_install() {
     fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
     let error = install_hooks(hooks.path.clone()).expect_err("existing hook must be rejected");
     assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
-    assert!(!hooks.hook_path().exists());
+    assert!(hooks.hook_path().exists());
     assert_eq!(
         fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
         existing
+    );
+}
+
+/// Verify that the legacy shell pre-push body upgrades to the command hook.
+#[test]
+fn pre_push_legacy_body_upgrades() {
+    let hooks = TemporaryHooksDir::new();
+    fs::write(hooks.pre_push_path(), LEGACY_PRE_PUSH_BODY).expect("write legacy hook");
+    install_pre_push_hook(&hooks.path).expect("upgrade pre-push hook");
+    assert_eq!(
+        fs::read_to_string(hooks.pre_push_path()).expect("read upgraded hook"),
+        PRE_PUSH_BODY
     );
 }
 
@@ -267,6 +290,11 @@ fn pre_push_uninstall_removes_matching_hook_and_spares_foreign_ones() {
     uninstall_pre_push_hook(&hooks.path).expect("uninstall pre-push hook");
     assert!(!hooks.pre_push_path().exists());
     uninstall_pre_push_hook(&hooks.path).expect("repeat uninstall is a no-op");
+
+    let legacy = LEGACY_PRE_PUSH_BODY;
+    fs::write(hooks.pre_push_path(), legacy).expect("write legacy hook");
+    uninstall_pre_push_hook(&hooks.path).expect("uninstall legacy pre-push hook");
+    assert!(!hooks.pre_push_path().exists());
 
     let foreign = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.pre_push_path(), foreign).expect("write foreign hook");
