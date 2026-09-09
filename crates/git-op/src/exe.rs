@@ -11,6 +11,10 @@ use crate::cli::Command;
 pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::ReferenceTransaction { phase } => reference_transaction(&phase),
+        Command::PrePush {
+            remote_name,
+            remote_url,
+        } => pre_push(&remote_name, &remote_url),
         Command::Install { global } => install(global),
         Command::Uninstall { global } => uninstall(global),
         Command::Snap => snap_command(),
@@ -79,6 +83,23 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     };
     git_op::reference_transaction(&repo, phase, &input)?;
+    Ok(())
+}
+
+fn pre_push(_remote_name: &str, _remote_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    for line in input.split(|byte| *byte == b'\n') {
+        let mut fields = line.split(|byte| byte.is_ascii_whitespace());
+        let local = fields.next().filter(|field| !field.is_empty());
+        let _local_oid = fields.next().filter(|field| !field.is_empty());
+        let remote = fields.next().filter(|field| !field.is_empty());
+        if local == Some(b"refs/op") || remote == Some(b"refs/op") {
+            return Err(
+                "Pushing refs/op is not supported: operation references must remain local".into(),
+            );
+        }
+    }
     Ok(())
 }
 

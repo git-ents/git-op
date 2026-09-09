@@ -24,6 +24,14 @@ pub(crate) enum Command {
         /// The phase supplied by Git: prepared, committed, or aborted.
         phase: String,
     },
+    /// Process a Git pre-push hook invocation.
+    #[command(hide = true)]
+    PrePush {
+        /// The remote name supplied by Git.
+        remote_name: String,
+        /// The remote URL supplied by Git.
+        remote_url: String,
+    },
     /// Install git-op's repository hooks in the current repository.
     Install {
         /// Install in Git's global template instead of the current repository.
