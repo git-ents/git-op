@@ -207,6 +207,7 @@ fn snap_records_metadata_drift() {
     let snapped = match snap(&temporary.repo).expect("snap drifted repository") {
         SnapOutcome::Recorded(snapped) => snapped.operation(),
         SnapOutcome::Detached => panic!("snap on a branch records the drifted state"),
+        SnapOutcome::Placeholder => panic!("snap on a branch records the drifted state"),
     };
     assert_ne!(snapped, initial);
     let changed = changes(&temporary.repo, snapped)

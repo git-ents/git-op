@@ -125,6 +125,9 @@ fn snap_outcome_summary(outcome: &git_op::SnapOutcome) -> String {
     match outcome {
         git_op::SnapOutcome::Recorded(snapped) => snap_summary(*snapped),
         git_op::SnapOutcome::Detached => "HEAD is detached; no snapshot recorded".to_owned(),
+        git_op::SnapOutcome::Placeholder => {
+            "HEAD is a placeholder; no snapshot recorded".to_owned()
+        }
     }
 }
 

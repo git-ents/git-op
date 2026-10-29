@@ -32,6 +32,7 @@ This is a list of concepts whose boundaries, relationships, and failure behavior
 * `HEAD`
 * Unborn `HEAD`
 * Detached `HEAD`
+* Clone placeholder `HEAD`
 * Checked-out branch
 * Branch
 * Tag

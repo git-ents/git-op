@@ -454,18 +454,9 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
         .all()
         .map_err(Error::git)?
     {
-        let reference = match reference {
-            Ok(reference) => reference,
-            Err(error) if error.to_string().contains("refs/heads/.invalid") => continue,
-            Err(error) => return Err(Error::git(error)),
-        };
+        let reference = reference.map_err(Error::git)?;
         let raw_name = reference.name().as_bstr();
         if !is_captured_ref(raw_name.as_bytes()) {
-            continue;
-        }
-        if matches!(reference.target(), gix::refs::TargetRef::Symbolic(target)
-            if target.as_bstr().as_bytes().ends_with(b"/.invalid"))
-        {
             continue;
         }
         let name = raw_name
@@ -647,16 +638,33 @@ pub enum SnapOutcome {
     /// HEAD is detached, so nothing was recorded: normal ref writes carry no
     /// branch context worth logging.
     Detached,
+    /// HEAD is Git's clone-time placeholder, so nothing was recorded: the
+    /// branch Git will check out is not known yet.
+    Placeholder,
+}
+
+/// The `HEAD` contents Git stubs in while initializing a clone, before the
+/// remote's default branch is known. The target name is invalid by design.
+const PLACEHOLDER_HEAD: &[u8] = b"ref: refs/heads/.invalid";
+
+/// Whether HEAD is Git's clone-time placeholder, which no reference backend
+/// will instantiate and so must be read directly.
+fn head_is_placeholder(repo: &gix::Repository) -> bool {
+    fs::read(repo.git_dir().join("HEAD"))
+        .is_ok_and(|contents| contents.trim_ascii_end() == PLACEHOLDER_HEAD)
 }
 
 /// Record repository state that is not yet on the operation log onto
 /// [`OP_REF`], with a generated commit message summarizing the changes.
 ///
-/// A no-op when the operation log already reflects the repository state, and
-/// a silent no-op when HEAD is detached. The returned [`SnapOutcome`] reports
-/// whether this call appended anything, so callers never have to infer it
-/// from the ref value.
+/// A no-op when the operation log already reflects the repository state, when
+/// HEAD is detached, or when Git's clone-time placeholder stands in for HEAD.
+/// The returned [`SnapOutcome`] reports whether this call appended anything,
+/// so callers never have to infer it from the ref value.
 pub fn snap(repo: &gix::Repository) -> Result<SnapOutcome, Error> {
+    if head_is_placeholder(repo) {
+        return Ok(SnapOutcome::Placeholder);
+    }
     if repo.head_name().map_err(Error::git)?.is_none() {
         return Ok(SnapOutcome::Detached);
     }

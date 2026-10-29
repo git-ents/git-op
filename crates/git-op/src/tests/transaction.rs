@@ -122,6 +122,68 @@ fn snap_skips_detached_head() {
         "a detached HEAD must not start an operation log"
     );
 }
+/// Verify that Git's clone-time placeholder HEAD records nothing: the branch
+/// Git will check out is not yet known.
+#[test]
+fn snap_skips_placeholder_head() {
+    let temporary = TemporaryRepository::new();
+    fs::write(
+        temporary.repo.git_dir().join("HEAD"),
+        b"ref: refs/heads/.invalid",
+    )
+    .expect("write placeholder HEAD");
+
+    let snapped = snap(&temporary.repo).expect("snap placeholder repository");
+    assert_eq!(snapped, SnapOutcome::Placeholder);
+    assert!(
+        temporary
+            .repo
+            .try_find_reference(OP_REF)
+            .expect("look up operation ref")
+            .is_none(),
+        "a placeholder HEAD must not start an operation log"
+    );
+}
+/// Verify that capturing is unaffected by the placeholder HEAD, which no
+/// reference iterator reports as a captured reference.
+#[test]
+fn capture_ignores_placeholder_head() {
+    let temporary = TemporaryRepository::new();
+    fs::write(
+        temporary.repo.git_dir().join("HEAD"),
+        b"ref: refs/heads/.invalid",
+    )
+    .expect("write placeholder HEAD");
+
+    capture(&temporary.repo).expect("capture repository with placeholder HEAD");
+}
+/// Verify that the committed transaction `git clone` raises while the
+/// placeholder HEAD stands in is accepted instead of failing the hook.
+#[test]
+fn hook_accepts_committed_transaction_under_placeholder_head() {
+    let temporary = TemporaryRepository::new();
+    fs::write(
+        temporary.repo.git_dir().join("HEAD"),
+        b"ref: refs/heads/.invalid",
+    )
+    .expect("write placeholder HEAD");
+
+    reference_transaction(
+        &temporary.repo,
+        ReferenceTransactionPhase::Committed,
+        format!("{ZERO_OID} {ZERO_OID} refs/remotes/origin/HEAD\n").as_bytes(),
+    )
+    .expect("process committed transaction");
+
+    assert!(
+        temporary
+            .repo
+            .try_find_reference(OP_REF)
+            .expect("look up operation ref")
+            .is_none(),
+        "a placeholder HEAD must not start an operation log"
+    );
+}
 /// Verify that every non-committed hook phase is accepted without a snapshot.
 #[test]
 fn hook_accepts_non_committed_phases() {

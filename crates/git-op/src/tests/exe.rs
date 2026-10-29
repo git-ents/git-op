@@ -85,6 +85,16 @@ fn snap_outcome_reports_detached_head() {
     );
 }
 
+/// Verify that Git's clone-time placeholder HEAD reports an informational
+/// no-op.
+#[test]
+fn snap_outcome_reports_placeholder_head() {
+    assert_eq!(
+        snap_outcome_summary(&git_op::SnapOutcome::Placeholder),
+        "HEAD is a placeholder; no snapshot recorded"
+    );
+}
+
 #[test]
 fn clean_worktree_is_allowed() {
     let (repo, _temp) = repository();
