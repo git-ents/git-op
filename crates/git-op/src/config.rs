@@ -174,8 +174,6 @@ pub fn install_global() -> Result<(), Error> {
     }
 }
 
-/// Resolve the global template directory, claiming a default one through an
-/// `[include]`d git-op config when Git has none configured.
 /// The default global template directory git-op claims when Git has none.
 fn default_template_dir(config_home: &Path) -> PathBuf {
     config_home.join("git/templates")
