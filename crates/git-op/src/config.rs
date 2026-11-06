@@ -15,7 +15,8 @@ const PRE_PUSH_HOOK_NAME: &str = "pre-push";
 
 static NEXT_TEMP_HOOK: AtomicUsize = AtomicUsize::new(0);
 
-/// Hook block written by fresh installs and hook upgrades.
+/// Hook line written by fresh installs and hook upgrades of the
+/// `reference-transaction` hook.
 ///
 /// When the `git-op` executable is missing, the hook exits 0 so a lost
 /// operation log never blocks ref updates, warning only on the `committed`
@@ -540,14 +541,13 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
     )))
 }
 
-/// Install both hooks, each independently so that a conflict in one does not
-/// withhold the other.
+/// Install both hooks.
 ///
-/// A hook git-op does not own is refused with [`Error::HookExists`] and left
+/// The hooks are independent, so each is installed even when the other is
+/// refused; the first refusal is returned once both have been attempted. A
+/// hook git-op does not own is refused with [`Error::HookExists`] and left
 /// untouched, and one that cannot be read as text is refused with
-/// [`Error::HookUnreadable`]. The hooks are installed independently, so one
-/// conflict never withholds the other; the first is returned once both have
-/// been attempted.
+/// [`Error::HookUnreadable`].
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
     let mut conflict = None;
     for hook in ManagedHook::ALL {
@@ -559,7 +559,7 @@ fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
 }
 
 /// Publish `body` as a new hook named `name`, reporting [`AlreadyExists`] when
-/// a concurrent install creates it first.
+/// the name is already taken.
 ///
 /// The body reaches the hook as a fully written, executable temporary file
 /// hard-linked under the final name: a crash before the link can never leave a
@@ -588,9 +588,9 @@ fn write_new_hook(hooks: &Path, name: &str, body: &str) -> std::io::Result<()> {
     result
 }
 
-/// Replace the first git-op-owned line with the current [`HOOK_LINE`], drop
-/// any further ones, and keep every other line, terminator included, byte by
-/// byte, or `None` when no owned line exists.
+/// Replace the first line `owned` claims with `line`, drop any further ones,
+/// and keep every other line, terminator included, byte by byte, or `None`
+/// when no owned line exists.
 fn rewrite_owned_lines(existing: &str, line: &str, owned: impl Fn(&str) -> bool) -> Option<String> {
     let mut rewritten = String::with_capacity(existing.len() + line.len());
     let mut replaced = false;
