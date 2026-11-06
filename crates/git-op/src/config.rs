@@ -33,7 +33,8 @@ macro_rules! hook_line {
 /// When the `git-op` executable is missing the hook exits 0, so a lost guard
 /// never blocks a push.
 ///
-/// `git-op pre-push` exits 1 only to reject a push; any other status means it
+/// `git-op pre-push` exits 1 both to reject a push and when it cannot read the
+/// push input, and the hook treats either as a block; any other status means it
 /// could not judge, as when the `git-op` found on `PATH` predates the
 /// subcommand and exits with a usage error. Blocking only on status 1 keeps a
 /// stale binary from failing every push.
