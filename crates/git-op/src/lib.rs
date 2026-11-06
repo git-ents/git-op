@@ -10,7 +10,6 @@ use std::{
     process::Command,
 };
 
-use facet::Facet;
 use facet_git_tree::{RawBlob, RawTree};
 use gix::objs::{Kind, Write};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit as GixRefEdit, RefLog};
@@ -32,7 +31,7 @@ pub const OP_REF: &str = "refs/op";
 const MAX_APPEND_ATTEMPTS: usize = 128;
 
 /// The state of repository metadata captured by an operation-log commit.
-#[derive(Debug, Clone, PartialEq, Eq, Facet)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryState {
     /// Local refs, represented as a ref-namespace tree whose leaves contain
     /// Git ref-file contents.
@@ -123,12 +122,6 @@ pub enum Error {
     /// A compare-and-swap could not be applied after repeated retries.
     #[error("reference update lost a race after {0} attempts")]
     LostRace(usize),
-    /// Facet tree serialization failed.
-    #[error("facet tree serialization failed: {0}")]
-    Serialize(#[source] facet_git_tree::SerializeError),
-    /// Facet tree deserialization failed.
-    #[error("facet tree deserialization failed: {0}")]
-    Deserialize(#[source] facet_git_tree::DeserializeError),
     /// A reference-transaction hook received an unsupported phase.
     #[error("unsupported reference-transaction phase {0}")]
     InvalidPhase(String),

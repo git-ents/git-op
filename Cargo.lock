@@ -592,7 +592,6 @@ dependencies = [
  "anstream",
  "anstyle",
  "clap",
- "facet",
  "facet-git-tree",
  "gix",
  "gix-refstore",
