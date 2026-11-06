@@ -1,6 +1,9 @@
 use std::fs;
 
-use super::{action_header, action_summary, ensure_clean, snap_outcome_summary, snap_summary};
+use super::{
+    action_header, action_summary, ensure_clean, line_pushes_operation_ref, snap_outcome_summary,
+    snap_summary,
+};
 fn repository() -> (gix::Repository, tempfile::TempDir) {
     let temp = tempfile::TempDir::new().expect("create temporary directory");
     let repo = gix::init(temp.path()).expect("initialize repository");
@@ -140,5 +143,38 @@ fn well_known_empty_object_ids_match_git() {
     assert_eq!(
         output(&["mktree"]),
         "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    );
+}
+
+/// Verify that a pre-push line is read by field, so leading whitespace cannot
+/// shift the operation ref out of the ref it is checked as, and that a line
+/// without the four fields Git sends is refused rather than ignored.
+#[test]
+fn pre_push_lines_are_matched_by_field() {
+    let ordinary = b"refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222";
+    for allowed in [ordinary.as_slice(), b"", b"   ", b"\r"] {
+        assert_eq!(
+            line_pushes_operation_ref(allowed),
+            Ok(false),
+            "{}",
+            String::from_utf8_lossy(allowed)
+        );
+    }
+    for rejected in [
+        b"refs/op 1111111111111111111111111111111111111111 refs/heads/x 2222222222222222222222222222222222222222".as_slice(),
+        b"(delete) 0000000000000000000000000000000000000000 refs/op 0000000000000000000000000000000000000000",
+        b" refs/op 1111111111111111111111111111111111111111 refs/heads/x 2222222222222222222222222222222222222222",
+        b"\trefs/heads/x 1111111111111111111111111111111111111111 refs/op 2222222222222222222222222222222222222222",
+    ] {
+        assert_eq!(
+            line_pushes_operation_ref(rejected),
+            Ok(true),
+            "{}",
+            String::from_utf8_lossy(rejected)
+        );
+    }
+    assert_eq!(
+        line_pushes_operation_ref(b"refs/heads/main 1111"),
+        Err("invalid pre-push input: refs/heads/main 1111".to_owned())
     );
 }
