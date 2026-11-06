@@ -20,6 +20,7 @@ use gix_refstore::{ApplyError, Committer, GixRefStore, ObjectId, RefEdit, RefNam
 
 mod config;
 mod invocation;
+mod snapshot;
 
 use config::commit_signing_enabled;
 pub use config::{install_global, install_local, uninstall_global, uninstall_local};
@@ -515,7 +516,7 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn serialize(repo: &gix::Repository, state: &RepositoryState) -> Result<ObjectId, Error> {
-    facet_git_tree::serialize_into(state, repo).map_err(Error::Serialize)
+    snapshot::serialize(repo, state)
 }
 
 /// Append a snapshot commit and advance [`OP_REF`] with compare-and-swap.
@@ -877,9 +878,7 @@ enum CommitMessage<'a> {
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState, Error> {
-    let commit = repo.find_commit(commit).map_err(Error::git)?;
-    let tree = commit.tree_id().map_err(Error::git)?.detach();
-    facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
+    snapshot::read(repo, commit)
 }
 
 /// A repository metadata file captured in snapshots.
@@ -1023,12 +1022,8 @@ impl SnapshotEntries {
         for entry in tree.decode().map_err(Error::git)?.entries {
             match entry.filename.to_str().ok() {
                 Some("refs") => refs = Some(entry.oid.to_owned()),
-                Some("config") => {
-                    config = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?)
-                }
-                Some("description") => {
-                    description = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?);
-                }
+                Some("config") => config = snapshot::optional_blob(repo, &entry)?,
+                Some("description") => description = snapshot::optional_blob(repo, &entry)?,
                 _ => {}
             }
         }
@@ -1037,27 +1032,9 @@ impl SnapshotEntries {
         })?;
         Ok(Self {
             r#refs,
-            config: config.flatten(),
-            description: description.flatten(),
+            config,
+            description,
         })
-    }
-
-    /// Read the blob wrapped by a `facet_git_tree` `Option<RawBlob>` field.
-    ///
-    /// `facet_git_tree` encodes an absent value as an empty tree and a
-    /// present value as a tree with a single `some` entry, rather than
-    /// storing a blob directly under the field name.
-    fn read_optional_blob(
-        repo: &gix::Repository,
-        tree: ObjectId,
-    ) -> Result<Option<ObjectId>, Error> {
-        let tree = repo.find_tree(tree).map_err(Error::git)?;
-        for entry in tree.decode().map_err(Error::git)?.entries {
-            if entry.filename.to_str().ok() == Some("some") {
-                return Ok(Some(entry.oid.to_owned()));
-            }
-        }
-        Ok(None)
     }
 
     /// The entries a pending state would serialize to, without reading anything.
