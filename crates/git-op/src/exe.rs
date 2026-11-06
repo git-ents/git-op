@@ -36,7 +36,10 @@ pub(crate) fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 /// Reject writes while the worktree is dirty.
 ///
 /// Installing from a dirty worktree is refused so the hook reflects a
-/// deliberate repository state rather than one mid-change.
+/// deliberate repository state rather than one mid-change. Whether untracked
+/// files count is left to the repository's `status.showUntrackedFiles`, so a
+/// worktree that tracks only part of a tree, such as a home-directory
+/// dotfiles repository, is not refused for the files it deliberately ignores.
 fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>> {
     let Some(workdir) = repo.workdir() else {
         return Ok(());
@@ -44,7 +47,7 @@ fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>
     let output = std::process::Command::new("git")
         .current_dir(workdir)
         .env("GIT_DIR", repo.git_dir())
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1"])
         .output()?;
     if !output.status.success() {
         return Err(format!("git status failed with {}", output.status).into());
