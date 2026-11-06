@@ -6,9 +6,21 @@ use std::{
 
 static NEXT_TEMP_HOOKS_DIR: AtomicUsize = AtomicUsize::new(0);
 
-/// A reference-transaction hook body written by an earlier git-op version.
+/// A reference-transaction hook body written by an earlier git-op version that
+/// this version still recognizes from its command line.
 const HISTORICAL_HOOK_BODY: &str = "#!/bin/sh\nexec git op reference-transaction \"$@\"\n";
+
+/// A `reference-transaction` body an earlier git-op version wrote, which this
+/// version recognizes only as a whole.
 const ORIGINAL_HOOK_BODY: &str = "#!/bin/sh\nexec op reference-transaction \"$@\"\n";
+
+/// Verify that the body git-op claims as a whole is the one an earlier version
+/// wrote, so the constant and the literal cannot drift apart.
+#[test]
+fn legacy_bodies_are_owned_as_a_whole() {
+    assert_eq!(LEGACY_REFERENCE_TRANSACTION_BODIES.len(), 1);
+    assert!(LEGACY_REFERENCE_TRANSACTION_BODIES.contains(&ORIGINAL_HOOK_BODY));
+}
 
 /// Own a temporary hooks directory and remove it when the test finishes.
 struct TemporaryHooksDir {
@@ -324,6 +336,24 @@ fn uninstall_removes_current_hook_and_repeats_safely() {
     uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
     assert!(!hooks.hook_path().exists());
     uninstall_reference_transaction_hook(&hooks.path).expect("repeat uninstall is a no-op");
+}
+
+/// Verify that a hook that merely runs a program named `op` is not claimed:
+/// only a body git-op previously wrote verbatim is owned.
+#[test]
+fn foreign_bare_op_command_is_not_owned() {
+    let hooks = TemporaryHooksDir::new();
+    let foreign = "#!/bin/sh\necho before\nexec op reference-transaction \"$@\"\n";
+    fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
+    let error = install_reference_transaction_hook(&hooks.path)
+        .expect_err("a hook git-op did not write must be rejected");
+    assert!(matches!(&error, Error::HookExists(path) if path == &hooks.hook_path()));
+    uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
+    assert_eq!(
+        fs::read_to_string(hooks.hook_path()).expect("read foreign hook"),
+        foreign,
+        "a hook git-op did not write must be left untouched"
+    );
 }
 
 /// Verify that uninstalling removes hooks from earlier git-op versions.

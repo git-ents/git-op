@@ -43,6 +43,17 @@ const PRE_PUSH_LINE: &str = pre_push_line!();
 const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 const PRE_PUSH_BODY: &str = concat!("#!/bin/sh\n", pre_push_line!());
 
+/// Complete `reference-transaction` bodies an earlier git-op version wrote
+/// whose command line this version does not otherwise recognize.
+///
+/// A file matching one of these byte for byte is still owned, so it upgrades
+/// and uninstalls in place. The commands are not matched line by line, because
+/// a bare `op` is too generic a name to claim: only a body git-op actually
+/// wrote is recognized, never an unrelated hook that happens to run something
+/// named `op` with the same argument.
+const LEGACY_REFERENCE_TRANSACTION_BODIES: &[&str] =
+    &["#!/bin/sh\nexec op reference-transaction \"$@\"\n"];
+
 /// A hook git-op installs and owns.
 #[derive(Clone, Copy)]
 enum ManagedHook {
@@ -86,14 +97,24 @@ impl ManagedHook {
             Self::PrePush => is_pre_push_line(line),
         }
     }
+
+    /// Whole-file bodies an earlier git-op version wrote, owned only when a
+    /// hook matches one exactly.
+    fn legacy_bodies(self) -> &'static [&'static str] {
+        match self {
+            Self::ReferenceTransaction => LEGACY_REFERENCE_TRANSACTION_BODIES,
+            Self::PrePush => &[],
+        }
+    }
 }
 
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
-/// Existing hooks carrying recognizable git-op command lines are upgraded in
-/// place, preserving other commands; unowned hooks are refused with
-/// [`Error::HookExists`] for manual merging. Both hooks are classified before
-/// either is written, so a refusal leaves no partial install behind.
+/// An existing hook carrying a recognizable git-op command, or matching a body
+/// an earlier version wrote, is upgraded in place, preserving other commands;
+/// unowned hooks are refused with [`Error::HookExists`] for manual merging.
+/// Both hooks are classified before either is written, so a refusal leaves no
+/// partial install behind.
 ///
 /// # Examples
 ///
@@ -271,9 +292,10 @@ fn config_home_optional() -> Option<PathBuf> {
 
 /// Remove the `reference-transaction` and `pre-push` hooks from this repository.
 ///
-/// Every line git-op owns, from this version or an earlier one, is removed;
-/// the file is deleted only when nothing of yours remains, so uninstalling
-/// is safe to repeat and never touches a hook git-op did not write.
+/// Every command git-op owns, from this version or an earlier one, is removed,
+/// as is a whole body an earlier version wrote; the file is deleted only when
+/// nothing of yours remains, so uninstalling is safe to repeat and never
+/// touches a hook git-op did not write.
 pub fn uninstall_local(repo: &gix::Repository) -> Result<(), Error> {
     uninstall_hooks(git_path(repo, "hooks")?)
 }
@@ -647,7 +669,6 @@ fn segment_runs_hook_command(segment: &str, subcommand: &str) -> bool {
         "git-op" => matches!(arguments, [first, ..] if *first == subcommand),
         "git" => matches!(arguments, [first, second, ..]
             if *first == "op" && *second == subcommand),
-        "op" => matches!(arguments, [first, ..] if *first == subcommand),
         _ => false,
     }
 }
@@ -788,6 +809,8 @@ fn shell_segments(line: &str) -> Vec<String> {
 /// Remove every line `hook` claims from its file, deleting the file when
 /// nothing but a shebang remains, and leaving unscannable content or a hook
 /// git-op does not own exactly as found.
+///
+/// A body an earlier git-op version wrote verbatim is removed whole.
 fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
     let path = hooks.join(hook.name());
     let existing = match fs::read(&path) {
@@ -798,6 +821,9 @@ fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> 
     let Ok(existing_text) = std::str::from_utf8(&existing) else {
         return Ok(());
     };
+    if hook.legacy_bodies().contains(&existing_text) {
+        return fs::remove_file(path).map_err(Error::git);
+    }
     let stripped: String = existing_text
         .split_inclusive('\n')
         .filter(|line| !hook.owns_line(line.trim_end_matches(['\n', '\r'])))
@@ -868,6 +894,12 @@ impl HookPlan {
         let Ok(text) = std::str::from_utf8(&existing) else {
             return Err(Error::HookExists(path));
         };
+        if hook.legacy_bodies().contains(&text) {
+            return Ok(Self::Replace {
+                contents: hook.body().to_owned(),
+                expected: existing,
+            });
+        }
         match rewrite_owned_lines(text, hook.line(), |line| hook.owns_line(line)) {
             None => Err(Error::HookExists(path)),
             Some(contents) if contents == text => Ok(Self::Current),
