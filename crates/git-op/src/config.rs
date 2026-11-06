@@ -840,11 +840,15 @@ fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> 
     replace_hook(hooks, hook.name(), &stripped, &existing)
 }
 
-/// Atomically replace the hook named `name` with `body` via a temporary file,
-/// so the live hook is never truncated in place.
+/// Replace the hook named `name` with `body` through a temporary file renamed
+/// into place, so Git only ever sees a complete hook.
 ///
 /// The replacement is abandoned with [`Error::HookExists`] when the hook no
-/// longer reads `expected`, so a concurrent edit is never overwritten.
+/// longer reads `expected`. The read, comparison, and rename are separate
+/// steps, so the check narrows but cannot close the window in which a writer
+/// that arrives between them is overwritten; the writers git-op can lose to
+/// are other git-op installs of the same hook. An unowned hook is never a
+/// target, so a hook git-op did not write is not at risk.
 fn replace_hook(hooks: &Path, name: &str, body: &str, expected: &[u8]) -> Result<(), Error> {
     let path = hooks.join(name);
     let unique = std::time::SystemTime::now()
