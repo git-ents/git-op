@@ -26,13 +26,22 @@ macro_rules! hook_line {
     };
 }
 
+/// Hook line written by fresh installs and hook upgrades of the `pre-push`
+/// guard.
+///
+/// When the `git-op` executable is missing the hook exits 0, so a lost guard
+/// never blocks a push.
+macro_rules! pre_push_line {
+    () => {
+        "command -v git-op >/dev/null 2>&1 || exit 0; exec git-op pre-push \"$@\"\n"
+    };
+}
+
 const HOOK_LINE: &str = hook_line!();
-const PRE_PUSH_LINE: &str =
-    "command -v git-op >/dev/null 2>&1 || exit 0; exec git-op pre-push \"$@\"\n";
+const PRE_PUSH_LINE: &str = pre_push_line!();
 
 const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
-const PRE_PUSH_BODY: &str =
-    "#!/bin/sh\ncommand -v git-op >/dev/null 2>&1 || exit 0; exec git-op pre-push \"$@\"\n";
+const PRE_PUSH_BODY: &str = concat!("#!/bin/sh\n", pre_push_line!());
 
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
