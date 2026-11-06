@@ -591,29 +591,170 @@ fn rewrite_owned_lines(existing: &str, line: &str, owned: impl Fn(&str) -> bool)
     replaced.then_some(rewritten)
 }
 
-/// Whether `line` invokes a git-op hook command in any spelling git-op has
-/// shipped, so hooks from earlier versions upgrade and uninstall in place.
+/// Whether `line` invokes the `reference-transaction` hook command in any
+/// spelling git-op has shipped, so hooks from earlier versions upgrade and
+/// uninstall in place.
 fn is_git_op_line(line: &str) -> bool {
-    is_git_command_line(line, "git-op reference-transaction")
-        || is_git_command_line(line, "git op reference-transaction")
-        || is_git_command_line(line, "op reference-transaction")
-        || is_git_command_line(line, "git op \"$hook\"")
+    line_runs_hook_command(line, "reference-transaction")
+        || any_segment_runs(line, segment_runs_generic_hook_command)
 }
 
-fn is_git_command_line(line: &str, command: &str) -> bool {
+/// Whether `line` invokes the `pre-push` guard command in any spelling git-op
+/// has shipped.
+///
+/// The generic `git op "$hook"` delegation is not one of them: git-op only ever
+/// installed it for the `reference-transaction` hook, so the guard never claims
+/// it.
+fn is_pre_push_line(line: &str) -> bool {
+    line_runs_hook_command(line, "pre-push")
+}
+
+/// Whether any shell segment on `line` satisfies `predicate`.
+///
+/// The whole line is judged, not a text prefix: a comment line is ignored, and
+/// each command a `;`, `|`, `&`, or brace separator splits off is tested on its
+/// own.
+fn any_segment_runs(line: &str, predicate: impl Fn(&str) -> bool) -> bool {
     let line = line.trim();
     !line.starts_with('#')
-        && shell_segments(line).iter().any(|segment| {
-            let segment = segment.trim();
-            let segment = ["exec ", "then ", "do ", "if "]
-                .into_iter()
-                .find_map(|prefix| segment.strip_prefix(prefix))
-                .unwrap_or(segment);
-            segment == command
-                || segment
-                    .strip_prefix(command)
-                    .is_some_and(|rest| rest.starts_with([' ', '\t']))
-        })
+        && shell_segments(line)
+            .iter()
+            .any(|segment| predicate(segment))
+}
+
+/// Whether any command on `line` runs git-op's hook for `subcommand`.
+///
+/// Matching is by command words rather than by a text prefix, so the wrapper
+/// commands, environment assignments, and absolute paths a hand-merged hook
+/// may carry are recognized: `command git-op reference-transaction "$@"`,
+/// `GIT_DIR=. git-op pre-push "$@"`, and `/usr/bin/git-op pre-push "$@"` all
+/// count. Wrapper *arguments* other than options and assignments, as in
+/// `nice -n 5 git-op …`, are not modeled.
+fn line_runs_hook_command(line: &str, subcommand: &str) -> bool {
+    any_segment_runs(line, |segment| {
+        segment_runs_hook_command(segment, subcommand)
+    })
+}
+
+/// Whether one shell segment runs git-op's hook for `subcommand`.
+fn segment_runs_hook_command(segment: &str, subcommand: &str) -> bool {
+    let words = shell_words(segment);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let Some((&program, arguments)) = command_words(&words).split_first() else {
+        return false;
+    };
+    match base_name(program) {
+        "git-op" => matches!(arguments, [first, ..] if *first == subcommand),
+        "git" => matches!(arguments, [first, second, ..]
+            if *first == "op" && *second == subcommand),
+        "op" => matches!(arguments, [first, ..] if *first == subcommand),
+        _ => false,
+    }
+}
+
+/// Whether one shell segment runs the generic delegation an earlier git-op
+/// wrote for the `reference-transaction` hook, whose hook name sat in the
+/// `$hook` variable: `git op "$hook" "$@"`.
+///
+/// Only that exact variable is claimed, so an unrelated `git op "$@"` or
+/// `git op "$1"` is left alone, and only the `reference-transaction` hook
+/// matches it, since that is the only hook git-op ever installed this way.
+fn segment_runs_generic_hook_command(segment: &str) -> bool {
+    let words = shell_words(segment);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let Some((&program, arguments)) = command_words(&words).split_first() else {
+        return false;
+    };
+    base_name(program) == "git"
+        && matches!(arguments, [first, second, ..] if *first == "op" && *second == "$hook")
+}
+
+/// Commands that run another command in place, so the command they precede is
+/// still the one being run.
+const COMMAND_WRAPPERS: &[&str] = &["command", "env", "exec", "nohup", "sudo"];
+
+/// Shell reserved words that may precede the command word.
+const SHELL_KEYWORDS: &[&str] = &["!", "do", "elif", "else", "if", "then", "until", "while"];
+
+/// Drop the leading wrappers, options, and environment assignments from
+/// `words`, leaving the command they run.
+fn command_words<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
+    let mut index = 0;
+    while let Some(&word) = words.get(index) {
+        if COMMAND_WRAPPERS.contains(&base_name(word)) || SHELL_KEYWORDS.contains(&base_name(word))
+        {
+            index += 1;
+            while let Some(&option) = words.get(index) {
+                if option.starts_with('-') || is_assignment(option) {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+        } else if is_assignment(word) {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    words.get(index..).unwrap_or_default()
+}
+
+/// The final path component of a command word, so `/usr/bin/git-op` and
+/// `git-op` compare equal.
+fn base_name(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
+}
+
+/// Whether `word` is a shell environment assignment such as `GIT_DIR=.`.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _value)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Split a shell segment into words, honoring quotes and backslash escapes and
+/// discarding the quoting characters, so a command can be compared by its
+/// words rather than by a prefix of the raw text.
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in segment.chars() {
+        if escaped {
+            escaped = false;
+            in_word = true;
+            word.push(character);
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            in_word = true;
+        } else if quote == Some(character) {
+            quote = None;
+            in_word = true;
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+            in_word = true;
+        } else if quote.is_none() && character.is_whitespace() {
+            if in_word {
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+            word.push(character);
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
 }
 
 fn shell_segments(line: &str) -> Vec<String> {
@@ -642,10 +783,6 @@ fn shell_segments(line: &str) -> Vec<String> {
     }
     segments.push(segment);
     segments
-}
-
-fn is_pre_push_line(line: &str) -> bool {
-    is_git_command_line(line, "git-op pre-push")
 }
 
 /// Remove every line `hook` claims from its file, deleting the file when

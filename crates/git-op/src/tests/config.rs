@@ -95,6 +95,40 @@ fn rewrite_removes_every_git_op_line() {
     assert!(!is_git_op_line("echo \"git-op reference-transaction\""));
 }
 
+/// Verify that the wrapped, qualified, and assigned spellings a hand-merged
+/// hook may use are recognized, while commands that merely mention git-op are
+/// not.
+#[test]
+fn classifies_wrapped_and_qualified_git_op_commands() {
+    for owned in [
+        "command git-op reference-transaction \"$@\"",
+        "/usr/local/bin/git-op reference-transaction \"$@\"",
+        "GIT_DIR=. git-op reference-transaction \"$@\"",
+        "env GIT_DIR=. git-op reference-transaction \"$@\"",
+        "exec /usr/bin/git op reference-transaction \"$@\"",
+        "if git-op reference-transaction \"$@\"; then :; fi",
+        "git op \"$hook\" \"$@\"",
+    ] {
+        assert!(is_git_op_line(owned), "{owned} must be recognized");
+    }
+    for foreign in [
+        "xargs git-op reference-transaction \"$@\"",
+        "sh -c 'git-op reference-transaction'",
+        "# git-op reference-transaction \"$@\"",
+        "git op \"$@\"",
+        "git op \"$1\"",
+    ] {
+        assert!(!is_git_op_line(foreign), "{foreign} must not be recognized");
+    }
+    assert!(is_pre_push_line("exec /usr/bin/git-op pre-push \"$@\""));
+    assert!(!is_pre_push_line("xargs git-op pre-push \"$@\""));
+    assert!(is_git_op_line("git op \"$hook\""));
+    assert!(
+        !is_pre_push_line("git op \"$hook\""),
+        "the generic delegation was only ever a reference-transaction spelling"
+    );
+}
+
 /// Verify that a fresh install writes an executable hook with the current body.
 #[test]
 fn fresh_install_writes_executable_hook() {
