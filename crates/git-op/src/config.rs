@@ -570,7 +570,7 @@ fn write_new_hook(hooks: &Path, name: &str, body: &str) -> std::io::Result<()> {
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        make_executable_io(&tmp_path)?;
+        set_executable(&tmp_path)?;
         fs::hard_link(&tmp_path, hooks.join(name))?;
         fs::remove_file(&tmp_path)
     })();
@@ -578,17 +578,6 @@ fn write_new_hook(hooks: &Path, name: &str, body: &str) -> std::io::Result<()> {
         drop(fs::remove_file(&tmp_path));
     }
     result
-}
-
-fn make_executable_io(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
 }
 
 /// Replace the first git-op-owned line with the current [`HOOK_LINE`], drop
@@ -956,16 +945,21 @@ fn apply_hook_plan(hooks: &Path, hook: ManagedHook, plan: HookPlan) -> Result<()
 }
 
 /// Ensure the hook has executable permissions on supported platforms.
+fn make_executable(path: &Path) -> Result<(), Error> {
+    set_executable(path).map_err(Error::git)
+}
+
+/// Give `path` the executable permissions a hook needs.
 ///
 /// On non-Unix platforms the file is already executable according to the
-/// platform's normal file semantics, so this function is a no-op.
-fn make_executable(path: &Path) -> Result<(), Error> {
+/// platform's normal file semantics, so this is a no-op.
+fn set_executable(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path).map_err(Error::git)?.permissions();
+        let mut permissions = fs::metadata(path)?.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).map_err(Error::git)?;
+        fs::set_permissions(path, permissions)?;
     }
     Ok(())
 }
