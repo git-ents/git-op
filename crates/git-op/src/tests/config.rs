@@ -1,5 +1,4 @@
 use super::*;
-use crate::OP_REF;
 use std::{
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -63,7 +62,10 @@ fn is_executable(path: &Path) -> bool {
 /// Verify that the current body survives a rewrite unchanged.
 #[test]
 fn hook_body_is_recognized_unchanged() {
-    assert_eq!(rewrite_managed_lines(HOOK_BODY).as_deref(), Some(HOOK_BODY));
+    assert_eq!(
+        rewrite_owned_lines(HOOK_BODY, HOOK_LINE, is_git_op_line).as_deref(),
+        Some(HOOK_BODY)
+    );
     assert_eq!(
         rewrite_owned_lines(PRE_PUSH_BODY, PRE_PUSH_LINE, is_pre_push_line).as_deref(),
         Some(PRE_PUSH_BODY)
@@ -85,7 +87,7 @@ fn rewrite_removes_every_git_op_line() {
         "echo before\n", HOOK_LINE, "# git-op in a comment\n", "echo after\n",
     );
     assert_eq!(
-        rewrite_managed_lines(existing).as_deref(),
+        rewrite_owned_lines(existing, HOOK_LINE, is_git_op_line).as_deref(),
         Some(expected.as_str())
     );
     assert!(!is_git_op_line("echo git-op-helper"));
@@ -174,58 +176,6 @@ fn install_over_existing_hook_returns_hook_exists() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn pre_push_rejects_operation_ref_and_allows_other_refs() {
-    let hooks = TemporaryHooksDir::new();
-    install_pre_push_hook(&hooks.path).expect("install pre-push hook");
-
-    let run = |input: &str| {
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg(hooks.path.join(PRE_PUSH_HOOK_NAME))
-            .arg("origin")
-            .arg("url")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().expect("spawn pre-push hook");
-        child
-            .stdin
-            .take()
-            .expect("open pre-push stdin")
-            .write_all(input.as_bytes())
-            .expect("write pre-push input");
-        child.wait_with_output().expect("wait for pre-push hook")
-    };
-    let rejected = run(&format!(
-        "{OP_REF} 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n",
-    ));
-    let rejected_remote = run(&format!(
-        "refs/heads/main 1111111111111111111111111111111111111111 {OP_REF} 2222222222222222222222222222222222222222\n",
-    ));
-    assert!(!rejected.status.success());
-    assert!(!rejected_remote.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&rejected.stderr).trim(),
-        &format!(
-            "git-op: Pushing {OP_REF} is not supported: operation references must remain local"
-        )
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&rejected_remote.stderr).trim(),
-        &format!(
-            "git-op: Pushing {OP_REF} is not supported: operation references must remain local"
-        )
-    );
-
-    let allowed = run(
-        "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n",
-    );
-    assert!(allowed.status.success());
-    assert!(allowed.stderr.is_empty());
-}
-
 /// Verify that pre-push install writes an executable hook and is idempotent.
 #[test]
 fn pre_push_install_is_fresh_then_idempotent() {
@@ -246,45 +196,62 @@ fn pre_push_install_is_fresh_then_idempotent() {
     assert!(is_executable(&hooks.pre_push_path()));
 }
 
-/// Verify that a pre-push conflict leaves the reference hook untouched.
+/// Verify that a pre-push conflict leaves the reference hook unwritten.
 #[test]
-fn pre_push_conflict_prevents_partial_install() {
+fn pre_push_conflict_leaves_the_reference_hook_unwritten() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
     let error = install_hooks(hooks.path.clone()).expect_err("existing hook must be rejected");
     assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
-    assert!(hooks.hook_path().exists());
+    assert!(
+        !hooks.hook_path().exists(),
+        "a pre-push conflict must not leave the reference hook installed"
+    );
     assert_eq!(
         fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
         existing
     );
 }
 
-/// Verify that the legacy shell pre-push body upgrades to the command hook.
+/// Verify that a reference hook conflict leaves the pre-push hook unwritten.
 #[test]
-fn pre_push_legacy_body_upgrades() {
-    let hooks = TemporaryHooksDir::new();
-    fs::write(hooks.pre_push_path(), LEGACY_PRE_PUSH_BODY).expect("write legacy hook");
-    install_pre_push_hook(&hooks.path).expect("upgrade pre-push hook");
-    assert_eq!(
-        fs::read_to_string(hooks.pre_push_path()).expect("read upgraded hook"),
-        PRE_PUSH_BODY
-    );
-}
-
-/// Verify that an existing pre-push hook is never replaced.
-#[test]
-fn pre_push_install_over_existing_hook_returns_hook_exists() {
+fn reference_conflict_leaves_the_pre_push_hook_unwritten() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
-    fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
-    let error = install_pre_push_hook(&hooks.path).expect_err("existing hook must be rejected");
-    assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
+    fs::write(hooks.hook_path(), existing).expect("write existing hook");
+    let error = install_hooks(hooks.path.clone()).expect_err("existing hook must be rejected");
+    assert!(matches!(&error, Error::HookExists(path) if path == &hooks.hook_path()));
+    assert!(
+        !hooks.pre_push_path().exists(),
+        "a reference hook conflict must not leave the pre-push hook installed"
+    );
     assert_eq!(
-        fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
+        fs::read_to_string(hooks.hook_path()).expect("read existing hook"),
         existing
     );
+}
+
+/// Verify that an existing pre-push hook is never replaced, including a
+/// standalone shell guard, which carries no git-op command line to adopt.
+#[test]
+fn pre_push_install_over_existing_hook_returns_hook_exists() {
+    let standalone = concat!(
+        "#!/bin/sh\n",
+        "while read -r local_ref local_oid remote_ref remote_oid; do\n",
+        "    if [ \"$local_ref\" = \"refs/op\" ]; then printf '%s\\n' \"refs/op is local\" >&2; exit 1; fi\n",
+        "done\n",
+    );
+    for existing in ["#!/bin/sh\necho something-else\n", standalone] {
+        let hooks = TemporaryHooksDir::new();
+        fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
+        let error = install_pre_push_hook(&hooks.path).expect_err("existing hook must be rejected");
+        assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
+        assert_eq!(
+            fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
+            existing
+        );
+    }
 }
 
 /// Verify that pre-push uninstall removes matching hooks and spares foreign ones.
@@ -296,10 +263,14 @@ fn pre_push_uninstall_removes_matching_hook_and_spares_foreign_ones() {
     assert!(!hooks.pre_push_path().exists());
     uninstall_pre_push_hook(&hooks.path).expect("repeat uninstall is a no-op");
 
-    let legacy = LEGACY_PRE_PUSH_BODY;
-    fs::write(hooks.pre_push_path(), legacy).expect("write legacy hook");
-    uninstall_pre_push_hook(&hooks.path).expect("uninstall legacy pre-push hook");
-    assert!(!hooks.pre_push_path().exists());
+    let standalone = "#!/bin/sh\nwhile read -r local_ref; do exit 1; done\n";
+    fs::write(hooks.pre_push_path(), standalone).expect("write standalone hook");
+    uninstall_pre_push_hook(&hooks.path).expect("uninstall over standalone hook");
+    assert_eq!(
+        fs::read_to_string(hooks.pre_push_path()).expect("read standalone hook"),
+        standalone,
+        "a hook carrying no git-op command line must be left untouched"
+    );
 
     let foreign = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.pre_push_path(), foreign).expect("write foreign hook");
