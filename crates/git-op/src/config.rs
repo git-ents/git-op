@@ -43,6 +43,51 @@ const PRE_PUSH_LINE: &str = pre_push_line!();
 const HOOK_BODY: &str = concat!("#!/bin/sh\n", hook_line!());
 const PRE_PUSH_BODY: &str = concat!("#!/bin/sh\n", pre_push_line!());
 
+/// A hook git-op installs and owns.
+#[derive(Clone, Copy)]
+enum ManagedHook {
+    /// Records a snapshot for every reference transaction.
+    ReferenceTransaction,
+    /// Refuses pushes of the operation ref.
+    PrePush,
+}
+
+impl ManagedHook {
+    /// The file name Git looks for.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReferenceTransaction => REFERENCE_TRANSACTION_HOOK_NAME,
+            Self::PrePush => PRE_PUSH_HOOK_NAME,
+        }
+    }
+
+    /// The complete body a fresh install writes.
+    fn body(self) -> &'static str {
+        match self {
+            Self::ReferenceTransaction => HOOK_BODY,
+            Self::PrePush => PRE_PUSH_BODY,
+        }
+    }
+
+    /// The command line an upgrade rewrites in place.
+    fn line(self) -> &'static str {
+        match self {
+            Self::ReferenceTransaction => HOOK_LINE,
+            Self::PrePush => PRE_PUSH_LINE,
+        }
+    }
+
+    /// Whether `line` invokes this hook's git-op command in a spelling git-op
+    /// has shipped, so hooks from earlier versions upgrade and uninstall in
+    /// place.
+    fn owns_line(self, line: &str) -> bool {
+        match self {
+            Self::ReferenceTransaction => is_git_op_line(line),
+            Self::PrePush => is_pre_push_line(line),
+        }
+    }
+}
+
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
 /// Existing hooks carrying recognizable git-op command lines are upgraded in
@@ -282,7 +327,12 @@ fn uninstall_hooks(hooks: PathBuf) -> Result<(), Error> {
 
 /// Remove git-op's `reference-transaction` hook from `hooks`.
 fn uninstall_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
-    uninstall_managed_hook(hooks, REFERENCE_TRANSACTION_HOOK_NAME, is_git_op_line)
+    uninstall_managed_hook(hooks, ManagedHook::ReferenceTransaction)
+}
+
+/// Remove git-op's `pre-push` hook from `hooks`.
+fn uninstall_pre_push_hook(hooks: &Path) -> Result<(), Error> {
+    uninstall_managed_hook(hooks, ManagedHook::PrePush)
 }
 
 /// Remove the claimed template directory when git-op's install created it.
@@ -464,51 +514,25 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 /// Install both hooks, classifying each first so a hook git-op does not own
 /// is refused before either hook is written.
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
-    ensure_installable(
-        &hooks,
-        REFERENCE_TRANSACTION_HOOK_NAME,
-        HOOK_LINE,
-        is_git_op_line,
-    )?;
-    ensure_installable(&hooks, PRE_PUSH_HOOK_NAME, PRE_PUSH_LINE, is_pre_push_line)?;
+    ensure_installable(&hooks, ManagedHook::ReferenceTransaction)?;
+    ensure_installable(&hooks, ManagedHook::PrePush)?;
     install_reference_transaction_hook(&hooks)?;
     install_pre_push_hook(&hooks)
 }
 
 /// Refuse an install for a hook git-op does not own, naming the hook's path,
 /// without changing anything on disk.
-fn ensure_installable(
-    hooks: &Path,
-    name: &str,
-    line: &str,
-    owned: fn(&str) -> bool,
-) -> Result<(), Error> {
-    HookPlan::of(hooks, name, line, owned).map(drop)
-}
-
-fn install_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    install_managed_hook(
-        hooks,
-        PRE_PUSH_HOOK_NAME,
-        PRE_PUSH_BODY,
-        PRE_PUSH_LINE,
-        is_pre_push_line,
-    )
-}
-
-fn uninstall_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    uninstall_managed_hook(hooks, PRE_PUSH_HOOK_NAME, is_pre_push_line)
+fn ensure_installable(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
+    HookPlan::of(hooks, hook).map(drop)
 }
 
 /// Install or upgrade the `reference-transaction` hook in `hooks`.
 fn install_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
-    install_managed_hook(
-        hooks,
-        REFERENCE_TRANSACTION_HOOK_NAME,
-        HOOK_BODY,
-        HOOK_LINE,
-        is_git_op_line,
-    )
+    install_managed_hook(hooks, ManagedHook::ReferenceTransaction)
+}
+
+fn install_pre_push_hook(hooks: &Path) -> Result<(), Error> {
+    install_managed_hook(hooks, ManagedHook::PrePush)
 }
 
 /// Publish `body` as a new hook named `name`, reporting [`AlreadyExists`] when
@@ -551,7 +575,7 @@ fn make_executable_io(path: &Path) -> std::io::Result<()> {
 /// Replace the first git-op-owned line with the current [`HOOK_LINE`], drop
 /// any further ones, and keep every other line, terminator included, byte by
 /// byte, or `None` when no owned line exists.
-fn rewrite_owned_lines(existing: &str, line: &str, owned: fn(&str) -> bool) -> Option<String> {
+fn rewrite_owned_lines(existing: &str, line: &str, owned: impl Fn(&str) -> bool) -> Option<String> {
     let mut rewritten = String::with_capacity(existing.len() + line.len());
     let mut replaced = false;
     for existing_line in existing.split_inclusive('\n') {
@@ -624,11 +648,11 @@ fn is_pre_push_line(line: &str) -> bool {
     is_git_command_line(line, "git-op pre-push")
 }
 
-/// Remove every line `owned` claims from the hook at `hooks`/`name`, deleting
-/// the file when nothing but a shebang remains, and leaving unscannable
-/// content or a hook git-op does not own exactly as found.
-fn uninstall_managed_hook(hooks: &Path, name: &str, owned: fn(&str) -> bool) -> Result<(), Error> {
-    let path = hooks.join(name);
+/// Remove every line `hook` claims from its file, deleting the file when
+/// nothing but a shebang remains, and leaving unscannable content or a hook
+/// git-op does not own exactly as found.
+fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
+    let path = hooks.join(hook.name());
     let existing = match fs::read(&path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -639,7 +663,7 @@ fn uninstall_managed_hook(hooks: &Path, name: &str, owned: fn(&str) -> bool) -> 
     };
     let stripped: String = existing_text
         .split_inclusive('\n')
-        .filter(|line| !owned(line.trim_end_matches(['\n', '\r'])))
+        .filter(|line| !hook.owns_line(line.trim_end_matches(['\n', '\r'])))
         .collect();
     if stripped == existing_text {
         return Ok(());
@@ -650,7 +674,7 @@ fn uninstall_managed_hook(hooks: &Path, name: &str, owned: fn(&str) -> bool) -> 
     {
         return fs::remove_file(path).map_err(Error::git);
     }
-    replace_hook(hooks, name, &stripped, &existing)
+    replace_hook(hooks, hook.name(), &stripped, &existing)
 }
 
 /// Atomically replace the hook named `name` with `body` via a temporary file,
@@ -695,10 +719,10 @@ enum HookPlan {
 }
 
 impl HookPlan {
-    /// Classify the hook at `hooks`/`name` without changing it, refusing one
+    /// Classify the hook `hook` describes without changing it, refusing one
     /// that invokes no git-op command with [`Error::HookExists`].
-    fn of(hooks: &Path, name: &str, line: &str, owned: fn(&str) -> bool) -> Result<Self, Error> {
-        let path = hooks.join(name);
+    fn of(hooks: &Path, hook: ManagedHook) -> Result<Self, Error> {
+        let path = hooks.join(hook.name());
         let existing = match fs::read(&path) {
             Ok(existing) => existing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::Create),
@@ -707,7 +731,7 @@ impl HookPlan {
         let Ok(text) = std::str::from_utf8(&existing) else {
             return Err(Error::HookExists(path));
         };
-        match rewrite_owned_lines(text, line, owned) {
+        match rewrite_owned_lines(text, hook.line(), |line| hook.owns_line(line)) {
             None => Err(Error::HookExists(path)),
             Some(contents) if contents == text => Ok(Self::Current),
             Some(contents) => Ok(Self::Replace {
@@ -718,39 +742,35 @@ impl HookPlan {
     }
 }
 
-/// Install git-op's hook at `hooks`/`name`, upgrading one git-op already owns
-/// and refusing one it does not.
-fn install_managed_hook(
-    hooks: &Path,
-    name: &str,
-    body: &str,
-    line: &str,
-    owned: fn(&str) -> bool,
-) -> Result<(), Error> {
+/// Install git-op's hook, upgrading one git-op already owns and refusing one
+/// it does not.
+fn install_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
     fs::create_dir_all(hooks).map_err(Error::git)?;
-    match HookPlan::of(hooks, name, line, owned)? {
-        HookPlan::Create => match write_new_hook(hooks, name, body) {
+    match HookPlan::of(hooks, hook)? {
+        HookPlan::Create => match write_new_hook(hooks, hook.name(), hook.body()) {
             Ok(()) => Ok(()),
             // A concurrent install created the hook between the read above and
             // the write: adopt what it left rather than failing this install.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                apply_hook_plan(hooks, name, HookPlan::of(hooks, name, line, owned)?)
+                apply_hook_plan(hooks, hook, HookPlan::of(hooks, hook)?)
             }
             Err(error) => Err(Error::git(error)),
         },
-        plan => apply_hook_plan(hooks, name, plan),
+        plan => apply_hook_plan(hooks, hook, plan),
     }
 }
 
-/// Bring the hook at `hooks`/`name` to the state `plan` describes.
+/// Bring the hook `hook` describes to the state `plan` describes.
 ///
 /// A [`HookPlan::Create`] reaching here means a hook another install created
 /// has since been removed, which leaves nothing to do.
-fn apply_hook_plan(hooks: &Path, name: &str, plan: HookPlan) -> Result<(), Error> {
+fn apply_hook_plan(hooks: &Path, hook: ManagedHook, plan: HookPlan) -> Result<(), Error> {
     match plan {
         HookPlan::Create => Ok(()),
-        HookPlan::Current => make_executable(&hooks.join(name)),
-        HookPlan::Replace { contents, expected } => replace_hook(hooks, name, &contents, &expected),
+        HookPlan::Current => make_executable(&hooks.join(hook.name())),
+        HookPlan::Replace { contents, expected } => {
+            replace_hook(hooks, hook.name(), &contents, &expected)
+        }
     }
 }
 
