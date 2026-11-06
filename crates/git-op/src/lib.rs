@@ -140,8 +140,10 @@ pub enum Error {
     /// A reference-transaction hook received malformed input.
     #[error("invalid reference-transaction input: {0}")]
     InvalidHookInput(String),
-    /// The existing hook is incompatible with the requested git-op hook.
-    #[error("refusing to modify existing hook {0}; merge hook commands manually")]
+    /// The existing hook is not git-op's, so git-op will not modify it.
+    #[error(
+        "refusing to modify hook {0}: it is not git-op's; merge git-op's command into it manually"
+    )]
     HookExists(PathBuf),
     /// The operation log has no earlier snapshot to restore.
     #[error("nothing to undo")]

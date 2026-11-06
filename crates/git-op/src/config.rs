@@ -64,6 +64,9 @@ enum ManagedHook {
 }
 
 impl ManagedHook {
+    /// Every hook git-op installs.
+    const ALL: [Self; 2] = [Self::ReferenceTransaction, Self::PrePush];
+
     /// The file name Git looks for.
     fn name(self) -> &'static str {
         match self {
@@ -111,10 +114,10 @@ impl ManagedHook {
 /// Install the `reference-transaction` and `pre-push` hooks in this repository.
 ///
 /// An existing hook carrying a recognizable git-op command, or matching a body
-/// an earlier version wrote, is upgraded in place, preserving other commands;
-/// unowned hooks are refused with [`Error::HookExists`] for manual merging.
-/// Both hooks are classified before either is written, so a refusal leaves no
-/// partial install behind.
+/// an earlier version wrote, is upgraded in place, preserving other commands.
+/// A hook git-op does not own is refused with [`Error::HookExists`] and left
+/// untouched, but the hooks are installed independently, so one conflict never
+/// withholds the other.
 ///
 /// # Examples
 ///
@@ -341,20 +344,16 @@ fn claimed_template(config_home: &Path) -> Result<Option<PathBuf>, Error> {
     )))
 }
 
-/// Remove both hooks from one hooks directory.
+/// Remove both hooks from one hooks directory, each independently so that a
+/// failure in one does not withhold the other. The first failure is returned.
 fn uninstall_hooks(hooks: PathBuf) -> Result<(), Error> {
-    uninstall_reference_transaction_hook(&hooks)?;
-    uninstall_pre_push_hook(&hooks)
-}
-
-/// Remove git-op's `reference-transaction` hook from `hooks`.
-fn uninstall_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
-    uninstall_managed_hook(hooks, ManagedHook::ReferenceTransaction)
-}
-
-/// Remove git-op's `pre-push` hook from `hooks`.
-fn uninstall_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    uninstall_managed_hook(hooks, ManagedHook::PrePush)
+    let mut failure = None;
+    for hook in ManagedHook::ALL {
+        if let Err(error) = uninstall_managed_hook(&hooks, hook) {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 /// Remove the claimed template directory when git-op's install created it.
@@ -533,28 +532,21 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
     )))
 }
 
-/// Install both hooks, classifying each first so a hook git-op does not own
-/// is refused before either hook is written.
+/// Install both hooks, each independently so that a conflict in one does not
+/// withhold the other.
+///
+/// A hook git-op does not own is refused with [`Error::HookExists`] and left
+/// untouched, but the hooks are installed independently, so one conflict never
+/// withholds the other. The first conflict is returned once both hooks have
+/// been attempted.
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
-    ensure_installable(&hooks, ManagedHook::ReferenceTransaction)?;
-    ensure_installable(&hooks, ManagedHook::PrePush)?;
-    install_reference_transaction_hook(&hooks)?;
-    install_pre_push_hook(&hooks)
-}
-
-/// Refuse an install for a hook git-op does not own, naming the hook's path,
-/// without changing anything on disk.
-fn ensure_installable(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
-    HookPlan::of(hooks, hook).map(drop)
-}
-
-/// Install or upgrade the `reference-transaction` hook in `hooks`.
-fn install_reference_transaction_hook(hooks: &Path) -> Result<(), Error> {
-    install_managed_hook(hooks, ManagedHook::ReferenceTransaction)
-}
-
-fn install_pre_push_hook(hooks: &Path) -> Result<(), Error> {
-    install_managed_hook(hooks, ManagedHook::PrePush)
+    let mut conflict = None;
+    for hook in ManagedHook::ALL {
+        if let Err(error) = install_managed_hook(&hooks, hook) {
+            conflict.get_or_insert(error);
+        }
+    }
+    conflict.map_or(Ok(()), Err)
 }
 
 /// Publish `body` as a new hook named `name`, reporting [`AlreadyExists`] when
