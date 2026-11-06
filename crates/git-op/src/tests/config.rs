@@ -222,6 +222,43 @@ fn install_over_existing_hook_returns_hook_exists() {
     );
 }
 
+/// Verify that a hook that cannot be read as text is refused on install, so
+/// git-op never overwrites content it cannot classify.
+#[test]
+fn unreadable_hook_is_refused_on_install() {
+    let hooks = TemporaryHooksDir::new();
+    let unreadable = b"#!/bin/sh\n\xff\xfe\n";
+    fs::write(hooks.hook_path(), unreadable).expect("write unreadable hook");
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect_err("an unreadable hook must be refused");
+    assert!(matches!(&error, Error::HookUnreadable(path) if path == &hooks.hook_path()));
+    assert_eq!(
+        fs::read(hooks.hook_path()).expect("read unreadable hook"),
+        unreadable
+    );
+}
+
+/// Verify that uninstalling leaves a hook it cannot read as text exactly as
+/// found, since git-op writes only text and so cannot have written it, while
+/// still removing the other, readable hook.
+#[test]
+fn uninstall_spares_an_unreadable_hook_and_still_removes_the_other() {
+    let hooks = TemporaryHooksDir::new();
+    let unreadable = b"#!/bin/sh\n\xff\xfe\n";
+    fs::write(hooks.hook_path(), unreadable).expect("write unreadable hook");
+    install_managed_hook(&hooks.path, ManagedHook::PrePush).expect("install pre-push hook");
+    uninstall_hooks(hooks.path.clone()).expect("uninstall must not fail on an unreadable hook");
+    assert_eq!(
+        fs::read(hooks.hook_path()).expect("read unreadable hook"),
+        unreadable,
+        "an unreadable hook must be left untouched"
+    );
+    assert!(
+        !hooks.pre_push_path().exists(),
+        "the readable hook must still be removed"
+    );
+}
+
 /// Verify that pre-push install writes an executable hook and is idempotent.
 #[test]
 fn pre_push_install_is_fresh_then_idempotent() {

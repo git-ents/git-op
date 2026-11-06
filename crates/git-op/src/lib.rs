@@ -145,6 +145,9 @@ pub enum Error {
         "refusing to modify hook {0}: it is not git-op's; merge git-op's command into it manually"
     )]
     HookExists(PathBuf),
+    /// An existing hook cannot be read as text, so git-op cannot classify it.
+    #[error("refusing to modify hook {0}: not valid UTF-8")]
+    HookUnreadable(PathBuf),
     /// The operation log has no earlier snapshot to restore.
     #[error("nothing to undo")]
     NothingToUndo,

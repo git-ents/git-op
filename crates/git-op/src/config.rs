@@ -536,8 +536,9 @@ fn git_config_global_template() -> Result<Option<PathBuf>, Error> {
 /// withhold the other.
 ///
 /// A hook git-op does not own is refused with [`Error::HookExists`] and left
-/// untouched, but the hooks are installed independently, so one conflict never
-/// withholds the other. The first conflict is returned once both hooks have
+/// untouched, and one that cannot be read as text is refused with
+/// [`Error::HookUnreadable`]. The hooks are installed independently, so one
+/// conflict never withholds the other; the first is returned once both have
 /// been attempted.
 fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
     let mut conflict = None;
@@ -799,10 +800,11 @@ fn shell_segments(line: &str) -> Vec<String> {
 }
 
 /// Remove every line `hook` claims from its file, deleting the file when
-/// nothing but a shebang remains, and leaving unscannable content or a hook
-/// git-op does not own exactly as found.
+/// nothing but a shebang remains. A body an earlier git-op version wrote
+/// verbatim is removed whole.
 ///
-/// A body an earlier git-op version wrote verbatim is removed whole.
+/// A hook git-op does not own is left exactly as found, as is one that cannot
+/// be read as text: git-op writes only text, so such a hook cannot be its.
 fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
     let path = hooks.join(hook.name());
     let existing = match fs::read(&path) {
@@ -811,6 +813,8 @@ fn uninstall_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> 
         Err(error) => return Err(Error::git(error)),
     };
     let Ok(existing_text) = std::str::from_utf8(&existing) else {
+        // git-op writes only text, so a hook that is not text cannot be its;
+        // leave it exactly as found.
         return Ok(());
     };
     if hook.legacy_bodies().contains(&existing_text) {
@@ -884,7 +888,7 @@ impl HookPlan {
             Err(error) => return Err(Error::git(error)),
         };
         let Ok(text) = std::str::from_utf8(&existing) else {
-            return Err(Error::HookExists(path));
+            return Err(Error::HookUnreadable(path));
         };
         if hook.legacy_bodies().contains(&text) {
             return Ok(Self::Replace {
