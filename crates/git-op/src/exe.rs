@@ -333,20 +333,14 @@ fn show_command(specification: Option<&str>) -> Result<(), Box<dyn std::error::E
     show_metadata_diff(
         &repo,
         "config",
-        previous
-            .as_ref()
-            .and_then(|state| state.config)
-            .map(|blob| blob.oid()),
-        state.config.map(|blob| blob.oid()),
+        previous.as_ref().and_then(|state| state.config),
+        state.config,
     )?;
     show_metadata_diff(
         &repo,
         "description",
-        previous
-            .as_ref()
-            .and_then(|state| state.description)
-            .map(|blob| blob.oid()),
-        state.description.map(|blob| blob.oid()),
+        previous.as_ref().and_then(|state| state.description),
+        state.description,
     )?;
     Ok(())
 }

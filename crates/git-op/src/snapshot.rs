@@ -11,7 +11,7 @@ use gix::objs::Write;
 use gix::objs::tree::{Entry, EntryKind, EntryMode, EntryRef};
 use gix_refstore::ObjectId;
 
-use crate::{Error, RawBlob, RawTree, RepositoryState};
+use crate::{Error, RepositoryState};
 
 /// The top-level tree entry holding the captured refs.
 const REFS_ENTRY: &str = "refs";
@@ -21,12 +21,12 @@ pub(crate) fn serialize(
     repo: &gix::Repository,
     state: &RepositoryState,
 ) -> Result<ObjectId, Error> {
-    let mut entries = vec![tree_entry(REFS_ENTRY, state.r#refs.oid())];
+    let mut entries = vec![tree_entry(REFS_ENTRY, state.r#refs)];
     if let Some(config) = state.config {
-        entries.push(blob_entry("config", config.oid()));
+        entries.push(blob_entry("config", config));
     }
     if let Some(description) = state.description {
-        entries.push(blob_entry("description", description.oid()));
+        entries.push(blob_entry("description", description));
     }
     entries.sort();
     repo.write(&gix::objs::Tree { entries }).map_err(Error::git)
@@ -72,9 +72,9 @@ pub(crate) fn read(repo: &gix::Repository, commit: ObjectId) -> Result<Repositor
         Error::InvalidSnapshot(format!("{commit} is missing its {REFS_ENTRY} tree entry"))
     })?;
     Ok(RepositoryState {
-        r#refs: RawTree::new(refs),
-        config: config.map(RawBlob::new),
-        description: description.map(RawBlob::new),
+        refs,
+        config,
+        description,
     })
 }
 
