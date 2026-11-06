@@ -64,12 +64,23 @@ fn ensure_clean(repo: &gix::Repository) -> Result<(), Box<dyn std::error::Error>
 /// invoked with `PWD` in one repository and `GIT_DIR` pointing at another
 /// (as happens during `git clone`) would silently operate on the wrong
 /// repository.
+///
+/// Discovery starts from an absolute path so the repository's Git directory
+/// and worktree are absolute too. `git-op` passes those paths to Git
+/// subprocesses that run from a different working directory, where a relative
+/// path would resolve against the wrong directory: discovering from `.` in a
+/// repository whose working directory is its own Git directory (a custom Git
+/// directory, as `git -C <git-dir>` reaches) yields a Git directory of `.`,
+/// which no subprocess launched from the worktree can find.
 #[expect(
     clippy::result_large_err,
     reason = "gix defines and returns this discovery error directly"
 )]
 pub(crate) fn open_repository() -> Result<gix::Repository, gix::discover::Error> {
-    gix::discover_with_environment_overrides(".")
+    let start = std::env::current_dir().map_err(|error| {
+        gix::discover::Error::from(gix::discover::upwards::Error::CurrentDir(error))
+    })?;
+    gix::discover_with_environment_overrides(start)
 }
 
 /// Process a reference-transaction hook invocation from standard input.
