@@ -36,9 +36,12 @@ macro_rules! hook_line {
 /// could not judge, as when the `git-op` found on `PATH` predates the
 /// subcommand and exits with a usage error. Blocking only on status 1 keeps a
 /// stale binary from failing every push.
+///
+/// Only a rejection ends the hook, so a hook whose owner pasted this line in,
+/// as the install error message instructs, still runs its own commands.
 macro_rules! pre_push_line {
     () => {
-        "command -v git-op >/dev/null 2>&1 || exit 0; git-op pre-push \"$@\"; git_op_status=$?; [ \"$git_op_status\" -eq 1 ] && exit 1; exit 0\n"
+        "command -v git-op >/dev/null 2>&1 || exit 0; git-op pre-push \"$@\"; git_op_status=$?; if [ \"$git_op_status\" -eq 1 ]; then exit 1; fi\n"
     };
 }
 

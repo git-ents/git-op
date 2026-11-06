@@ -260,3 +260,67 @@ fn installed_pre_push_hook_fails_open_for_an_older_git_op() {
         "a rejection must still block the push"
     );
 }
+
+/// A pre-push hook that git-op's command was pasted into, as the install error
+/// message instructs, keeps running its own commands after git-op allows the
+/// push.
+#[cfg(unix)]
+#[test]
+fn merged_pre_push_hook_keeps_running_after_git_op_allows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = TempDir::new().expect("create repository");
+    let home = TempDir::new().expect("create home");
+    init(root.path());
+    run("install", root.path(), home.path());
+
+    let installed = std::fs::read_to_string(root.path().join(".git/hooks/pre-push"))
+        .expect("read installed pre-push hook");
+    let git_op_line = installed
+        .lines()
+        .find(|line| line.contains("git-op pre-push"))
+        .expect("the installed hook carries git-op's command");
+
+    let merged = root.path().join("merged-pre-push");
+    std::fs::write(
+        &merged,
+        format!("#!/bin/sh\n{git_op_line}\necho reached-the-end\n"),
+    )
+    .expect("write merged hook");
+    std::fs::set_permissions(&merged, std::fs::Permissions::from_mode(0o755))
+        .expect("make merged hook executable");
+
+    let binary_dir = binary().parent().expect("binary has a parent directory");
+    let search_path = std::env::join_paths(std::iter::once(binary_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join search path");
+
+    let mut child = Command::new("/bin/sh")
+        .arg(&merged)
+        .args(["origin", "url"])
+        .env("PATH", &search_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn merged hook");
+    child
+        .stdin
+        .take()
+        .expect("open merged hook stdin")
+        .write_all(
+            b"refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n",
+        )
+        .expect("write merged hook input");
+    let output = child.wait_with_output().expect("wait for merged hook");
+    assert!(
+        output.status.success(),
+        "an allowed push must leave the hook successful"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "reached-the-end",
+        "commands after git-op's line must still run"
+    );
+}
