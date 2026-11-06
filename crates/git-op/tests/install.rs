@@ -196,3 +196,67 @@ fn installed_pre_push_hook_rejects_the_operation_ref() {
     assert!(allowed.status.success(), "an ordinary ref must be allowed");
     assert!(allowed.stderr.is_empty());
 }
+
+/// The installed pre-push hook blocks a push only when `git-op` rejects it, so
+/// a `git-op` on `PATH` that predates the `pre-push` subcommand does not fail
+/// every push.
+#[cfg(unix)]
+#[test]
+fn installed_pre_push_hook_fails_open_for_an_older_git_op() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = TempDir::new().expect("create repository");
+    let home = TempDir::new().expect("create home");
+    let stub = TempDir::new().expect("create stub directory");
+    init(root.path());
+    run("install", root.path(), home.path());
+    let hook = root.path().join(".git/hooks/pre-push");
+    assert!(hook.is_file(), "install must write the pre-push hook");
+
+    let stub_binary = stub.path().join("git-op");
+    let write_stub = |body: &str| {
+        std::fs::write(&stub_binary, body).expect("write stub");
+        std::fs::set_permissions(&stub_binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make stub executable");
+    };
+
+    let run_hook = |input: &str| {
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .args(["origin", "url"])
+            .env("PATH", stub.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pre-push hook");
+        child
+            .stdin
+            .take()
+            .expect("open pre-push stdin")
+            .write_all(input.as_bytes())
+            .expect("write pre-push input");
+        child.wait_with_output().expect("wait for pre-push hook")
+    };
+
+    let rejected = format!(
+        "{OP_REF} 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n"
+    );
+
+    // An older binary reports the unknown subcommand with clap's usage status,
+    // which must read as "cannot judge" rather than "reject".
+    write_stub("#!/bin/sh\necho \"error: unrecognized subcommand 'pre-push'\" >&2\nexit 2\n");
+    let older = run_hook(&rejected);
+    assert!(
+        older.status.success(),
+        "an older git-op must not block the push"
+    );
+
+    // A rejection still blocks the push.
+    write_stub("#!/bin/sh\necho 'git-op: rejected' >&2\nexit 1\n");
+    let blocked = run_hook(&rejected);
+    assert!(
+        !blocked.status.success(),
+        "a rejection must still block the push"
+    );
+}

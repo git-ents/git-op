@@ -92,6 +92,12 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
 /// local object, the remote ref, and the remote object. A push whose local or
 /// remote ref is the operation ref, under any name, is refused so the log
 /// stays local.
+///
+/// A rejection exits with [`ExitCode::FAILURE`] and nothing else does, because
+/// the installed hook blocks a push only for that code; any other failure means
+/// git-op could not judge the push and must not stop ordinary work.
+///
+/// [`ExitCode::FAILURE`]: std::process::ExitCode::FAILURE
 fn pre_push(_remote_name: &str, _remote_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;

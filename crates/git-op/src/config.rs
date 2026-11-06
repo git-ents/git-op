@@ -31,9 +31,14 @@ macro_rules! hook_line {
 ///
 /// When the `git-op` executable is missing the hook exits 0, so a lost guard
 /// never blocks a push.
+///
+/// `git-op pre-push` exits 1 only to reject a push; any other status means it
+/// could not judge, as when the `git-op` found on `PATH` predates the
+/// subcommand and exits with a usage error. Blocking only on status 1 keeps a
+/// stale binary from failing every push.
 macro_rules! pre_push_line {
     () => {
-        "command -v git-op >/dev/null 2>&1 || exit 0; exec git-op pre-push \"$@\"\n"
+        "command -v git-op >/dev/null 2>&1 || exit 0; git-op pre-push \"$@\"; git_op_status=$?; [ \"$git_op_status\" -eq 1 ] && exit 1; exit 0\n"
     };
 }
 
