@@ -222,6 +222,34 @@ fn install_over_existing_hook_returns_hook_exists() {
     );
 }
 
+/// Verify that a temporary file left by an interrupted install is reported
+/// rather than mistaken for a concurrent install, which would make the install
+/// a silent no-op.
+///
+/// The temporary name carries a per-process sequence number, so the test
+/// occupies the sequence values the install may draw from. The install's value
+/// is at least the counter's current reading and, with at most a handful of
+/// concurrent installs, falls inside the window.
+#[test]
+fn stale_temporary_file_is_reported() {
+    let hooks = TemporaryHooksDir::new();
+    let start = NEXT_TEMP_HOOK.load(Ordering::Relaxed);
+    for sequence in start..start + 256 {
+        let stale = hooks.path.join(format!(
+            ".{REFERENCE_TRANSACTION_HOOK_NAME}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::write(&stale, b"partial").expect("write stale temporary file");
+    }
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect_err("a leftover temporary file must not skip the install");
+    assert!(matches!(&error, Error::Git(_)));
+    assert!(
+        !hooks.hook_path().exists(),
+        "a failed install must not leave a hook behind"
+    );
+}
+
 /// Verify that a hook that cannot be read as text is refused on install, so
 /// git-op never overwrites content it cannot classify.
 #[test]

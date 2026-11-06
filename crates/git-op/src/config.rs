@@ -557,6 +557,10 @@ fn install_hooks(hooks: PathBuf) -> Result<(), Error> {
 /// hard-linked under the final name: a crash before the link can never leave a
 /// truncated hook for Git to execute.
 ///
+/// [`AlreadyExists`] is reported when the hook name is taken, and also when a
+/// temporary file left by an interrupted install still occupies the temporary
+/// name; the caller distinguishes them by the hook's presence.
+///
 /// [`AlreadyExists`]: std::io::ErrorKind::AlreadyExists
 fn write_new_hook(hooks: &Path, name: &str, body: &str) -> std::io::Result<()> {
     let sequence = NEXT_TEMP_HOOK.fetch_add(1, Ordering::Relaxed);
@@ -913,12 +917,20 @@ fn install_managed_hook(hooks: &Path, hook: ManagedHook) -> Result<(), Error> {
     fs::create_dir_all(hooks).map_err(Error::git)?;
     match HookPlan::of(hooks, hook)? {
         HookPlan::Create => match write_new_hook(hooks, hook.name(), hook.body()) {
-            Ok(()) => Ok(()),
             // A concurrent install created the hook between the read above and
             // the write: adopt what it left rather than failing this install.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            //
+            // `AlreadyExists` also reports a leftover temporary file, which
+            // leaves no hook behind; requiring the hook to exist tells the two
+            // apart, so a stale file is reported instead of silently skipping
+            // the install.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && hooks.join(hook.name()).exists() =>
+            {
                 apply_hook_plan(hooks, hook, HookPlan::of(hooks, hook)?)
             }
+            Ok(()) => Ok(()),
             Err(error) => Err(Error::git(error)),
         },
         plan => apply_hook_plan(hooks, hook, plan),
