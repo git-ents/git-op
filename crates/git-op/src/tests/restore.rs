@@ -207,6 +207,70 @@ fn restore_refuses_to_overwrite_untracked_files() {
         "refs must not move when the restore is refused"
     );
 }
+/// Run Git against a worktree whose repository is reached through an explicit
+/// Git directory rather than a `.git` marker of the worktree's own.
+fn git_in_custom_directory(worktree: &Path, git_dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(worktree)
+        .env("GIT_DIR", git_dir)
+        .args(args)
+        .status()
+        .expect("run Git with a custom Git directory");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+/// Verify that a restore detects a collision when the repository uses a
+/// custom Git directory and the worktree carries no `.git` marker of its own.
+/// Git cannot rediscover such a repository from the worktree, so the collision
+/// helpers must be handed the Git directory explicitly.
+#[test]
+fn restore_detects_collisions_with_a_custom_git_directory() {
+    let temporary = tempfile::TempDir::new().expect("create temporary directory");
+    let worktree = temporary.path().join("worktree");
+    let git_dir = temporary.path().join("git");
+    fs::create_dir(&worktree).expect("create worktree directory");
+    let worktree_path = worktree.to_str().expect("worktree path is UTF-8");
+    let git_dir_path = git_dir.to_str().expect("Git directory path is UTF-8");
+    let status = Command::new("git")
+        .args(["init", "--bare", git_dir_path])
+        .status()
+        .expect("initialize custom Git directory");
+    assert!(status.success(), "git init --bare failed with {status}");
+    // A bare repository with `core.worktree` set is a non-bare repository whose
+    // worktree is an ordinary directory: nothing inside `worktree` points back
+    // at the Git directory.
+    for (key, value) in [
+        ("core.bare", "false"),
+        ("core.worktree", worktree_path),
+        ("user.name", "git-op test"),
+        ("user.email", "git-op@test"),
+    ] {
+        let status = Command::new("git")
+            .args(["--git-dir", git_dir_path, "config", "--local", key, value])
+            .status()
+            .expect("configure custom Git directory");
+        assert!(status.success(), "git config {key} failed with {status}");
+    }
+    let repo = gix::open(&git_dir).expect("open custom Git directory");
+
+    fs::write(worktree.join("tracked"), b"initial\n").expect("write tracked file");
+    git_in_custom_directory(&worktree, &git_dir, &["add", "tracked"]);
+    git_in_custom_directory(&worktree, &git_dir, &["commit", "-m", "one"]);
+    let initial = append(&repo, "initial snapshot").expect("append initial snapshot");
+    fs::remove_file(worktree.join("tracked")).expect("remove tracked file");
+    git_in_custom_directory(&worktree, &git_dir, &["commit", "-am", "two"]);
+    append(&repo, "current snapshot").expect("append current snapshot");
+
+    fs::write(worktree.join("tracked"), b"untracked\n").expect("write colliding untracked file");
+
+    let error = restore_action(&repo, initial).expect_err("untracked collision must refuse");
+    assert!(
+        matches!(error, Error::OverwrittenPaths { ref collisions }
+            if collisions.len() == 1
+                && collisions[0]
+                    == PathCollision { path: "tracked".to_owned(), untracked: true }),
+        "expected the untracked collision, got {error:?}"
+    );
+}
 /// Verify that a restore refuses to discard unstaged worktree
 /// modifications on a path the target tree touches.
 #[test]

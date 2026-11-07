@@ -1833,9 +1833,10 @@ fn ensure_no_local_collisions(
     let Some(target) = snapshot_worktree_tree(repo, state)? else {
         return Ok(());
     };
-    let target_paths = tree_paths(workdir, target)?;
-    let status = status_paths(workdir)?;
-    let differing = index_differences(workdir, target)?;
+    let git_dir = repo.git_dir();
+    let target_paths = tree_paths(workdir, git_dir, target)?;
+    let status = status_paths(workdir, git_dir)?;
+    let differing = index_differences(workdir, git_dir, target)?;
 
     let mut collisions: std::collections::BTreeMap<String, bool> =
         std::collections::BTreeMap::new();
@@ -1883,9 +1884,10 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
 }
 
 /// The paths of every file in `tree`, as worktree-relative names.
-fn tree_paths(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> {
+fn tree_paths(workdir: &Path, git_dir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> {
     run_git_lines(
         workdir,
+        git_dir,
         &[
             "ls-tree",
             "-r",
@@ -1897,9 +1899,14 @@ fn tree_paths(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> 
 }
 
 /// The paths whose index entry differs from `tree`.
-fn index_differences(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, Error> {
+fn index_differences(
+    workdir: &Path,
+    git_dir: &Path,
+    tree: ObjectId,
+) -> Result<HashSet<String>, Error> {
     run_git_lines(
         workdir,
+        git_dir,
         &[
             "diff",
             "--cached",
@@ -1912,9 +1919,15 @@ fn index_differences(workdir: &Path, tree: ObjectId) -> Result<HashSet<String>, 
 }
 
 /// Run Git in `workdir` and split NUL-separated output into a set of paths.
-fn run_git_lines(workdir: &Path, args: &[&str]) -> Result<HashSet<String>, Error> {
+///
+/// `git_dir` is passed explicitly because the worktree may have no `.git`
+/// marker of its own when the repository uses a custom Git directory reached
+/// with the process working directory inside that directory. Without it a
+/// child `git` started in the worktree cannot rediscover the repository.
+fn run_git_lines(workdir: &Path, git_dir: &Path, args: &[&str]) -> Result<HashSet<String>, Error> {
     let output = Command::new("git")
         .current_dir(workdir)
+        .env("GIT_DIR", git_dir)
         .args(args)
         .output()
         .map_err(Error::git)?;
@@ -1947,9 +1960,10 @@ struct WorktreeStatus {
 
 /// Classify `git status --porcelain` output. Rename records contribute both
 /// endpoints.
-fn status_paths(workdir: &Path) -> Result<WorktreeStatus, Error> {
+fn status_paths(workdir: &Path, git_dir: &Path) -> Result<WorktreeStatus, Error> {
     let output = Command::new("git")
         .current_dir(workdir)
+        .env("GIT_DIR", git_dir)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .map_err(Error::git)?;
