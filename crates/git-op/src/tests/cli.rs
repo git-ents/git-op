@@ -2,6 +2,20 @@ use clap::{CommandFactory, Parser};
 
 use super::{Cli, Command};
 
+#[test]
+fn pre_push_is_hidden() {
+    let cli = Cli::try_parse_from(["git-op", "pre-push", "origin", "url"]).expect("parse pre-push");
+    assert!(matches!(
+        cli.command,
+        Command::PrePush { remote_name, remote_url } if remote_name == "origin" && remote_url == "url"
+    ));
+    assert!(
+        Cli::command()
+            .get_subcommands()
+            .any(|command| command.get_name() == "pre-push" && command.is_hide_set())
+    );
+}
+
 /// Verify that `snap` takes no arguments and is listed as a visible command.
 #[test]
 fn snap_parses_without_arguments_and_is_listed() {

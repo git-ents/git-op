@@ -1,5 +1,10 @@
-use std::{path::Path, process::Command};
+use std::{
+    io::Write as _,
+    path::Path,
+    process::{Command, Stdio},
+};
 
+use git_op::OP_REF;
 use tempfile::TempDir;
 
 fn binary() -> &'static Path {
@@ -123,4 +128,71 @@ fn user_configured_template_directory_is_never_seeded_or_deleted() {
         String::from_utf8_lossy(&still_configured.stdout).trim(),
         templates.to_str().expect("UTF-8 path")
     );
+}
+
+/// The installed pre-push hook refuses a pushed operation ref and lets every
+/// other ref through, resolving git-op from `PATH` as Git would.
+#[cfg(unix)]
+#[test]
+fn installed_pre_push_hook_rejects_the_operation_ref() {
+    let root = TempDir::new().expect("create repository");
+    let home = TempDir::new().expect("create home");
+    init(root.path());
+    run("install", root.path(), home.path());
+    let hook = root.path().join(".git/hooks/pre-push");
+    assert!(hook.is_file(), "install must write the pre-push hook");
+
+    // The hook reaches git-op through PATH, so put the binary under test first.
+    let binary_dir = binary().parent().expect("binary has a parent directory");
+    let search_path = std::env::join_paths(std::iter::once(binary_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join search path");
+
+    let run_hook = |input: &str| {
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .args(["origin", "url"])
+            .env("PATH", &search_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pre-push hook");
+        child
+            .stdin
+            .take()
+            .expect("open pre-push stdin")
+            .write_all(input.as_bytes())
+            .expect("write pre-push input");
+        child.wait_with_output().expect("wait for pre-push hook")
+    };
+
+    for rejected in [
+        format!(
+            "{OP_REF} 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n"
+        ),
+        format!(
+            "refs/heads/main 1111111111111111111111111111111111111111 {OP_REF} 2222222222222222222222222222222222222222\n"
+        ),
+    ] {
+        let output = run_hook(&rejected);
+        assert!(
+            !output.status.success(),
+            "{} must be rejected",
+            rejected.trim()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            format!(
+                "git-op: Pushing {OP_REF} is not supported: operation references must remain local"
+            )
+        );
+    }
+
+    let allowed = run_hook(
+        "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n",
+    );
+    assert!(allowed.status.success(), "an ordinary ref must be allowed");
+    assert!(allowed.stderr.is_empty());
 }
