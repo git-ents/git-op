@@ -203,9 +203,10 @@ This is a list of concepts whose boundaries, relationships, and failure behavior
 * Local hook
 * Global hook
 * Git template
-* Managed hook fragment
+* Managed hook command
+* Legacy hook body
 * Foreign hook content
-* Hook merge
+* Hook conflict
 * Hook idempotence
 * Hook replacement
 * Hook preservation
@@ -216,6 +217,7 @@ This is a list of concepts whose boundaries, relationships, and failure behavior
 * Hook standard output
 * Hook standard error
 * Hook exit status
+* Operation-ref push guard
 * Best-effort snapshot
 * Hook-induced snapshot
 * Automatic uninstall

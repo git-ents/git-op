@@ -196,3 +196,131 @@ fn installed_pre_push_hook_rejects_the_operation_ref() {
     assert!(allowed.status.success(), "an ordinary ref must be allowed");
     assert!(allowed.stderr.is_empty());
 }
+
+/// The installed pre-push hook blocks a push only when `git-op` rejects it, so
+/// a `git-op` on `PATH` that predates the `pre-push` subcommand does not fail
+/// every push.
+#[cfg(unix)]
+#[test]
+fn installed_pre_push_hook_fails_open_for_an_older_git_op() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = TempDir::new().expect("create repository");
+    let home = TempDir::new().expect("create home");
+    let stub = TempDir::new().expect("create stub directory");
+    init(root.path());
+    run("install", root.path(), home.path());
+    let hook = root.path().join(".git/hooks/pre-push");
+    assert!(hook.is_file(), "install must write the pre-push hook");
+
+    let stub_binary = stub.path().join("git-op");
+    let write_stub = |body: &str| {
+        std::fs::write(&stub_binary, body).expect("write stub");
+        std::fs::set_permissions(&stub_binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make stub executable");
+    };
+
+    let run_hook = |input: &str| {
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .args(["origin", "url"])
+            .env("PATH", stub.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pre-push hook");
+        child
+            .stdin
+            .take()
+            .expect("open pre-push stdin")
+            .write_all(input.as_bytes())
+            .expect("write pre-push input");
+        child.wait_with_output().expect("wait for pre-push hook")
+    };
+
+    let rejected = format!(
+        "{OP_REF} 1111111111111111111111111111111111111111 refs/heads/op 2222222222222222222222222222222222222222\n"
+    );
+
+    // An older binary reports the unknown subcommand with clap's usage status,
+    // which must read as "cannot judge" rather than "reject".
+    write_stub("#!/bin/sh\necho \"error: unrecognized subcommand 'pre-push'\" >&2\nexit 2\n");
+    let older = run_hook(&rejected);
+    assert!(
+        older.status.success(),
+        "an older git-op must not block the push"
+    );
+
+    // A rejection still blocks the push.
+    write_stub("#!/bin/sh\necho 'git-op: rejected' >&2\nexit 1\n");
+    let blocked = run_hook(&rejected);
+    assert!(
+        !blocked.status.success(),
+        "a rejection must still block the push"
+    );
+}
+
+/// A pre-push hook that git-op's command was pasted into, as the install error
+/// message instructs, keeps running its own commands after git-op allows the
+/// push.
+#[cfg(unix)]
+#[test]
+fn merged_pre_push_hook_keeps_running_after_git_op_allows() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = TempDir::new().expect("create repository");
+    let home = TempDir::new().expect("create home");
+    init(root.path());
+    run("install", root.path(), home.path());
+
+    let installed = std::fs::read_to_string(root.path().join(".git/hooks/pre-push"))
+        .expect("read installed pre-push hook");
+    let git_op_line = installed
+        .lines()
+        .find(|line| line.contains("git-op pre-push"))
+        .expect("the installed hook carries git-op's command");
+
+    let merged = root.path().join("merged-pre-push");
+    std::fs::write(
+        &merged,
+        format!("#!/bin/sh\n{git_op_line}\necho reached-the-end\n"),
+    )
+    .expect("write merged hook");
+    std::fs::set_permissions(&merged, std::fs::Permissions::from_mode(0o755))
+        .expect("make merged hook executable");
+
+    let binary_dir = binary().parent().expect("binary has a parent directory");
+    let search_path = std::env::join_paths(std::iter::once(binary_dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join search path");
+
+    let mut child = Command::new("/bin/sh")
+        .arg(&merged)
+        .args(["origin", "url"])
+        .env("PATH", &search_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn merged hook");
+    child
+        .stdin
+        .take()
+        .expect("open merged hook stdin")
+        .write_all(
+            b"refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n",
+        )
+        .expect("write merged hook input");
+    let output = child.wait_with_output().expect("wait for merged hook");
+    assert!(
+        output.status.success(),
+        "an allowed push must leave the hook successful"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "reached-the-end",
+        "commands after git-op's line must still run"
+    );
+}

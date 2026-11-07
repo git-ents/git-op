@@ -6,9 +6,21 @@ use std::{
 
 static NEXT_TEMP_HOOKS_DIR: AtomicUsize = AtomicUsize::new(0);
 
-/// A reference-transaction hook body written by an earlier git-op version.
+/// A reference-transaction hook body written by an earlier git-op version that
+/// this version still recognizes from its command line.
 const HISTORICAL_HOOK_BODY: &str = "#!/bin/sh\nexec git op reference-transaction \"$@\"\n";
+
+/// A `reference-transaction` body an earlier git-op version wrote, which this
+/// version recognizes only as a whole.
 const ORIGINAL_HOOK_BODY: &str = "#!/bin/sh\nexec op reference-transaction \"$@\"\n";
+
+/// Verify that the body git-op claims as a whole is the one an earlier version
+/// wrote, so the constant and the literal cannot drift apart.
+#[test]
+fn legacy_bodies_are_owned_as_a_whole() {
+    assert_eq!(LEGACY_REFERENCE_TRANSACTION_BODIES.len(), 1);
+    assert!(LEGACY_REFERENCE_TRANSACTION_BODIES.contains(&ORIGINAL_HOOK_BODY));
+}
 
 /// Own a temporary hooks directory and remove it when the test finishes.
 struct TemporaryHooksDir {
@@ -95,11 +107,45 @@ fn rewrite_removes_every_git_op_line() {
     assert!(!is_git_op_line("echo \"git-op reference-transaction\""));
 }
 
+/// Verify that the wrapped, qualified, and assigned spellings a hand-merged
+/// hook may use are recognized, while commands that merely mention git-op are
+/// not.
+#[test]
+fn classifies_wrapped_and_qualified_git_op_commands() {
+    for owned in [
+        "command git-op reference-transaction \"$@\"",
+        "/usr/local/bin/git-op reference-transaction \"$@\"",
+        "GIT_DIR=. git-op reference-transaction \"$@\"",
+        "env GIT_DIR=. git-op reference-transaction \"$@\"",
+        "exec /usr/bin/git op reference-transaction \"$@\"",
+        "if git-op reference-transaction \"$@\"; then :; fi",
+        "git op \"$hook\" \"$@\"",
+    ] {
+        assert!(is_git_op_line(owned), "{owned} must be recognized");
+    }
+    for foreign in [
+        "xargs git-op reference-transaction \"$@\"",
+        "sh -c 'git-op reference-transaction'",
+        "# git-op reference-transaction \"$@\"",
+        "git op \"$@\"",
+        "git op \"$1\"",
+    ] {
+        assert!(!is_git_op_line(foreign), "{foreign} must not be recognized");
+    }
+    assert!(is_pre_push_line("exec /usr/bin/git-op pre-push \"$@\""));
+    assert!(!is_pre_push_line("xargs git-op pre-push \"$@\""));
+    assert!(is_git_op_line("git op \"$hook\""));
+    assert!(
+        !is_pre_push_line("git op \"$hook\""),
+        "the generic delegation was only ever a reference-transaction spelling"
+    );
+}
+
 /// Verify that a fresh install writes an executable hook with the current body.
 #[test]
 fn fresh_install_writes_executable_hook() {
     let hooks = TemporaryHooksDir::new();
-    install_reference_transaction_hook(&hooks.path).expect("install hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
     let body = fs::read(hooks.hook_path()).expect("read installed hook");
     assert_eq!(body, HOOK_BODY.as_bytes());
     #[cfg(unix)]
@@ -110,14 +156,14 @@ fn fresh_install_writes_executable_hook() {
 #[test]
 fn install_over_current_body_is_idempotent() {
     let hooks = TemporaryHooksDir::new();
-    install_reference_transaction_hook(&hooks.path).expect("install hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(hooks.hook_path(), fs::Permissions::from_mode(0o644))
             .expect("remove execute permissions");
     }
-    install_reference_transaction_hook(&hooks.path).expect("reinstall hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("reinstall hook");
     let body = fs::read(hooks.hook_path()).expect("read installed hook");
     assert_eq!(body, HOOK_BODY.as_bytes());
     #[cfg(unix)]
@@ -130,7 +176,7 @@ fn install_over_historical_body_upgrades_in_place() {
     for historical in [HISTORICAL_HOOK_BODY, ORIGINAL_HOOK_BODY] {
         let hooks = TemporaryHooksDir::new();
         fs::write(hooks.hook_path(), historical).expect("write historical hook");
-        install_reference_transaction_hook(&hooks.path).expect("install hook");
+        install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
         let body = fs::read(hooks.hook_path()).expect("read installed hook");
         assert_eq!(body, HOOK_BODY.as_bytes());
     }
@@ -142,11 +188,11 @@ fn install_over_merged_hook_upgrades_git_op_lines_only() {
     let hooks = TemporaryHooksDir::new();
     let merged = "#!/bin/sh\nexec git op reference-transaction \"$@\"\necho something-else\n";
     fs::write(hooks.hook_path(), merged).expect("write merged hook");
-    install_reference_transaction_hook(&hooks.path).expect("install hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
     let body = fs::read_to_string(hooks.hook_path()).expect("read hook after install");
     let expected = format!("#!/bin/sh\n{HOOK_LINE}echo something-else\n");
     assert_eq!(body, expected);
-    install_reference_transaction_hook(&hooks.path).expect("reinstall hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("reinstall hook");
     let body = fs::read_to_string(hooks.hook_path()).expect("read hook after reinstall");
     assert_eq!(
         body, expected,
@@ -160,13 +206,13 @@ fn install_over_existing_hook_returns_hook_exists() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.hook_path(), existing).expect("write existing hook");
-    let error = install_reference_transaction_hook(&hooks.path)
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
         .expect_err("existing hook must be rejected");
     assert!(matches!(&error, Error::HookExists(path) if path == &hooks.hook_path()));
     assert_eq!(
         error.to_string(),
         format!(
-            "refusing to modify existing hook {}; merge hook commands manually",
+            "refusing to modify hook {}: it is not git-op's; merge git-op's command into it manually",
             hooks.hook_path().display()
         )
     );
@@ -176,11 +222,76 @@ fn install_over_existing_hook_returns_hook_exists() {
     );
 }
 
+/// Verify that a temporary file left by an interrupted install is reported
+/// rather than mistaken for a concurrent install, which would make the install
+/// a silent no-op.
+///
+/// The temporary name carries a per-process sequence number, so the test
+/// occupies the sequence values the install may draw from. The install's value
+/// is at least the counter's current reading and, with at most a handful of
+/// concurrent installs, falls inside the window.
+#[test]
+fn stale_temporary_file_is_reported() {
+    let hooks = TemporaryHooksDir::new();
+    let start = NEXT_TEMP_HOOK.load(Ordering::Relaxed);
+    for sequence in start..start + 256 {
+        let stale = hooks.path.join(format!(
+            ".{REFERENCE_TRANSACTION_HOOK_NAME}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::write(&stale, b"partial").expect("write stale temporary file");
+    }
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect_err("a leftover temporary file must not skip the install");
+    assert!(matches!(&error, Error::Git(_)));
+    assert!(
+        !hooks.hook_path().exists(),
+        "a failed install must not leave a hook behind"
+    );
+}
+
+/// Verify that a hook that cannot be read as text is refused on install, so
+/// git-op never overwrites content it cannot classify.
+#[test]
+fn unreadable_hook_is_refused_on_install() {
+    let hooks = TemporaryHooksDir::new();
+    let unreadable = b"#!/bin/sh\n\xff\xfe\n";
+    fs::write(hooks.hook_path(), unreadable).expect("write unreadable hook");
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect_err("an unreadable hook must be refused");
+    assert!(matches!(&error, Error::HookUnreadable(path) if path == &hooks.hook_path()));
+    assert_eq!(
+        fs::read(hooks.hook_path()).expect("read unreadable hook"),
+        unreadable
+    );
+}
+
+/// Verify that uninstalling leaves a hook it cannot read as text exactly as
+/// found, since git-op writes only text and so cannot have written it, while
+/// still removing the other, readable hook.
+#[test]
+fn uninstall_spares_an_unreadable_hook_and_still_removes_the_other() {
+    let hooks = TemporaryHooksDir::new();
+    let unreadable = b"#!/bin/sh\n\xff\xfe\n";
+    fs::write(hooks.hook_path(), unreadable).expect("write unreadable hook");
+    install_managed_hook(&hooks.path, ManagedHook::PrePush).expect("install pre-push hook");
+    uninstall_hooks(hooks.path.clone()).expect("uninstall must not fail on an unreadable hook");
+    assert_eq!(
+        fs::read(hooks.hook_path()).expect("read unreadable hook"),
+        unreadable,
+        "an unreadable hook must be left untouched"
+    );
+    assert!(
+        !hooks.pre_push_path().exists(),
+        "the readable hook must still be removed"
+    );
+}
+
 /// Verify that pre-push install writes an executable hook and is idempotent.
 #[test]
 fn pre_push_install_is_fresh_then_idempotent() {
     let hooks = TemporaryHooksDir::new();
-    install_pre_push_hook(&hooks.path).expect("install pre-push hook");
+    install_managed_hook(&hooks.path, ManagedHook::PrePush).expect("install pre-push hook");
     let body = fs::read(hooks.pre_push_path()).expect("read installed hook");
     assert_eq!(body, PRE_PUSH_BODY.as_bytes());
     #[cfg(unix)]
@@ -189,24 +300,26 @@ fn pre_push_install_is_fresh_then_idempotent() {
         fs::set_permissions(hooks.pre_push_path(), fs::Permissions::from_mode(0o644))
             .expect("remove execute permissions");
     }
-    install_pre_push_hook(&hooks.path).expect("reinstall pre-push hook");
+    install_managed_hook(&hooks.path, ManagedHook::PrePush).expect("reinstall pre-push hook");
     let body = fs::read(hooks.pre_push_path()).expect("read reinstalled hook");
     assert_eq!(body, PRE_PUSH_BODY.as_bytes());
     #[cfg(unix)]
     assert!(is_executable(&hooks.pre_push_path()));
 }
 
-/// Verify that a pre-push conflict leaves the reference hook unwritten.
+/// Verify that a pre-push conflict is reported without withholding the
+/// reference hook.
 #[test]
-fn pre_push_conflict_leaves_the_reference_hook_unwritten() {
+fn pre_push_conflict_still_installs_the_reference_hook() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
     let error = install_hooks(hooks.path.clone()).expect_err("existing hook must be rejected");
     assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
-    assert!(
-        !hooks.hook_path().exists(),
-        "a pre-push conflict must not leave the reference hook installed"
+    assert_eq!(
+        fs::read(hooks.hook_path()).expect("read installed hook"),
+        HOOK_BODY.as_bytes(),
+        "a pre-push conflict must not withhold the reference hook"
     );
     assert_eq!(
         fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
@@ -214,17 +327,19 @@ fn pre_push_conflict_leaves_the_reference_hook_unwritten() {
     );
 }
 
-/// Verify that a reference hook conflict leaves the pre-push hook unwritten.
+/// Verify that a reference hook conflict is reported without withholding the
+/// pre-push hook.
 #[test]
-fn reference_conflict_leaves_the_pre_push_hook_unwritten() {
+fn reference_conflict_still_installs_the_pre_push_hook() {
     let hooks = TemporaryHooksDir::new();
     let existing = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.hook_path(), existing).expect("write existing hook");
     let error = install_hooks(hooks.path.clone()).expect_err("existing hook must be rejected");
     assert!(matches!(&error, Error::HookExists(path) if path == &hooks.hook_path()));
-    assert!(
-        !hooks.pre_push_path().exists(),
-        "a reference hook conflict must not leave the pre-push hook installed"
+    assert_eq!(
+        fs::read(hooks.pre_push_path()).expect("read installed hook"),
+        PRE_PUSH_BODY.as_bytes(),
+        "a reference hook conflict must not withhold the pre-push hook"
     );
     assert_eq!(
         fs::read_to_string(hooks.hook_path()).expect("read existing hook"),
@@ -245,7 +360,8 @@ fn pre_push_install_over_existing_hook_returns_hook_exists() {
     for existing in ["#!/bin/sh\necho something-else\n", standalone] {
         let hooks = TemporaryHooksDir::new();
         fs::write(hooks.pre_push_path(), existing).expect("write existing hook");
-        let error = install_pre_push_hook(&hooks.path).expect_err("existing hook must be rejected");
+        let error = install_managed_hook(&hooks.path, ManagedHook::PrePush)
+            .expect_err("existing hook must be rejected");
         assert!(matches!(&error, Error::HookExists(path) if path == &hooks.pre_push_path()));
         assert_eq!(
             fs::read_to_string(hooks.pre_push_path()).expect("read existing hook"),
@@ -258,14 +374,15 @@ fn pre_push_install_over_existing_hook_returns_hook_exists() {
 #[test]
 fn pre_push_uninstall_removes_matching_hook_and_spares_foreign_ones() {
     let hooks = TemporaryHooksDir::new();
-    install_pre_push_hook(&hooks.path).expect("install pre-push hook");
-    uninstall_pre_push_hook(&hooks.path).expect("uninstall pre-push hook");
+    install_managed_hook(&hooks.path, ManagedHook::PrePush).expect("install pre-push hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::PrePush).expect("uninstall pre-push hook");
     assert!(!hooks.pre_push_path().exists());
-    uninstall_pre_push_hook(&hooks.path).expect("repeat uninstall is a no-op");
+    uninstall_managed_hook(&hooks.path, ManagedHook::PrePush).expect("repeat uninstall is a no-op");
 
     let standalone = "#!/bin/sh\nwhile read -r local_ref; do exit 1; done\n";
     fs::write(hooks.pre_push_path(), standalone).expect("write standalone hook");
-    uninstall_pre_push_hook(&hooks.path).expect("uninstall over standalone hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::PrePush)
+        .expect("uninstall over standalone hook");
     assert_eq!(
         fs::read_to_string(hooks.pre_push_path()).expect("read standalone hook"),
         standalone,
@@ -274,7 +391,7 @@ fn pre_push_uninstall_removes_matching_hook_and_spares_foreign_ones() {
 
     let foreign = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.pre_push_path(), foreign).expect("write foreign hook");
-    uninstall_pre_push_hook(&hooks.path).expect("uninstall over foreign hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::PrePush).expect("uninstall over foreign hook");
     assert_eq!(
         fs::read_to_string(hooks.pre_push_path()).expect("read foreign hook"),
         foreign,
@@ -286,10 +403,29 @@ fn pre_push_uninstall_removes_matching_hook_and_spares_foreign_ones() {
 #[test]
 fn uninstall_removes_current_hook_and_repeats_safely() {
     let hooks = TemporaryHooksDir::new();
-    install_reference_transaction_hook(&hooks.path).expect("install hook");
-    uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("uninstall hook");
     assert!(!hooks.hook_path().exists());
-    uninstall_reference_transaction_hook(&hooks.path).expect("repeat uninstall is a no-op");
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect("repeat uninstall is a no-op");
+}
+
+/// Verify that a hook that merely runs a program named `op` is not claimed:
+/// only a body git-op previously wrote verbatim is owned.
+#[test]
+fn foreign_bare_op_command_is_not_owned() {
+    let hooks = TemporaryHooksDir::new();
+    let foreign = "#!/bin/sh\necho before\nexec op reference-transaction \"$@\"\n";
+    fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
+    let error = install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect_err("a hook git-op did not write must be rejected");
+    assert!(matches!(&error, Error::HookExists(path) if path == &hooks.hook_path()));
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("uninstall hook");
+    assert_eq!(
+        fs::read_to_string(hooks.hook_path()).expect("read foreign hook"),
+        foreign,
+        "a hook git-op did not write must be left untouched"
+    );
 }
 
 /// Verify that uninstalling removes hooks from earlier git-op versions.
@@ -298,7 +434,8 @@ fn uninstall_removes_historical_hook() {
     for historical in [HISTORICAL_HOOK_BODY, ORIGINAL_HOOK_BODY] {
         let hooks = TemporaryHooksDir::new();
         fs::write(hooks.hook_path(), historical).expect("write historical hook");
-        uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
+        uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+            .expect("uninstall hook");
         assert!(!hooks.hook_path().exists());
     }
 }
@@ -314,11 +451,12 @@ fn uninstall_strips_git_op_lines_from_merged_hook() {
         "echo after\n",
     );
     fs::write(hooks.hook_path(), merged).expect("write merged hook");
-    uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("uninstall hook");
     let body = fs::read_to_string(hooks.hook_path()).expect("read stripped hook");
     assert_eq!(body, "#!/bin/sh\necho before\necho after\n");
 
-    uninstall_reference_transaction_hook(&hooks.path).expect("repeat uninstall");
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction)
+        .expect("repeat uninstall");
     let body = fs::read_to_string(hooks.hook_path()).expect("read hook again");
     assert_eq!(
         body, "#!/bin/sh\necho before\necho after\n",
@@ -332,7 +470,7 @@ fn uninstall_leaves_foreign_hook_untouched() {
     let hooks = TemporaryHooksDir::new();
     let foreign = "#!/bin/sh\necho something-else\n";
     fs::write(hooks.hook_path(), foreign).expect("write foreign hook");
-    uninstall_reference_transaction_hook(&hooks.path).expect("uninstall hook");
+    uninstall_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("uninstall hook");
     assert_eq!(
         fs::read_to_string(hooks.hook_path()).expect("read foreign hook"),
         foreign
@@ -345,7 +483,7 @@ fn uninstall_leaves_foreign_hook_untouched() {
 #[test]
 fn missing_binary_exits_zero_and_warns_only_on_committed_phase() {
     let hooks = TemporaryHooksDir::new();
-    install_reference_transaction_hook(&hooks.path).expect("install hook");
+    install_managed_hook(&hooks.path, ManagedHook::ReferenceTransaction).expect("install hook");
     let run = |phase: &str| {
         let output = Command::new("/bin/sh")
             .arg(hooks.hook_path())

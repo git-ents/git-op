@@ -86,15 +86,25 @@ fn reference_transaction(phase: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Process a Git pre-push hook invocation from standard input.
+///
+/// Git supplies one line per ref being pushed, each holding the local ref, the
+/// local object, the remote ref, and the remote object. A push whose local or
+/// remote ref is the operation ref, under any name, is refused so the log
+/// stays local.
+///
+/// The installed hook blocks a push only when git-op exits with
+/// [`ExitCode::FAILURE`], which a refusal and input git-op cannot read both do,
+/// since an unreadable line may name the operation ref. A `git-op` too old to
+/// know the subcommand exits with a usage status instead, so the hook lets the
+/// push through rather than failing all of them.
+///
+/// [`ExitCode::FAILURE`]: std::process::ExitCode::FAILURE
 fn pre_push(_remote_name: &str, _remote_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     for line in input.split(|byte| *byte == b'\n') {
-        let mut fields = line.split(|byte| byte.is_ascii_whitespace());
-        let local = fields.next().filter(|field| !field.is_empty());
-        let _local_oid = fields.next().filter(|field| !field.is_empty());
-        let remote = fields.next().filter(|field| !field.is_empty());
-        if local == Some(OP_REF.as_bytes()) || remote == Some(OP_REF.as_bytes()) {
+        if line_pushes_operation_ref(line)? {
             return Err(format!(
                 "Pushing {OP_REF} is not supported: operation references must remain local"
             )
@@ -102,6 +112,31 @@ fn pre_push(_remote_name: &str, _remote_url: &str) -> Result<(), Box<dyn std::er
         }
     }
     Ok(())
+}
+
+/// Whether one pre-push input line pushes the operation ref, or a description
+/// of why the line cannot be read.
+///
+/// Fields are the non-empty runs of whitespace, so leading or repeated
+/// whitespace cannot shift the local ref out of its position and hide a push.
+/// Whitespace rather than a single space also accepts the carriage returns a
+/// CRLF-terminated line carries.
+fn line_pushes_operation_ref(line: &[u8]) -> Result<bool, String> {
+    let fields: Vec<&[u8]> = line
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect();
+    if fields.is_empty() {
+        return Ok(false);
+    }
+    let [local, _local_oid, remote, ..] = fields.as_slice() else {
+        return Err(format!(
+            "invalid pre-push input: {}",
+            String::from_utf8_lossy(line)
+        ));
+    };
+    let operation_ref = OP_REF.as_bytes();
+    Ok(*local == operation_ref || *remote == operation_ref)
 }
 
 /// Install the hook in the current repository or Git's global template.
