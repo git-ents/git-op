@@ -10,8 +10,6 @@ use std::{
     process::Command,
 };
 
-use facet::Facet;
-use facet_git_tree::{RawBlob, RawTree};
 use gix::objs::{Kind, Write};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit as GixRefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -20,6 +18,7 @@ use gix_refstore::{ApplyError, Committer, GixRefStore, ObjectId, RefEdit, RefNam
 
 mod config;
 mod invocation;
+mod snapshot;
 
 use config::commit_signing_enabled;
 pub use config::{install_global, install_local, uninstall_global, uninstall_local};
@@ -31,15 +30,15 @@ pub const OP_REF: &str = "refs/op";
 const MAX_APPEND_ATTEMPTS: usize = 128;
 
 /// The state of repository metadata captured by an operation-log commit.
-#[derive(Debug, Clone, PartialEq, Eq, Facet)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryState {
-    /// Local refs, represented as a ref-namespace tree whose leaves contain
-    /// Git ref-file contents.
-    pub r#refs: RawTree,
+    /// Local refs, as a ref-namespace tree whose leaves contain Git ref-file
+    /// contents.
+    pub r#refs: ObjectId,
     /// The bytes of the repository's `config` file, when it exists.
-    pub config: Option<RawBlob>,
+    pub config: Option<ObjectId>,
     /// The bytes of the repository's `description` file, when it exists.
-    pub description: Option<RawBlob>,
+    pub description: Option<ObjectId>,
 }
 
 /// Optional commit metadata for [`append_with_options`].
@@ -122,12 +121,6 @@ pub enum Error {
     /// A compare-and-swap could not be applied after repeated retries.
     #[error("reference update lost a race after {0} attempts")]
     LostRace(usize),
-    /// Facet tree serialization failed.
-    #[error("facet tree serialization failed: {0}")]
-    Serialize(#[source] facet_git_tree::SerializeError),
-    /// Facet tree deserialization failed.
-    #[error("facet tree deserialization failed: {0}")]
-    Deserialize(#[source] facet_git_tree::DeserializeError),
     /// A reference-transaction hook received an unsupported phase.
     #[error("unsupported reference-transaction phase {0}")]
     InvalidPhase(String),
@@ -383,7 +376,7 @@ impl RefNode {
 ///     .expect("write description");
 /// let state = git_op::capture(&repo).expect("capture repository state");
 /// let description = repo
-///     .find_blob(state.description.expect("description was captured").oid())
+///     .find_blob(state.description.expect("description was captured"))
 ///     .expect("read description blob");
 /// assert_eq!(description.data, b"raw bytes\\xff\\n");
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
@@ -442,10 +435,10 @@ fn operation_target(repo: &gix::Repository, name: &RefName) -> Result<Option<Obj
 ///
 /// let state = git_op::capture(&repo).expect("capture repository state");
 /// let config = repo
-///     .find_blob(state.config.expect("config was created").oid())
+///     .find_blob(state.config.expect("config was created"))
 ///     .expect("read config blob");
 /// let description = repo
-///     .find_blob(state.description.expect("description was created").oid())
+///     .find_blob(state.description.expect("description was created"))
 ///     .expect("read description blob");
 /// assert_eq!(config.data, b"[core]\n\tbare = false\n");
 /// assert_eq!(description.data, b"example repository\n");
@@ -485,9 +478,9 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
         .map_err(Error::git)?;
 
     Ok(RepositoryState {
-        r#refs: RawTree::new(ref_tree),
-        config: config_oid.map(RawBlob::new),
-        description: description_oid.map(RawBlob::new),
+        r#refs: ref_tree,
+        config: config_oid,
+        description: description_oid,
     })
 }
 
@@ -515,7 +508,7 @@ pub fn capture(repo: &gix::Repository) -> Result<RepositoryState, Error> {
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn serialize(repo: &gix::Repository, state: &RepositoryState) -> Result<ObjectId, Error> {
-    facet_git_tree::serialize_into(state, repo).map_err(Error::Serialize)
+    snapshot::serialize(repo, state)
 }
 
 /// Append a snapshot commit and advance [`OP_REF`] with compare-and-swap.
@@ -871,15 +864,13 @@ enum CommitMessage<'a> {
 /// let commit = git_op::append(&repo, "capture metadata").expect("append snapshot");
 /// let state = git_op::read(&repo, commit).expect("read snapshot");
 /// let description = repo
-///     .find_blob(state.description.expect("description was captured").oid())
+///     .find_blob(state.description.expect("description was captured"))
 ///     .expect("read description blob");
 /// assert_eq!(description.data, b"snapshot example\n");
 /// std::fs::remove_dir_all(root).expect("remove temporary repository");
 /// ```
 pub fn read(repo: &gix::Repository, commit: ObjectId) -> Result<RepositoryState, Error> {
-    let commit = repo.find_commit(commit).map_err(Error::git)?;
-    let tree = commit.tree_id().map_err(Error::git)?.detach();
-    facet_git_tree::deserialize(&tree, repo).map_err(Error::Deserialize)
+    snapshot::read(repo, commit)
 }
 
 /// A repository metadata file captured in snapshots.
@@ -1023,12 +1014,8 @@ impl SnapshotEntries {
         for entry in tree.decode().map_err(Error::git)?.entries {
             match entry.filename.to_str().ok() {
                 Some("refs") => refs = Some(entry.oid.to_owned()),
-                Some("config") => {
-                    config = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?)
-                }
-                Some("description") => {
-                    description = Some(Self::read_optional_blob(repo, entry.oid.to_owned())?);
-                }
+                Some("config") => config = snapshot::optional_blob(repo, &entry)?,
+                Some("description") => description = snapshot::optional_blob(repo, &entry)?,
                 _ => {}
             }
         }
@@ -1037,35 +1024,17 @@ impl SnapshotEntries {
         })?;
         Ok(Self {
             r#refs,
-            config: config.flatten(),
-            description: description.flatten(),
+            config,
+            description,
         })
-    }
-
-    /// Read the blob wrapped by a `facet_git_tree` `Option<RawBlob>` field.
-    ///
-    /// `facet_git_tree` encodes an absent value as an empty tree and a
-    /// present value as a tree with a single `some` entry, rather than
-    /// storing a blob directly under the field name.
-    fn read_optional_blob(
-        repo: &gix::Repository,
-        tree: ObjectId,
-    ) -> Result<Option<ObjectId>, Error> {
-        let tree = repo.find_tree(tree).map_err(Error::git)?;
-        for entry in tree.decode().map_err(Error::git)?.entries {
-            if entry.filename.to_str().ok() == Some("some") {
-                return Ok(Some(entry.oid.to_owned()));
-            }
-        }
-        Ok(None)
     }
 
     /// The entries a pending state would serialize to, without reading anything.
     fn from_state(state: &RepositoryState) -> Self {
         Self {
-            r#refs: state.r#refs.oid(),
-            config: state.config.map(|blob| blob.oid()),
-            description: state.description.map(|blob| blob.oid()),
+            r#refs: state.r#refs,
+            config: state.config,
+            description: state.description,
         }
     }
 
@@ -1599,7 +1568,7 @@ pub fn parent_operation(
 /// are reported as creations.
 pub fn captured_refs(repo: &gix::Repository, commit: ObjectId) -> Result<Vec<RefChange>, Error> {
     let state = read(repo, commit)?;
-    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let refs = repo.find_tree(state.r#refs).map_err(Error::git)?;
     let mut updates = Vec::new();
     collect_ref_updates(repo, &refs, "refs", &mut updates)?;
     updates
@@ -1654,7 +1623,7 @@ pub fn resolve_operation(repo: &gix::Repository, specification: &str) -> Result<
 /// was captured. Applying such a snapshot would move refs onto missing
 /// objects and leave the repository unusable.
 fn verify_snapshot_objects(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Error> {
-    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let refs = repo.find_tree(state.r#refs).map_err(Error::git)?;
     let mut updates = Vec::new();
     collect_ref_updates(repo, &refs, "refs", &mut updates)?;
     for (name, contents) in updates {
@@ -1693,7 +1662,7 @@ fn verify_object(repo: &gix::Repository, ref_name: &str, oid: ObjectId) -> Resul
 
 /// Apply a captured state to the repository's refs and metadata files.
 fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Error> {
-    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let refs = repo.find_tree(state.r#refs).map_err(Error::git)?;
     let mut updates = Vec::new();
     collect_ref_updates(repo, &refs, "refs", &mut updates)?;
     let captured = updates.iter().map(|(name, _)| name.clone()).collect();
@@ -1711,16 +1680,8 @@ fn apply_state(repo: &gix::Repository, state: &RepositoryState) -> Result<(), Er
     // the index and worktree are being rewritten. A snapshot's `core.worktree`
     // or repository-format settings could otherwise redirect or break the
     // destructive checkout after refs have already moved.
-    restore_metadata_file(
-        repo,
-        MetadataFile::Config,
-        state.config.map(|blob| blob.oid()),
-    )?;
-    restore_metadata_file(
-        repo,
-        MetadataFile::Description,
-        state.description.map(|blob| blob.oid()),
-    )?;
+    restore_metadata_file(repo, MetadataFile::Config, state.config)?;
+    restore_metadata_file(repo, MetadataFile::Description, state.description)?;
     Ok(())
 }
 
@@ -1795,7 +1756,7 @@ fn snapshot_worktree_tree(
     state: &RepositoryState,
 ) -> Result<Option<ObjectId>, Error> {
     if let Some(branch) = repo.head_name().map_err(Error::git)? {
-        let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+        let refs = repo.find_tree(state.r#refs).map_err(Error::git)?;
         let mut updates = Vec::new();
         collect_ref_updates(repo, &refs, "refs", &mut updates)?;
         let Some((_, contents)) = updates
@@ -1838,7 +1799,7 @@ fn refuse_checked_out_branch_removal(
             output.status
         )));
     }
-    let refs = repo.find_tree(state.r#refs.oid()).map_err(Error::git)?;
+    let refs = repo.find_tree(state.r#refs).map_err(Error::git)?;
     let mut updates = Vec::new();
     collect_ref_updates(repo, &refs, "refs", &mut updates)?;
     for line in output.stdout.split(|byte| *byte == b'\n') {

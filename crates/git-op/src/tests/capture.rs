@@ -217,7 +217,7 @@ fn snap_records_metadata_drift() {
     let state = read(&temporary.repo, snapped).expect("read snapped state");
     let description = temporary
         .repo
-        .find_blob(state.description.expect("description was captured").oid())
+        .find_blob(state.description.expect("description was captured"))
         .expect("read description blob");
     assert_eq!(description.data, b"drifted description\n");
 }
